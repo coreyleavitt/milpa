@@ -3,6 +3,10 @@ version 1
 strategy "maxver"
 
 dep "foo" {
+    source {
+        kind "git"
+        url (url)"https://github.com/example/foo"
+    }
     identity "dag-sha256:43174efaf1fd8f6e9bd2ed405e124b7d1d4f30e3672afbfbb17986a7b8ee25a0"
     version "1.0.0"
     declared_version_source "nimble"

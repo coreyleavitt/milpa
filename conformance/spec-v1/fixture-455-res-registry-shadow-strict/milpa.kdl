@@ -1,0 +1,6 @@
+name "myapp"
+kind "application"
+attestation-policy "strict"
+deps {
+    t1 git=(url)"https://example.com/t1.git" ref="main"
+}

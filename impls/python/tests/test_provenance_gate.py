@@ -29,7 +29,7 @@ import pytest
 
 from milpa.cas import CAStore
 from milpa.context import MilpaEnv, ResolveParams
-from milpa.errors import MilpaError, RES_PROVENANCE_CONFLICT
+from milpa.errors import MilpaError, RES_BINDING_CONFLICT
 from milpa.fetchers.cas_admitting import CasAdmittingFetcher
 from milpa.fetchers.mocked import mocked_registry, url_key
 from milpa.manifest import parse_manifest
@@ -48,9 +48,11 @@ def _make_git_mock(mocked_dir: Path, url: str, ref: str, *, nim_name: str, nimbl
 class TestProvenanceGateWinsOverDifferingRealVersions:
     """Two transitives (a, b) claim ``shared`` from different URLs; each
     URL's ``shared`` carries a genuinely different REAL declared version
-    (1.0.0 vs 2.0.0) — the provenance gate must still win, raising
-    RES-PROVENANCE-CONFLICT rather than ever reaching a version-level
-    SOLVE-CONFLICT (or resolving one of the two arbitrarily)."""
+    (1.0.0 vs 2.0.0) — ``BindingResolver`` (RFC origin-as-identity §4.3)
+    must still win, raising RES-BINDING-CONFLICT (two non-root claims
+    disagreeing on ``shared``'s source-id, no root claim to arbitrate)
+    rather than ever reaching a version-level SOLVE-CONFLICT (or resolving
+    one of the two arbitrarily)."""
 
     def test_gate_wins_before_version_data_is_ever_consulted(self, tmp_path: Path) -> None:
         mocked_dir = tmp_path / "mocked-fetches"
@@ -132,5 +134,5 @@ class TestProvenanceGateWinsOverDifferingRealVersions:
         with pytest.raises(MilpaError) as exc_info:
             resolve(manifest, deps_dir, env, ResolveParams())
         err = exc_info.value
-        assert err.slug == RES_PROVENANCE_CONFLICT
+        assert err.slug == RES_BINDING_CONFLICT
         assert "shared" in err.message

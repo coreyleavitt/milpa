@@ -112,7 +112,14 @@ class TestAttestationSurvivesResolveToLockfile:
 
         lockfile = from_graph(graph, strategy="maxver")
         locked = next(d for d in lockfile.deps if d.name == "widget")
-        assert locked.attestation == LockAttestation(kind=att.kind, rekor=att.rekor)
+        # P3a: namespace mirrors the index entry's real namespace ("acme",
+        # per _index_with below) — a pre-existing assertion gap this test
+        # never updated after P3a added the field. RFC origin-as-identity.md
+        # §4.4 (S5): now derived from source_id.namespace, not a separate
+        # registry_namespace field, but the VALUE is unchanged.
+        assert locked.attestation == LockAttestation(
+            kind=att.kind, rekor=att.rekor, namespace="acme"
+        )
 
     def test_unattested_entry_has_no_lockfile_block(self, tmp_path: Path) -> None:
         mocked_dir = tmp_path / "mocked"

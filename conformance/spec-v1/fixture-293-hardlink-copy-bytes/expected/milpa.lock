@@ -3,6 +3,10 @@ version 1
 strategy "maxver"
 
 dep "mylib" {
+    source {
+        kind "tarball"
+        url (url)"https://example.com/h2-hardlink.tar.gz"
+    }
     identity "dag-sha256:f18587036d1c18e8cae5e881018c2f79b060fb1e88d2427c03c4dee7f32f6f5d"
     version "0.1.0"
     declared_version_source "nimble"

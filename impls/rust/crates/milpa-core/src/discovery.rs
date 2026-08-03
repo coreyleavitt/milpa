@@ -136,7 +136,7 @@ pub fn manifest_from_nimble(nm: &NimbleManifest, name: &str) -> Manifest {
     for req in &nm.requires {
         match req {
             NimbleRequirement::Url { url, ref_spec, .. } => {
-                deps.push(Dep::Url(UrlDep {
+                deps.push(Dep::Url(UrlDep { subpath: None,
                     name: name_from_url(url),
                     git: url.clone(),
                     // §7.2 normative: bare URL with no `#ref` defaults to HEAD
@@ -199,6 +199,7 @@ pub fn manifest_from_nimble(nm: &NimbleManifest, name: &str) -> Manifest {
         index_history_policy: milpa_manifest::TrustPolicy::Warn,
         index_history_policy_explicit: false,
         resolution: None,
+        provides: Vec::new(),
         optional_auto_flags: std::collections::BTreeSet::new(),
     }
 }

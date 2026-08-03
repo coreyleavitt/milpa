@@ -3,6 +3,10 @@ version 1
 strategy "maxver"
 
 dep "lib-childless" {
+    source {
+        kind "git"
+        url (url)"https://example.com/lib-childless"
+    }
     identity "dag-sha256:f30779e561d82df8f15d15f057ae1ccd2eb8baf049f17c465493ba9a69c6cfc1"
     version "0.0.0"
     src_dir ""
@@ -18,6 +22,10 @@ dep "lib-childless" {
 }
 
 dep "lib-ssl" {
+    source {
+        kind "git"
+        url (url)"https://example.com/lib-ssl"
+    }
     identity "dag-sha256:5c7a370b8010971e302041c373cf0ca5d037efaae83da9122585125bf4ccf37f"
     version "0.0.0"
     src_dir ""

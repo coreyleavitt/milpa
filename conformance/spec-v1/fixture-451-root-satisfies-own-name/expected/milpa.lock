@@ -3,6 +3,10 @@ version 1
 strategy "maxver"
 
 dep "helper" {
+    source {
+        kind "git"
+        url (url)"https://example.com/helper"
+    }
     identity "dag-sha256:6e4c6870059ac5d06f1ec189eeba82c3ba07d51651d2fcc1e597587e6aca3482"
     version "1.0.0"
     declared_version_source "tag"
@@ -18,6 +22,10 @@ dep "helper" {
 }
 
 dep "myapp" {
+    source {
+        kind "member"
+        name "myapp"
+    }
     version "1.0.0"
     declared_version_source "manifest"
     src_dir ""

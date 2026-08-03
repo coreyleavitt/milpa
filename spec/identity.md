@@ -898,6 +898,55 @@ The downstream consequences, each keyed to the axis it actually depends on:
 > entry — their symlinks point directly to the live source tree and are valid
 > regardless of CAS state.
 
+### 4.1b  Source-id vs. identity — origin vs. content (normative SSOT)
+
+> NORMATIVE: **Vocabulary discipline.** The bare word "identity" is reserved,
+> everywhere in this spec, for `content_hash` (§1). A **source-id**
+> (`SourceId` — `rfc-origin-as-identity.md` §3.1/§4.1) is an **origin**: a
+> version-independent description of *where a dep comes from* (a registry
+> coordinate, a normalized git/tarball URL, an OCI coordinate, a local path,
+> or a workspace-member name), used as the PubGrub solver variable
+> (`spec/resolver-semantics.md` §6b) and as the lockfile's grouping key
+> (`spec/lockfile-schema.md` §3.10). A source-id is never called an
+> "identity," and `content_hash` is never called an "origin" — the two
+> concepts are deliberately named apart because they answer unrelated
+> questions and hold unrelated invariants:
+>
+> | | `SourceId` (origin) | `content_hash` (identity) |
+> |---|---|---|
+> | Answers | "where do these bytes come from?" | "are these the bytes that were expected?" |
+> | Computed | pre-fetch, from the manifest/index alone | post-fetch, from the materialized tree (§1) |
+> | Varies with | the dep's declared source (URL, path, coordinate) | the dep's actual byte content |
+> | Ref/tag/digest | excluded — those select a *version* within one origin, never part of the origin itself | irrelevant — identity is computed from bytes on disk, independent of how they were obtained |
+> | Two dep declarations can | be genuinely different origins yet still resolve to the identical `content_hash` (byte-identical trees) | be the identical `content_hash` regardless of how many distinct origins produced it |
+
+> NORMATIVE: These two facts compose, never substitute for each other. A
+> `SourceId` never participates in the content-hash computation of §1 (no
+> origin field is hashed — only tree bytes are), mirroring exactly the
+> declared-version boundary §4.1a already draws. Conversely, `content_hash`
+> is never used to decide which origin a reference binds to
+> (`spec/resolver-semantics.md` §10.0/§10.1) — origin binding is a pre-fetch
+> decision, and `content_hash` does not exist until after a tree is fetched.
+> The one place the two facts meet is a **post-fetch, proof-based**
+> unification: two *distinct* source-ids whose fetched trees hash identically
+> MAY be collapsed to one solver variable (`spec/resolver-semantics.md`
+> §10.6) — a merge justified by content-identity, never by inspecting or
+> guessing at origin equivalence. This is milpa's structural edge over a
+> pure name+origin identity model (Cargo): identity can prove two
+> differently-sourced dependency declarations are the same tree even though
+> their origins remain, correctly, distinct facts.
+
+> NORMATIVE: **`canonical(source_id)` is a stable wire format once shipped.**
+> Like `content_hash`'s own algorithm (§1.1.1's epoch discipline), a change to
+> a `SourceId` normalization rule post-stabilization (e.g., additionally
+> stripping a `www.` host prefix) is a **lockfile-migration event**, not a
+> silent fix — it changes what string a fetched dep's solver variable and
+> on-disk grouping key canonicalize to. Pre-v1.0 stabilization, normalization
+> rules MAY change freely with a one-shot lockfile regen
+> (`spec/resolver-semantics.md` §8 migration discipline); this commitment
+> applies from spec v1.0 onward, the same way the content-hash epoch
+> boundary (§1.1.1) does.
+
 ---
 
 ## 5  Error codes

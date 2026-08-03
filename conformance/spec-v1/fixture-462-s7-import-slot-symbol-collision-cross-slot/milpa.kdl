@@ -1,0 +1,20 @@
+// fixture-462: S7 (rfc-origin-as-identity.md §4.6/§10 item 13) — the
+// complete symbol-level import-slot check, RES-IMPORT-COLLISION.
+//
+// "pkg-a" and "pkg-b" are two DISTINCT source-ids that project to two
+// DIFFERENTLY-named `_deps/` slots — dep_dir_name("pkg-a", None) !=
+// dep_dir_name("pkg-b", None), so S6's directory-slot floor does NOT fire.
+// But both fetched trees' OWN milpa.kdl explicitly declares
+// `provides { module "shared" }` (manifest_declared fidelity, with
+// DIFFERENT content_hash) — the exact case the RFC's headline S7 gap
+// describes: a hijacking transitive evading the directory-slot floor by
+// choosing a distinct label. check_import_slot_collisions's symbol-level
+// scan (behind ManifestDeclaredSymbolProvider — the fidelity tier the live
+// production wiring hard-fails on today, import_slot.live_symbol_
+// provider's docstring has the why) is what catches it.
+name "testapp"
+kind "application"
+deps {
+    pkg-a git=(url)"https://example.com/pkg-a.git" ref="main"
+    pkg-b git=(url)"https://example.com/pkg-b.git" ref="main"
+}

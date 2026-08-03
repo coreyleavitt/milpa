@@ -119,9 +119,15 @@ def test_named_stub_dep_key_field():
         dep_decl_schema_version = None
 
     dep_key = DepKey(name="pkg", namespace=None)
-    stub = _NamedStub(dep_key=dep_key, version=Version(1, 0, 0), index_version=_FakeIV())
+    # S5-rekey (RFC origin-as-identity §4.4): `canonical` is now an INJECTED
+    # field (the caller — _enumerate_named_stubs — computes it via
+    # binding_resolver.canonical_for BEFORE construction), not derived from
+    # dep_key.solver_var() internally.  Constructed here with the bare-name
+    # value a namespace=None dep_key's canonical would coincide with in the
+    # unqualified case, to keep this a pure carries-through-construction check.
+    stub = _NamedStub(dep_key=dep_key, version=Version(1, 0, 0), index_version=_FakeIV(), canonical="pkg")
     assert stub.dep_key == dep_key
-    # .name must return solver_var string (bare name for namespace=None)
+    # .name must return the injected canonical string.
     assert stub.name == "pkg"
 
 
@@ -137,6 +143,8 @@ def test_named_stub_dep_key_with_namespace():
         dep_decl_schema_version = None
 
     dep_key = DepKey(name="pkg", namespace="core")
-    stub = _NamedStub(dep_key=dep_key, version=Version(1, 0, 0), index_version=_FakeIV())
+    # S5-rekey: `canonical` is injected by the caller (see above) — pass the
+    # legacy qualified-form value here to keep this a carries-through check.
+    stub = _NamedStub(dep_key=dep_key, version=Version(1, 0, 0), index_version=_FakeIV(), canonical="core::pkg")
     assert stub.dep_key.namespace == "core"
-    assert stub.name == "core::pkg"  # qualified solver_var
+    assert stub.name == "core::pkg"  # the injected canonical string

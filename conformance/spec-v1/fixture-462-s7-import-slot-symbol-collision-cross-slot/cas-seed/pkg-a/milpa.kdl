@@ -1,0 +1,6 @@
+name "pkg-a"
+kind "library"
+src_dir ""
+provides {
+    module "shared"
+}

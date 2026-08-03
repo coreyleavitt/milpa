@@ -1,0 +1,3 @@
+name "foo-b"
+kind "library"
+src_dir "src"

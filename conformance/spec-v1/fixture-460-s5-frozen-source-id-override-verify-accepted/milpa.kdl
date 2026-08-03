@@ -1,0 +1,8 @@
+name "myapp"
+kind "application"
+deps {
+    foo git=(url)"https://example.com/foo-ORIGINAL.git" ref="main"
+}
+overrides {
+    pkg "foo" git=(url)"https://example.com/foo-fork.git" ref="main"
+}

@@ -4,6 +4,10 @@ strategy "maxver"
 exclude_newer "2026-01-01T00:00:00Z"
 
 dep "widget" {
+    source {
+        kind "git"
+        url (url)"https://example.com/widget"
+    }
     identity "dag-sha256:716a763dd3da756f6a9098fb4f09cf6041a24977b366825634ab50efeabd7207"
     version "1.0.0"
     declared_version_source "nimble"

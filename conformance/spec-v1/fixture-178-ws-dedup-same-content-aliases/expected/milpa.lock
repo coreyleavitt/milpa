@@ -3,11 +3,22 @@ version 1
 strategy "maxver"
 
 dep "foo" {
+    source {
+        kind "git"
+        url (url)"https://example.com/foo"
+    }
     identity "dag-sha256:bf96b8218ab368e242f81123dd8de4d52bfc53a100f755737a08196d86f15b64"
     version "0.0.0"
     src_dir "src"
     requires
     aliases "bar"
+    provenance {
+        origin "observed"
+        kind "git"
+        url "https://example.com/bar.git"
+        ref "main"
+        commit_sha "deadbeef02"
+    }
     provenance {
         origin "observed"
         kind "git"
@@ -18,6 +29,10 @@ dep "foo" {
 }
 
 dep "pkg-a" {
+    source {
+        kind "member"
+        name "pkg-a"
+    }
     identity "dag-sha256:b19b0be9e3067490e84a6bfb5f66c0e71edfeb4487dc32cd8e1d4b5bc419c913"
     version "0.0.0"
     src_dir "src"
@@ -30,6 +45,10 @@ dep "pkg-a" {
 }
 
 dep "pkg-b" {
+    source {
+        kind "member"
+        name "pkg-b"
+    }
     identity "dag-sha256:bec433de5e995d41563a93ae60ec31ec5865535e3f9d943c3f80118efd362782"
     version "0.0.0"
     src_dir "src"

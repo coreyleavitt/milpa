@@ -1,0 +1,16 @@
+// fixture-463: S8 (rfc-origin-as-identity.md §4.1/§10 item 14) — subpath
+// grammar. Two root deps declare the SAME git URL but DIFFERENT refs AND
+// DIFFERENT subpath= values: react-dom lives at packages/react-dom on
+// "main", react-core at packages/react-core on "v2-branch" within the
+// monorepo the URL points at. Per RFC §4.1 "same repo + different subpath =
+// different source-ids", these are two DISTINCT origins (distinct SourceId,
+// distinct canonical solver-var, distinct lockfile `source { }` node);
+// subpath is a pure identity discriminator in this slice (S8), not a
+// partial-checkout mechanism, so this fixture pins whatever the reference
+// oracle actually does with the combination (never hand-authored).
+name "testapp"
+kind "application"
+deps {
+    react-dom git=(url)"https://example.com/react.git" ref="main" subpath="packages/react-dom"
+    react-core git=(url)"https://example.com/react.git" ref="v2-branch" subpath="packages/react-core"
+}

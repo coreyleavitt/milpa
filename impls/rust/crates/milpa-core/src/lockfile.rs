@@ -13,9 +13,9 @@ use kdl::{KdlDocument, KdlNode, KdlValue};
 use milpa_manifest::{contains_unsafe_char, valid_flag_name, kdl_block_comment_depth, kdl_brace_depth, KDL_MAX_NESTING_DEPTH};
 use milpa_solver::VersionSource;
 use milpa_types::{
-    format_iso8601_timestamp, parse_iso8601_timestamp, AttestationKind, LockAttestation,
-    LockedDep, Lockfile, ProvenanceRecord, RekorRef, ResolvedDep, ResolvedGraph, Timestamp,
-    LOCKFILE_SCHEMA_VERSION,
+    format_iso8601_timestamp, parse_iso8601_timestamp, AttestationKind, FetchableOrigin,
+    LockAttestation, LockedDep, Lockfile, ProvenanceRecord, RekorRef, ResolvedDep, ResolvedGraph,
+    SourceId, Timestamp, LOCKFILE_SCHEMA_VERSION,
 };
 
 use crate::error::CoreError;
@@ -177,6 +177,7 @@ fn parse_dep(node: &KdlNode) -> LockResult<LockedDep> {
     let mut provenances: Vec<ProvenanceRecord> = Vec::new();
     let mut attestation: Option<LockAttestation> = None; // RFC per-entry-attestation.md P2 (§3.9)
     let mut declared_version_source: Option<String> = None; // A5: sibling source for `version`
+    let mut source_id: Option<SourceId> = None; // S5: structured on-disk source-id (§4.1/§7)
 
     for child in children(node) {
         match child.name().value() {
@@ -290,6 +291,12 @@ fn parse_dep(node: &KdlNode) -> LockResult<LockedDep> {
                     cond_requires.push(cr);
                 }
             }
+            // RFC origin-as-identity §4.1/§7 (S5): structured on-disk
+            // source-id — field-by-field into the frozen SourceId struct,
+            // never a flat-string parse.
+            "source" => {
+                source_id = Some(parse_source_block(child, &name)?);
+            }
             "provenance" => provenances.push(parse_provenance(child, &name)?),
             // RFC per-entry-attestation.md P2 (lockfile-schema §3.9): the
             // per-entry attestation CLAIM block. Malformed → None + a
@@ -316,6 +323,106 @@ fn parse_dep(node: &KdlNode) -> LockResult<LockedDep> {
         aliases,
         attestation,
         declared_version_source,
+        source_id,
+    })
+}
+
+/// Kind labels recognized by a `source { … }` block's `kind` discriminator
+/// (RFC origin-as-identity §4.1/§7, S5). Mirrors Python's
+/// `lockfile._SOURCE_KIND_LABELS`.
+const SOURCE_KIND_LABELS: &str = "git, oci, tarball, local, registry, member";
+
+/// Parse a `source { kind "…"; … }` block into a typed `SourceId` (RFC
+/// origin-as-identity §4.1/§7, S5). Mirrors Python's
+/// `lockfile._parse_source_block` function-for-function.
+///
+/// Structural (arity/missing-field) errors raise `LOCK-SRC-*`; the parsed
+/// RAW value is then passed through `source_id::normalize_source` (the sole
+/// validation boundary), which raises `SRC-ID-MALFORMED` on a malformed
+/// subpath / namespace / registry component.
+fn parse_source_block(node: &KdlNode, dep_name: &str) -> LockResult<SourceId> {
+    let mut fields: Vec<(&str, String)> = Vec::new();
+    for child in children(node) {
+        let a = args(child);
+        let [entry] = a.as_slice() else {
+            return Err(err(
+                "LOCK-SRC-FIELD-ARITY",
+                format!(
+                    "dep {dep_name:?}: source field {:?} must have exactly one value",
+                    child.name().value()
+                ),
+            ));
+        };
+        match entry.value().as_string() {
+            Some(s) => fields.push((child.name().value(), s.to_string())),
+            None => {
+                return Err(err(
+                    "LOCK-SRC-FIELD-ARITY",
+                    format!(
+                        "dep {dep_name:?}: source field {:?} must be a string",
+                        child.name().value()
+                    ),
+                ));
+            }
+        }
+    }
+
+    let get = |key: &str| -> Option<String> {
+        fields.iter().rev().find(|(k, _)| *k == key).map(|(_, v)| v.clone())
+    };
+
+    let kind = get("kind").ok_or_else(|| {
+        err(
+            "LOCK-SRC-KIND-MISSING",
+            format!("dep {dep_name:?}: source block missing 'kind' discriminator"),
+        )
+    })?;
+
+    let required = |key: &str| -> LockResult<String> {
+        get(key).ok_or_else(|| {
+            err(
+                "LOCK-SRC-FIELD-MISSING",
+                format!(
+                    "dep {dep_name:?}: source block (kind={kind:?}) missing required field {key:?}"
+                ),
+            )
+        })
+    };
+
+    let raw = match kind.as_str() {
+        "git" => SourceId::Fetchable(FetchableOrigin::Git {
+            url: required("url")?,
+            subpath: get("subpath"),
+        }),
+        "oci" => SourceId::Fetchable(FetchableOrigin::Oci {
+            registry: required("registry")?,
+            repository: required("repository")?,
+            subpath: get("subpath"),
+        }),
+        "tarball" => SourceId::Fetchable(FetchableOrigin::Tarball {
+            url: required("url")?,
+            subpath: get("subpath"),
+        }),
+        "local" => SourceId::Fetchable(FetchableOrigin::Local { path: required("path")? }),
+        "registry" => SourceId::Fetchable(FetchableOrigin::Registry {
+            registry: required("registry")?,
+            namespace: get("namespace"),
+            name: required("name")?,
+        }),
+        "member" => SourceId::Member { member_name: required("name")? },
+        other => {
+            return Err(err(
+                "LOCK-SRC-KIND-UNKNOWN",
+                format!(
+                    "dep {dep_name:?}: unknown source kind {other:?} (known: {SOURCE_KIND_LABELS})"
+                ),
+            ));
+        }
+    };
+
+    crate::source_id::normalize_source(&raw).map_err(|e| match e {
+        crate::error::MilpaError::Core(c) => c,
+        other => err("SRC-ID-MALFORMED", format!("{other:?}")),
     })
 }
 
@@ -824,6 +931,17 @@ pub fn format_lockfile(lockfile: &Lockfile) -> String {
         if let Some(ns) = &dep.namespace {
             lines.push(format!("    namespace {}", kdl_str(ns)));
         }
+        // RFC origin-as-identity §4.1/§7 (S5): the structured on-disk
+        // SourceId, typed children (uv's model). Positioned right after
+        // namespace, before identity. Omitted only for a lockfile predating
+        // S5 (forward-compat; a conformant S5+ emitter always writes it).
+        if let Some(sid) = &dep.source_id {
+            lines.push("    source {".to_string());
+            for field in format_source_fields(sid) {
+                lines.push(format!("        {field}"));
+            }
+            lines.push("    }".to_string());
+        }
         if let Some(identity) = &dep.identity {
             lines.push(format!("    identity {}", kdl_str(identity)));
         }
@@ -1000,6 +1118,61 @@ fn format_cond_require(cr: &milpa_types::CondRequire) -> Vec<String> {
         }
         out.push("    }".to_string());
         out
+    }
+}
+
+/// Emit `kind` + kind-specific typed children for a `source { … }` block
+/// (RFC origin-as-identity §4.1/§7, S5 — NORMATIVE, both impls MUST match
+/// byte-for-byte). Mirrors Python's `_format_source_fields`.
+///
+/// Field order per kind: git/tarball = kind/url/subpath?; oci =
+/// kind/registry/repository/subpath?; local = kind/path; registry =
+/// kind/registry/namespace?/name; member = kind/name.
+///
+/// URL-bearing fields carry the `(url)` KDL type annotation
+/// ([[kdl_url_convention]]); the parser reads the string content regardless
+/// of tag.
+fn format_source_fields(sid: &SourceId) -> Vec<String> {
+    match sid {
+        SourceId::Fetchable(FetchableOrigin::Git { url, subpath }) => {
+            let mut out = vec![format!("kind {}", kdl_str("git")), format!("url (url){}", kdl_str(url))];
+            if let Some(sp) = subpath {
+                out.push(format!("subpath {}", kdl_str(sp)));
+            }
+            out
+        }
+        SourceId::Fetchable(FetchableOrigin::Oci { registry, repository, subpath }) => {
+            let mut out = vec![
+                format!("kind {}", kdl_str("oci")),
+                format!("registry {}", kdl_str(registry)),
+                format!("repository {}", kdl_str(repository)),
+            ];
+            if let Some(sp) = subpath {
+                out.push(format!("subpath {}", kdl_str(sp)));
+            }
+            out
+        }
+        SourceId::Fetchable(FetchableOrigin::Tarball { url, subpath }) => {
+            let mut out = vec![format!("kind {}", kdl_str("tarball")), format!("url (url){}", kdl_str(url))];
+            if let Some(sp) = subpath {
+                out.push(format!("subpath {}", kdl_str(sp)));
+            }
+            out
+        }
+        SourceId::Fetchable(FetchableOrigin::Local { path }) => {
+            vec![format!("kind {}", kdl_str("local")), format!("path {}", kdl_str(path))]
+        }
+        SourceId::Fetchable(FetchableOrigin::Registry { registry, namespace, name }) => {
+            let mut out = vec![format!("kind {}", kdl_str("registry")), format!("registry {}", kdl_str(registry))];
+            if let Some(ns) = namespace {
+                out.push(format!("namespace {}", kdl_str(ns)));
+            }
+            out.push(format!("name {}", kdl_str(name)));
+            out
+        }
+        SourceId::Member { member_name } => {
+            vec![format!("kind {}", kdl_str("member")), format!("name {}", kdl_str(member_name))]
+        }
     }
 }
 
@@ -1220,6 +1393,216 @@ pub fn from_graph(
     }
 }
 
+/// A dep shape carrying `name`/`aliases`/`provenances` — implemented by both
+/// [`ResolvedDep`] (in-memory) and [`LockedDep`] (on-disk) so
+/// `format_dep_origin`/`collapse_notes` read identically from either.
+///
+/// RFC origin-as-identity.md §4.7/B3 (S3a-req): when the slot projection
+/// collapses two declared labels reaching one origin into a single canonical
+/// dep, dropping the non-canonical label MUST be visible, never silent
+/// ("the collapse is visible, never a silent disappearance"). Mirrors the
+/// Python `format_dep_origin`/`collapse_notes` (which duck-type on the same
+/// two fields) — single source of truth for both `resolve()`'s post-build
+/// stderr trace and `milpa show`, so the note text never drifts between them.
+pub trait AliasedDep {
+    fn dep_name(&self) -> &str;
+    fn dep_aliases(&self) -> &[String];
+    fn dep_provenances(&self) -> &[ProvenanceRecord];
+}
+
+impl AliasedDep for ResolvedDep {
+    fn dep_name(&self) -> &str {
+        &self.name
+    }
+    fn dep_aliases(&self) -> &[String] {
+        &self.aliases
+    }
+    fn dep_provenances(&self) -> &[ProvenanceRecord] {
+        &self.provenances
+    }
+}
+
+impl AliasedDep for LockedDep {
+    fn dep_name(&self) -> &str {
+        &self.name
+    }
+    fn dep_aliases(&self) -> &[String] {
+        &self.aliases
+    }
+    fn dep_provenances(&self) -> &[ProvenanceRecord] {
+        &self.provenances
+    }
+}
+
+/// Human-readable origin string for *dep* — `git+<url>`, `tar+<url>`,
+/// `oci+<registry>/<repository>`, `file+<path>`, `member+<name>`, or
+/// `root+<name>`.
+///
+/// Deliberately mirrors `source_id`'s canonical wire-format prefixes
+/// (RFC origin-as-identity.md §4.1) WITHOUT depending on `source_id` — it is
+/// derived from the dep's own OBSERVED `ProvenanceRecord` (falling back to
+/// the first record, or the dep's own name when there are none) so it reads
+/// identically whether called on an in-memory `ResolvedDep` (which also
+/// carries a `source_id`, not yet threaded to disk — that is a later slice)
+/// or an on-disk `LockedDep` reconstructed by `milpa show`.
+pub fn format_dep_origin<D: AliasedDep>(dep: &D) -> String {
+    let provenances = dep.dep_provenances();
+    let observed = provenances
+        .iter()
+        .find(|p| p.origin() == "observed")
+        .or_else(|| provenances.first());
+    match observed {
+        None => dep.dep_name().to_string(),
+        Some(ProvenanceRecord::Git { url, .. }) => format!("git+{url}"),
+        Some(ProvenanceRecord::Tarball { url, .. }) => format!("tar+{url}"),
+        Some(ProvenanceRecord::Oci {
+            registry,
+            repository,
+            ..
+        }) => format!("oci+{registry}/{repository}"),
+        Some(ProvenanceRecord::Local { path, .. }) => format!("file+{path}"),
+        Some(ProvenanceRecord::Member { name, .. }) => format!("member+{name}"),
+        Some(ProvenanceRecord::Root { name, .. }) => format!("root+{name}"),
+    }
+}
+
+/// One low-severity note per alias the §4.7 slot projection dropped.
+///
+/// E.g. `"'z3lib' and 'nimz3' both name git+https://…nim-z3; used 'nimz3'"`
+/// — the exact shape RFC origin-as-identity.md §4.7 specifies. Empty for a
+/// dep with no aliases. Notes are emitted in (canonical dep name, alias)
+/// lexicographic order — deterministic regardless of BFS/dict ordering.
+pub fn collapse_notes<D: AliasedDep>(deps: &[D]) -> Vec<String> {
+    let mut order: Vec<&D> = deps.iter().collect();
+    order.sort_by(|a, b| a.dep_name().cmp(b.dep_name()));
+    let mut notes = Vec::new();
+    for dep in order {
+        if dep.dep_aliases().is_empty() {
+            continue;
+        }
+        let origin = format_dep_origin(dep);
+        let mut aliases: Vec<&String> = dep.dep_aliases().iter().collect();
+        aliases.sort();
+        for alias in aliases {
+            notes.push(format!(
+                "'{alias}' and '{}' both name {origin}; used '{}'",
+                dep.dep_name(),
+                dep.dep_name()
+            ));
+        }
+    }
+    notes
+}
+
+/// The single diagnostic label for `dep`'s origin — mirrors Python's
+/// `_dep_origin_label` (used by [`check_directory_slot_collisions`], below).
+///
+/// Prefers `format_source_id` (`source_id.rs`, the SAME formatter
+/// `RES-BINDING-CONFLICT`/`FROZEN-SOURCE-ID-MISMATCH` reuse) when
+/// `dep.source_id` is populated (every fresh `resolve()`/`resolve_workspace()`
+/// dep, S3a+). Falls back to the provenance-derived `format_dep_origin`
+/// (above) when it is not — the frozen/verify reconstruction path
+/// (`frozen.rs`), whose `ResolvedDep` has no `source_id` until a later slice
+/// threads the lockfile's structured source node onto it.
+pub(crate) fn dep_origin_label(dep: &ResolvedDep) -> String {
+    match &dep.source_id {
+        Some(sid) => crate::source_id::format_source_id(sid),
+        None => format_dep_origin(dep),
+    }
+}
+
+/// The v1 **directory-slot** floor of the import-slot check
+/// (`rfc-origin-as-identity.md` §4.6, S6) — `RES-IMPORT-COLLISION`.
+/// Mirrors Python's `lockfile.check_directory_slot_collisions`
+/// function-for-function (§9 cross-impl discipline).
+///
+/// A plain function, no port: two distinct origins that would materialize
+/// into the identical `_deps/<slot>/` directory (`dep_dir_name(name,
+/// namespace)` — the SAME SSOT `rebuild_deps_view` uses to lay out
+/// `_deps/`) cannot coexist, because the second write would silently clobber
+/// the first. The complete, symbol-level check (comparing actual exported
+/// Nim module paths behind a `SymbolProviderPort`) is a later slice ("S7")
+/// — this floor is retained afterward as its cheap directory-level
+/// pre-filter, never deleted (§4.6 round-2 fix — G9).
+///
+/// **The `content_hash` short-circuit (§4.6, CRITICAL):** two origins that
+/// project to the same slot but fetch **byte-identical** trees are the exact
+/// same-bytes/different-origin case §3.3 celebrates as milpa's edge over
+/// Cargo (already realized post-solve by the S4b dedup pass, which folds any
+/// such pair into one canonical dep + alias before this function ever runs)
+/// — they cannot produce a Nim symbol conflict and MUST NOT raise. This
+/// function re-asserts that invariant directly, rather than trusting the
+/// caller never to invoke it on data the dedup pass hasn't deduped (e.g. a
+/// hand-edited or future-corrupted lockfile reconstructed by the frozen
+/// path, which runs no dedup pass at all): it raises ONLY when a shared slot
+/// ALSO disagrees on `identity` (content_hash) — never on slot alone. An
+/// EMPTY identity (`ResolvedDep::identity` has no `Option` — `frozen.rs`'s
+/// `resolved_from_locked` maps a missing `LockedDep.identity` to `""`) can
+/// never be proven equal to anything, so it does NOT short-circuit — mirrors
+/// Python's `None`-is-never-proven-equal rule exactly.
+///
+/// **Runs on fresh AND frozen graphs, no deferral (§10 S6 "F4"):** this
+/// function's only inputs are `ResolvedDep.name`/`.namespace` (the slot) and
+/// `.identity` (the raise/no-raise decision) — both already present on a
+/// frozen-reconstructed `ResolvedDep` (`frozen.rs`'s `resolved_from_locked`)
+/// exactly as they are on a fresh one. Naming the colliding origins uses
+/// `dep_origin_label` (above), which falls back to the provenance-derived
+/// `format_dep_origin` when `source_id` is absent (frozen, pre-S5) — so no
+/// new `SourceId` reconstruction plumbing is needed in `frozen.rs` to get
+/// full coverage today: this floor is wired into `resolve_frozen`/
+/// `resolve_workspace_frozen` (`frozen.rs`) exactly like `resolve()`/
+/// `resolve_workspace()` (`resolver.rs`), all four call sites, from this
+/// slice onward.
+///
+/// **Durable caveat (§4.6/G9 — also in spec/errors.md):** this is a
+/// *partial* proxy for "two packages export the same Nim symbol" — a slot
+/// collision implies a symbol collision, but the converse does not hold (two
+/// differently-named slots can still export the identical module, evading
+/// this floor). A non-raising call means "no directory-slot collision,"
+/// **never** "no import collision" in general.
+pub fn check_directory_slot_collisions(resolved: &ResolvedGraph) -> Result<(), CoreError> {
+    use milpa_types::dep_dir_name;
+    use std::collections::BTreeMap;
+
+    let mut by_slot: BTreeMap<String, Vec<&ResolvedDep>> = BTreeMap::new();
+    for dep in &resolved.deps {
+        let slot = dep_dir_name(&dep.name, dep.namespace.as_deref());
+        by_slot.entry(slot).or_default().push(dep);
+    }
+
+    for (slot, group) in by_slot {
+        if group.len() < 2 {
+            continue;
+        }
+        // content_hash short-circuit: every member must share ONE non-empty
+        // identity to be provably byte-identical. An empty identity (missing
+        // content hash) can never be proven equal, so it does NOT short-circuit.
+        let first_identity = &group[0].identity;
+        let all_same_and_known =
+            !first_identity.is_empty() && group.iter().all(|d| &d.identity == first_identity);
+        if all_same_and_known {
+            continue;
+        }
+        let existing = dep_origin_label(group[0]);
+        let conflicting = dep_origin_label(group[1]);
+        // A resolver-domain code (mirrors RES-BINDING-CONFLICT in binding.rs),
+        // not a lockfile-parse error — deliberately NOT the module's `err()`
+        // helper, which always tags `CoreError::Lockfile`.
+        return Err(CoreError::Resolver(
+            "RES-IMPORT-COLLISION",
+            format!(
+                "directory-slot collision at '_deps/{slot}/': {existing} and {conflicting} have \
+                 different content and cannot both materialize into this slot — give one an \
+                 explicit, distinct dep label (or reconcile via `overrides {{}}`) to separate \
+                 them (note: this checks directory slots only, not full Nim-symbol import \
+                 collisions — a clean run here does not rule out a symbol collision across two \
+                 differently-named slots)"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Convert a solver-var form requires name (`"ns::name"`) to lockfile-safe
 /// slash form (`"ns/name"`). Bare dep names (no `::`) are returned unchanged.
 /// This is the SOLE conversion site — matches Python `_req_name_to_lockfile`.
@@ -1271,18 +1654,28 @@ fn locked_from_resolved(d: &ResolvedDep) -> LockedDep {
         // (index-side) to LockAttestation (lockfile-side). P3a: bundle_pin
         // NOW round-trips too (lockfile-schema §3.9 P3a addition) — `milpa
         // verify`'s offline re-verification needs it downstream of a live
-        // resolve. namespace is folded in from ResolvedDep.registry_namespace
-        // (the entry's REAL index namespace, distinct from d.namespace which
-        // is manifest-qualification only).
+        // resolve. RFC origin-as-identity §4.4 (B2/G10): namespace is now
+        // derived from `d.source_id`'s namespace (the entry's REAL index
+        // namespace, distinct from d.namespace which is manifest-
+        // qualification only) — the deleted `registry_namespace` field's
+        // successor.
         attestation: d.attestation.as_ref().map(|a| LockAttestation {
             kind: a.kind.clone(),
             rekor: a.rekor.clone(),
             bundle_pin: a.bundle_pin.clone(),
-            namespace: d.registry_namespace.clone().unwrap_or_default(),
+            namespace: match &d.source_id {
+                Some(SourceId::Fetchable(FetchableOrigin::Registry { namespace, .. })) => {
+                    namespace.clone().unwrap_or_default()
+                }
+                _ => String::new(),
+            },
         }),
         // A5: carry the sibling declared-version source straight through —
         // never recomputed at the lockfile boundary.
         declared_version_source: d.declared_version_source.clone(),
+        // RFC origin-as-identity §4.1/§7 (S5): carry the binding phase's
+        // accepted SourceId straight through to the on-disk structured form.
+        source_id: d.source_id.clone(),
     }
 }
 
@@ -2099,6 +2492,7 @@ mod tests {
             strategy: "maxver".into(),
             exclude_newer: None,
             deps: vec![LockedDep {
+            source_id: None,
                 declared_version_source: None,
                 name: "foo".into(),
                 namespace: None,
@@ -2170,6 +2564,7 @@ mod tests {
             strategy: "maxver".into(),
             exclude_newer: None,
             deps: vec![LockedDep {
+            source_id: None,
                 declared_version_source: None,
                 name: "foo".into(),
                 namespace: None,
@@ -2214,6 +2609,7 @@ mod tests {
             strategy: "maxver".into(),
             exclude_newer: None,
             deps: vec![LockedDep {
+            source_id: None,
                 declared_version_source: None,
                 name: "safe-name".into(),  // must be clean: LOCK-DEP-NAME-INVALID rejects non-charset chars
                 namespace: None,
@@ -2268,6 +2664,7 @@ mod tests {
             strategy: "maxver".into(),
             exclude_newer: None,
             deps: vec![LockedDep {
+            source_id: None,
                 declared_version_source: None,
                 name: "foo".into(),
                 namespace: None,
@@ -2341,6 +2738,7 @@ mod tests {
                 strategy: "maxver".into(),
                 exclude_newer: None,
                 deps: vec![LockedDep {
+            source_id: None,
                     declared_version_source: None,
                     name: "foo".into(),
                     namespace: None,
@@ -2389,6 +2787,7 @@ mod tests {
     fn rdep(name: &str, prov: ProvenanceRecord, requires: Vec<&str>) -> ResolvedDep {
         ResolvedDep {
             declared_version_source: None,
+            source_id: None,
             name: name.into(),
             namespace: None,
             identity: format!("dag-sha256:{}", "0".repeat(63) + "1"),
@@ -2401,7 +2800,6 @@ mod tests {
             aliases: vec![],
             active_flags: vec![],
             attestation: None,
-            registry_namespace: None,
         }
     }
 
@@ -2731,6 +3129,7 @@ mod tests {
             strategy: "maxver".into(),
             exclude_newer: None,
             deps: vec![LockedDep {
+            source_id: None,
                 declared_version_source: None,
                 name: "foo".into(),
                 namespace: None,
@@ -2815,6 +3214,7 @@ mod tests {
             strategy: "maxver".into(),
             exclude_newer: None,
             deps: vec![LockedDep {
+            source_id: None,
                 declared_version_source: None,
                 name: "foo".into(),
                 namespace: None,
@@ -2845,6 +3245,7 @@ mod tests {
     /// Build a minimal LockedDep for verify tests.
     fn make_verify_dep(name: &str, aliases: Vec<String>) -> LockedDep {
         LockedDep {
+            source_id: None,
             declared_version_source: None,
             name: name.into(),
             namespace: None,
@@ -3205,6 +3606,7 @@ mod tests {
     /// that verify passes based on identity alone and ignores provenance metadata.
     fn make_verify_dep_multi_prov(name: &str, identity: &str) -> LockedDep {
         LockedDep {
+            source_id: None,
             declared_version_source: None,
             name: name.into(),
             namespace: None,
@@ -3340,6 +3742,7 @@ mod tests {
             strategy: "maxver".into(),
             exclude_newer: None,
             deps: vec![LockedDep {
+            source_id: None,
                 declared_version_source: None,
                 name: "foo".into(),
                 namespace: None,
@@ -3400,6 +3803,7 @@ mod tests {
 
     fn make_locked(cond_requires: Vec<milpa_types::CondRequire>) -> LockedDep {
         LockedDep {
+            source_id: None,
             declared_version_source: None,
             name: "qux".into(),
             namespace: None,
@@ -3877,6 +4281,7 @@ mod tests {
 
     fn make_locked_with_aliases(aliases: Vec<String>) -> LockedDep {
         LockedDep {
+            source_id: None,
             declared_version_source: None,
             name: "foo".into(),
             namespace: None,
@@ -3928,6 +4333,7 @@ mod tests {
     fn aliases_position_after_cond_requires_before_active_flags() {
         // Field order: requires → cond-require* → aliases → active_flags
         let dep = LockedDep {
+            source_id: None,
             declared_version_source: None,
             name: "foo".into(),
             namespace: None,
@@ -3994,12 +4400,202 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // S3a-req (RFC origin-as-identity.md §4.7/B3) — format_dep_origin /
+    // collapse_notes: the alias-collapse note visible on `milpa show` / the
+    // resolve trace. Mirrors Python's TestFormatDepOrigin/TestCollapseNotes.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn format_dep_origin_git_provenance() {
+        let dep = make_locked_with_aliases(vec![]);
+        assert_eq!(format_dep_origin(&dep), "git+https://example.com/foo.git");
+    }
+
+    #[test]
+    fn format_dep_origin_tarball_provenance() {
+        let mut dep = make_locked_with_aliases(vec![]);
+        dep.provenances = vec![ProvenanceRecord::Tarball {
+            url: "https://example.com/foo.tar.gz".into(),
+            sha256: None,
+            origin: "observed".into(),
+        }];
+        assert_eq!(format_dep_origin(&dep), "tar+https://example.com/foo.tar.gz");
+    }
+
+    #[test]
+    fn format_dep_origin_oci_provenance() {
+        let mut dep = make_locked_with_aliases(vec![]);
+        dep.provenances = vec![ProvenanceRecord::Oci {
+            registry: "ghcr.io".into(),
+            repository: "acme/foo".into(),
+            digest: format!("sha256:{}", "a".repeat(64)),
+            origin: "observed".into(),
+        }];
+        assert_eq!(format_dep_origin(&dep), "oci+ghcr.io/acme/foo");
+    }
+
+    #[test]
+    fn format_dep_origin_prefers_observed_over_declared() {
+        let mut dep = make_locked_with_aliases(vec![]);
+        dep.provenances = vec![
+            ProvenanceRecord::Git {
+                url: "https://mirror.example.com/foo.git".into(),
+                ref_spec: None,
+                commit_sha: None,
+                origin: "declared".into(),
+                submodule_shas: vec![],
+            },
+            ProvenanceRecord::Git {
+                url: "https://example.com/foo.git".into(),
+                ref_spec: None,
+                commit_sha: None,
+                origin: "observed".into(),
+                submodule_shas: vec![],
+            },
+        ];
+        assert_eq!(format_dep_origin(&dep), "git+https://example.com/foo.git");
+    }
+
+    #[test]
+    fn format_dep_origin_no_provenance_falls_back_to_name() {
+        let mut dep = make_locked_with_aliases(vec![]);
+        dep.provenances = vec![];
+        assert_eq!(format_dep_origin(&dep), "foo");
+    }
+
+    #[test]
+    fn collapse_notes_empty_when_no_aliases() {
+        let dep = make_locked_with_aliases(vec![]);
+        assert!(collapse_notes(&[dep]).is_empty());
+    }
+
+    #[test]
+    fn collapse_notes_one_note_per_alias() {
+        let dep = make_locked_with_aliases(vec!["bar".into(), "baz".into()]);
+        let notes = collapse_notes(&[dep]);
+        assert_eq!(
+            notes,
+            vec![
+                "'bar' and 'foo' both name git+https://example.com/foo.git; used 'foo'"
+                    .to_string(),
+                "'baz' and 'foo' both name git+https://example.com/foo.git; used 'foo'"
+                    .to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn collapse_notes_deterministic_order_across_deps() {
+        // Notes are ordered by canonical dep name, regardless of input order.
+        let mut dep_z = make_locked_with_aliases(vec!["zzz-alias".into()]);
+        dep_z.name = "zzz".into();
+        let mut dep_a = make_locked_with_aliases(vec!["aaa-alias".into()]);
+        dep_a.name = "aaa".into();
+        let notes = collapse_notes(&[dep_z, dep_a]);
+        assert!(notes[0].starts_with("'aaa-alias'"), "got: {notes:?}");
+        assert!(notes[1].starts_with("'zzz-alias'"), "got: {notes:?}");
+    }
+
+    // -----------------------------------------------------------------------
+    // S6 (rfc-origin-as-identity.md §4.6/§10) — check_directory_slot_collisions.
+    // Mirrors Python's test_s6_import_slot_collision.py.
+    // -----------------------------------------------------------------------
+
+    fn git_source(url: &str) -> milpa_types::SourceId {
+        milpa_types::SourceId::Fetchable(milpa_types::FetchableOrigin::Git {
+            url: url.into(),
+            subpath: None,
+        })
+    }
+
+    fn s6_dep(name: &str, identity: &str, source_id: Option<milpa_types::SourceId>, url: &str) -> ResolvedDep {
+        let mut dep = rdep(name, git(url, "main", None), vec![]);
+        dep.identity = identity.into();
+        dep.source_id = source_id;
+        dep
+    }
+
+    #[test]
+    fn s6_raises_on_different_content_same_slot() {
+        let a = s6_dep("foo", &format!("sha256:{}", "a".repeat(64)), Some(git_source("https://example.com/a.git")), "https://example.com/a.git");
+        let b = s6_dep("foo", &format!("sha256:{}", "b".repeat(64)), Some(git_source("https://example.com/b.git")), "https://example.com/b.git");
+        let graph = ResolvedGraph { deps: vec![a, b] };
+
+        let err = check_directory_slot_collisions(&graph).unwrap_err();
+        assert_eq!(err.code(), "RES-IMPORT-COLLISION");
+        assert!(err.message().contains("example.com/a"));
+        assert!(err.message().contains("example.com/b"));
+        assert!(err.message().contains("symbol"), "must carry the directory-slot-only caveat: {}", err.message());
+    }
+
+    #[test]
+    fn s6_content_hash_short_circuit_no_raise() {
+        // Same slot, distinct source-ids, SAME identity — fixture-458's shape.
+        let same_id = format!("sha256:{}", "a".repeat(64));
+        let a = s6_dep("chronos", &same_id, Some(git_source("https://example.com/chronos.git")), "https://example.com/chronos.git");
+        let b = s6_dep("chronos", &same_id, Some(git_source("https://example.com/chronos-fork.git")), "https://example.com/chronos-fork.git");
+        let graph = ResolvedGraph { deps: vec![a, b] };
+
+        assert!(check_directory_slot_collisions(&graph).is_ok());
+    }
+
+    #[test]
+    fn s6_empty_identity_is_not_proven_equal() {
+        // An empty identity (frozen.rs's unwrap_or_default() sentinel for a
+        // missing LockedDep.identity) can never be proven equal to another
+        // dep's identity — the short-circuit must not fire on "both unknown".
+        let a = s6_dep("foo", "", Some(git_source("https://example.com/a.git")), "https://example.com/a.git");
+        let b = s6_dep("foo", "", Some(git_source("https://example.com/b.git")), "https://example.com/b.git");
+        let graph = ResolvedGraph { deps: vec![a, b] };
+
+        let err = check_directory_slot_collisions(&graph).unwrap_err();
+        assert_eq!(err.code(), "RES-IMPORT-COLLISION");
+    }
+
+    #[test]
+    fn s6_ordinary_graph_no_raise() {
+        let a = s6_dep("foo", &format!("sha256:{}", "a".repeat(64)), None, "https://example.com/a.git");
+        let b = s6_dep("bar", &format!("sha256:{}", "b".repeat(64)), None, "https://example.com/b.git");
+        let graph = ResolvedGraph { deps: vec![a, b] };
+
+        assert!(check_directory_slot_collisions(&graph).is_ok());
+    }
+
+    #[test]
+    fn s6_namespace_disambiguates_bare_name_collision() {
+        // Two deps named "baz" in DIFFERENT namespaces project to distinct
+        // "_deps/@ns/baz" slots (dep_dir_name's own collision-free design).
+        let mut a = s6_dep("baz", &format!("sha256:{}", "a".repeat(64)), None, "https://example.com/a.git");
+        a.namespace = Some("ns1".into());
+        let mut b = s6_dep("baz", &format!("sha256:{}", "b".repeat(64)), None, "https://example.com/b.git");
+        b.namespace = Some("ns2".into());
+        let graph = ResolvedGraph { deps: vec![a, b] };
+
+        assert!(check_directory_slot_collisions(&graph).is_ok());
+    }
+
+    #[test]
+    fn s6_falls_back_to_format_dep_origin_when_source_id_absent() {
+        // Frozen path (pre a later slice): source_id is None, so the label
+        // must fall back to format_dep_origin (provenance-derived) rather
+        // than panicking or omitting the origin from the message.
+        let a = s6_dep("foo", &format!("sha256:{}", "a".repeat(64)), None, "https://example.com/a.git");
+        let b = s6_dep("foo", &format!("sha256:{}", "b".repeat(64)), None, "https://example.com/b.git");
+        let graph = ResolvedGraph { deps: vec![a, b] };
+
+        let err = check_directory_slot_collisions(&graph).unwrap_err();
+        assert!(err.message().contains("git+https://example.com/a.git"));
+        assert!(err.message().contains("git+https://example.com/b.git"));
+    }
+
+    // -----------------------------------------------------------------------
     // A5 (resolution-semantics RFC §3 Axis A (b) / §5) — declared_version_source
     // field: the sibling to `version` naming WHICH precedence step produced it.
     // -----------------------------------------------------------------------
 
     fn make_locked_with_dvs(version: &str, declared_version_source: Option<String>) -> LockedDep {
         LockedDep {
+            source_id: None,
             declared_version_source,
             name: "foo".into(),
             namespace: None,
@@ -4262,6 +4858,7 @@ mod tests {
     /// Helper: a minimal LockedDep with LocalProvenanceRecord and no identity.
     fn local_locked_dep(name: &str, path: &str) -> LockedDep {
         LockedDep {
+            source_id: None,
             declared_version_source: None,
             name: name.to_string(),
             namespace: None,
@@ -4426,6 +5023,7 @@ mod tests {
 
     fn make_locked_dep(name: &str, identity: Option<&str>, provs: Vec<ProvenanceRecord>) -> LockedDep {
         LockedDep {
+            source_id: None,
             declared_version_source: None,
             name: name.into(),
             namespace: None,
@@ -4623,6 +5221,7 @@ mod tests {
     #[test]
     fn test_position_after_active_flags_before_provenance() {
         let dep = LockedDep {
+            source_id: None,
             declared_version_source: None,
             name: "foo".into(),
             namespace: None,
@@ -4785,8 +5384,9 @@ mod tests {
         // P3a (RFC per-entry-attestation.md §7, lockfile-schema §3.9 addition):
         // `locked_from_resolved` now carries `bundle_pin` through (it no
         // longer drops it — needed for `milpa verify`'s offline
-        // re-verification), and folds `ResolvedDep::registry_namespace` into
-        // `LockAttestation::namespace`.
+        // re-verification). RFC origin-as-identity §4.4 (B2/G10, S5): folds
+        // `source_id`'s namespace (the deleted `registry_namespace` field's
+        // successor) into `LockAttestation::namespace`.
         let entry_att = milpa_types::EntryAttestation {
             kind: AttestationKind::AuthorSigned { signer: "https://example.com/wf.yaml".into() },
             rekor: Some(RekorRef { uuid: "u".into(), log_index: "1".into(), integrated_time: "2".into() }),
@@ -4794,6 +5394,11 @@ mod tests {
         };
         let resolved = ResolvedDep {
             declared_version_source: None,
+            source_id: Some(SourceId::Fetchable(FetchableOrigin::Registry {
+                registry: "tianguis".into(),
+                namespace: Some("ns1".into()),
+                name: "foo".into(),
+            })),
             name: "foo".into(),
             namespace: None,
             identity: VALID_ID.into(),
@@ -4812,7 +5417,6 @@ mod tests {
             aliases: vec![],
             active_flags: vec![],
             attestation: Some(entry_att),
-            registry_namespace: Some("ns1".into()),
         };
         let graph = ResolvedGraph { deps: vec![resolved] };
         let lf = from_graph(&graph, "maxver", None);
@@ -4836,6 +5440,7 @@ mod tests {
     fn test_unattested_entry_has_no_lockfile_block() {
         let resolved = ResolvedDep {
             declared_version_source: None,
+            source_id: None,
             name: "foo".into(),
             namespace: None,
             identity: VALID_ID.into(),
@@ -4854,7 +5459,6 @@ mod tests {
             aliases: vec![],
             active_flags: vec![],
             attestation: None,
-            registry_namespace: None,
         };
         let graph = ResolvedGraph { deps: vec![resolved] };
         let lf = from_graph(&graph, "maxver", None);

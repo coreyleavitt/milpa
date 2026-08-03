@@ -1,0 +1,12 @@
+schema_version 1
+package "foo" {
+    version "1.0.0" {
+        content_hash "dag-sha256:55dd310de955124ca7ae1af4b0bdcd6f2d316c9f6d97564991e3a80655906153"
+        provenance {
+            kind "git"
+            url "https://registry.example.com/foo.git"
+            ref "v1.0.0"
+            commit_sha "4444444444444444444444444444444444444444"
+        }
+    }
+}

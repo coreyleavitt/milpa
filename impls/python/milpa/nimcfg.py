@@ -26,7 +26,7 @@ from milpa.lockfile import (
     ResolvedGraph,
     RootProvenanceRecord,
 )
-from milpa.version import dep_dir_name
+from milpa.version import DepKey, dep_dir_name
 
 if TYPE_CHECKING:
     from milpa.workspace import LoadedMember, LoadedWorkspace
@@ -232,8 +232,16 @@ def format_workspace_nimcfgs(
 
     workspace_root: Path = workspace.root_dir
 
-    # Build graph lookups
-    dep_by_name: dict[str, ResolvedDep] = {d.name: d for d in graph.deps}
+    # Build graph lookups. KEY BY THE QUALIFIED SOLVER-VAR, not the bare name:
+    # ``ResolvedDep.requires`` entries are qualified solver-variable strings
+    # (``ns1::foo``), so a bare-name index silently misses a namespace-qualified
+    # transitive dep — dropping it AND its whole subtree from the member's
+    # nim.cfg --path closure with no error (R2). A member's own key is
+    # ``DepKey(member_name, None).solver_var()`` == the bare member name, so the
+    # member lookup below is unaffected.
+    dep_by_name: dict[str, ResolvedDep] = {
+        DepKey(name=d.name, namespace=d.namespace).solver_var(): d for d in graph.deps
+    }
 
     out: dict[str, str] = {}
 

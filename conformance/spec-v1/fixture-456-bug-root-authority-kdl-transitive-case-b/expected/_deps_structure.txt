@@ -1,0 +1,3 @@
+nim-z3 -> <CAS_ROOT>/dag-sha256/99ec44d54733f547c95c90e4c4e5b57095414e69dc907243a20e470f504c75aa/
+proptest -> <CAS_ROOT>/dag-sha256/d6bc557ecab7ae48580ba47b1e25a4e69c083f1a283b6cd0c9183c2e49b0dcd0/
+softlink -> <CAS_ROOT>/dag-sha256/0a1b703694686b843ec60a3ba41f1691673a29ff02fb3216be445c2aeeba9ede/

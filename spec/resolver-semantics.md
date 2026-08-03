@@ -411,6 +411,23 @@ merely how to tie-break individual package picks.
 > manifest, index, and strategy.  The solved package order determines
 > which of the (possibly many) complete solutions is canonical.
 
+> NORMATIVE (`rfc-origin-as-identity.md` §4.2.1/§4.7): **first-occurrence
+> dedup (step 3) is keyed by `canonical(source_id)`, not by the reference's
+> declared label.** Since the solver variable is a source-id (§6b), two BFS
+> parents reaching the same origin under two different author-chosen labels
+> (e.g. one dep block names it `nimz3`, another names the same URL `z3lib`)
+> are ONE position in P, not two — the position is assigned at the origin's
+> first BFS occurrence. This is what makes the pre-fetch collapse of
+> same-URL-different-label direct deps possible (§10.1's binding-phase
+> `DUPLICATE` outcome is the arbitration; this rule is its ordering
+> consequence). The chosen **display** label for that position (which of the
+> two author-chosen names appears in `_deps/`/`nim.cfg`) is a separate,
+> fully-specified tie-break — root-declared label beats any transitive's;
+> among transitive labels with no root claim, first-BFS-occurrence wins;
+> derived URL-tail label is last resort (`rfc-origin-as-identity.md` §4.7) —
+> and a dropped label MUST be surfaced as a visible, low-severity note (never
+> a silent disappearance from `_deps/`).
+
 **Worked example — declaration order decides the canonical solution.**
 
 Consider the scenario from the conformance fixture
@@ -720,48 +737,120 @@ yet exist ([[feedback_minimal_over_completeness]], [[positioning_no_generic]]).
 
 ---
 
-## 6a  DepKey — resolver identity key
+## 6a  DepKey — the binding/grouping key
 
-> NORMATIVE: Every implementation MUST represent the resolver-level identity
-> of a dep as a **`DepKey`** value, not a bare string. The canonical shape is:
+> NORMATIVE: Every implementation MUST represent a dep **reference's**
+> grouping identity as a **`DepKey`** value, not a bare string. The canonical
+> shape is:
 >
 > ```
 > DepKey { name: String, namespace: Option<String> }
 > ```
 >
-> In S1 (rfc-resolver-correctness.md), `namespace` is always `None` — strictly
-> equivalent to a bare string but type-correct. S5b populates `namespace` from
-> the manifest grammar for namespace-qualified `NamedDep` references.
+> `namespace` is `None` for a bare (unqualified) reference and populated from
+> the manifest grammar for a namespace-qualified `NamedDep` reference (§3.2 of
+> `spec/manifest-grammar.md`).
 >
 > **Ordering:** `DepKey` values are ordered lexicographically by `(namespace,
 > name)`, with `None` namespace sorting before any non-`None` value.
 >
 > **Usage:** `DepKey` is used as the key in the frozen-path manifest-coverage
-> index (§7.1 condition 2) and MUST be used in `seen_named` (the resolver's
-> transitive-named-dep dedup set, S5a). This forces the alias-awareness fix:
-> the index maps EVERY canonical name AND every alias to its `LockedDep`.
+> index (§7.1 condition 2), MUST be used in `seen_named` (the resolver's
+> transitive-named-dep dedup set), and — since `rfc-origin-as-identity.md`
+> §4.3 — is the grouping/query key of the **binding phase** (§6b): a bare-name
+> store is the literal root cause of #193 (a same-name, different-namespace
+> collision falsely treated as one package), so every binding-phase lookup
+> and arbitration decision is scoped by `DepKey`, never by bare `name` alone.
+> This forces the alias-awareness fix: the frozen-path index maps EVERY
+> canonical name AND every alias to its `LockedDep`.
 
-## 6b  Solver variable (solver_var) — S5b
+## 6b  The solver variable — a source-id, in two phases (`rfc-origin-as-identity.md` §3/§4)
 
-> NORMATIVE (S5b): The **solver variable** is the string key used INTERNALLY
-> by the PubGrub solver. It is derived from the `DepKey`:
+> NORMATIVE (repeal-and-replace): The rule this subsection previously stated —
+> that the solver variable is a name/`DepKey`-derived string (`name`, or
+> `"ns::name"` for a qualified reference) and that a "cross-name precedence
+> gate" (`RES-PROVENANCE-CONFLICT`) keyed on that string to stop two
+> transports from claiming one dep — is **superseded**. The defect that rule
+> encoded (`#193`) was keying the solver by the consumer's **label**. The
+> solver variable is now a **source-id**: the dep's version-independent
+> **origin** (`SourceId` — a git URL, an OCI coordinate, a tarball URL, a
+> local path, a registry coordinate, or a workspace-member name; ref/tag/
+> digest excluded — they are versions, not origin). Coordinate-is-origin: a
+> `named` (registry) dep's origin **is** its registry coordinate; a
+> `git=`/`local=`/`tarball=` dep's origin is its own declared URL/path. The
+> same name resolving through two different origins is **not** one package —
+> it is two packages sharing an import label; `overrides {}` is the only
+> bridge between them (§10).
+
+> NORMATIVE: Deriving the solver variable for a given dep **reference**
+> (a root/workspace-member declaration, a transitive `requires` occurrence, a
+> provider stub, or a solved candidate alike) is **two distinct, separately
+> specified phases** — conflating them was the root cause of the earlier
+> "fictional registry canonical" defect this subsection also repeals:
 >
-> - Bare dep (`namespace == None`): `solver_var = name`
-> - Qualified dep (`namespace == Some(ns)`): `solver_var = "ns::name"`
->
-> The double-colon separator (`::`) is SOLVER-INTERNAL ONLY. It MUST NOT
-> appear in the lockfile, the `_deps/` layout, the `nim.cfg` path entries,
-> or the `requires` list. The `::` form is invisible to users; it never
-> reaches any serialized surface.
->
-> **Consequence:** Two NamedDeps with the same bare `name` but different
-> `namespace` values have distinct solver variables and are treated as
-> completely independent packages by the solver.
->
-> **Cross-name precedence gate:** The gate that prevents two different
-> transports from claiming the same dep (RES-PROVENANCE-CONFLICT) MUST key
-> on the solver variable, not the bare name. Two qualified deps sharing a
-> bare name MUST NOT be flagged as conflicting by the gate.
+> 1. **Name-resolution** (`reference → source_id`, binding-aware) — *what
+>    source does this reference actually point to?* Evaluated against the
+>    current state of the **binding phase** (a `BindingResolver`, or
+>    equivalent, holding one accepted `SourceId` per `DepKey`):
+>    1. If this reference's `DepKey` is **already bound** (by a root claim, an
+>       `overrides {}` rule, a workspace member/standalone-root self-claim, or
+>       an earlier-accepted transitive claim) — that bound `SourceId` wins,
+>       **regardless of what kind of declaration this reference itself is**.
+>       This is what unifies a root `bearssl git=(url)"…"` with a transitive
+>       bare `requires "bearssl >= 0.2.8"`: both share one `DepKey`
+>       (`name="bearssl"`, `namespace=None`); the transitive's own guess is
+>       never even computed, because the root's bound `GitSourceId` is found
+>       first. A direct `git=`/`local=`/`tarball=`/`oci=` declaration is
+>       therefore, semantically, an **implicit override** of that name (the
+>       same mechanism as an explicit `overrides {}` rule, Cargo `[patch]` /
+>       nimble URL-federation unified into one).
+>    2. Otherwise (genuinely first encounter — no root claim, no
+>       `overrides {}` rule, no prior transitive binding) — fall back to a
+>       **kind default**: the standalone root's own declared name → the
+>       workspace-member-style self source-id (§14); an `overrides {}` match →
+>       the override target's source-id; a `git=`/`tarball=`/`local=`
+>       declaration → that declaration's own URL/path; otherwise (a bare
+>       `named` reference) → the registry coordinate resolved via the
+>       pre-loaded index.
+> 2. **Canonicalization** (`source_id → canonical`, uniform) — *what is the
+>    stable key for this source?* `canonical(source_id)` (one-way, injective;
+>    `spec/identity.md`). This step is **kind-free**: every kind is
+>    canonicalized the same way. There is no "eager kinds stay name-keyed"
+>    carve-out — the PubGrub solver variable (`Term.package`) is
+>    `canonical(source_id)` for **every** resolved node, git/tarball/local/
+>    member/registry alike.
+
+> NORMATIVE: **Root-vs-root** disagreement for one `DepKey` (e.g. a root dep
+> declaration and a root `overrides {}` rule naming the same package) MUST be
+> reconciled — the override pre-empting the plain declaration — **before**
+> any claim is bound; two disagreeing root claims for one `DepKey` reaching
+> the binding phase is an implementation-internal invariant violation, never
+> a resolvable-at-runtime case. **Transitive** claims are arbitrated as they
+> arrive (§10 has the full arbitration table and error conditions —
+> `RES-BINDING-CONFLICT`, the successor to the repealed
+> `RES-PROVENANCE-CONFLICT`).
+
+> NORMATIVE (repeal-and-replace of the prior "`::` MUST NOT appear on any
+> serialized surface" rule): a namespace-qualified reference's lookup form
+> (`"ns::name"`, used only as an internal grouping-key convenience when
+> constructing a `DepKey`/looking up a binding) remains solver/binding-phase
+> internal — but the rule requiring this is now vacuously satisfied by
+> construction, not by a separate leak-prevention check: the **on-disk**
+> origin is always the structured `source { … }` block (`spec/lockfile-
+> schema.md` §3.10), never the solver's in-memory canonical string or the
+> `::` lookup form, so neither can leak onto any serialized surface. `_deps/`
+> layout and `nim.cfg`/`requires` emission for a qualified named dep keep the
+> unchanged `@<namespace>/<name>` convention (§6c) — that convention is about
+> the *display* slot for a qualified reference, orthogonal to solver keying.
+
+> NOTE: The reference implementation is `binding.canonical_key_for_requirement`
+> (phase 1 + phase 2 composed) and `BindingResolver` (`binding.py`,
+> `rfc-origin-as-identity.md` §4.3) for the binding-phase state; `Term.package`
+> and the provider's candidate/stub dicts are fed `canonical(source_id)`
+> uniformly. `DepKey.from_solver_var`/`Claim.name` still carry the `"ns::name"`
+> qualified-lookup string internally — this is the phase-1 lookup key, not the
+> phase-2 solver variable, and it is what §6a's `DepKey`-scoping discipline
+> (not a bare `name`) protects against the #193 regression.
 
 ## 6c  On-disk layout for qualified deps — S5b
 
@@ -847,7 +936,7 @@ conditions that disqualify the `--frozen` fast path. `spec/cli-contract.md`
 cross-references this section rather than restating the list.
 
 > NORMATIVE: The frozen *resolve path* (`resolve_frozen()` /
-> `resolve_workspace_frozen()`) raises exactly the following ten
+> `resolve_workspace_frozen()`) raises exactly the following twelve
 > `FROZEN-*` codes on precondition failure (non-`FROZEN-*` failures
 > silently fall through to the slow path when `--frozen` was not
 > explicitly set, or hard-error when it was):
@@ -881,6 +970,29 @@ cross-references this section rather than restating the list.
 >     `resolution { exclude-newer }` (default: unset). Built manifest-
 >     sourced from the start, mirroring exactly how #1
 >     (`FROZEN-STRATEGY-MISMATCH`) is built — never a hardcoded literal.
+> 11. **`FROZEN-REGISTRY-ALIAS-UNRESOLVED`** (rfc-origin-as-identity.md
+>     §7.1 D3, S5) — a locked dep's structured `source { kind "registry"
+>     … }` node (`lockfile-schema.md` §3.10) names a registry alias this
+>     machine's configuration does not recognize. **Checked FIRST** among
+>     the two source-id preconditions (before #12) and short-circuits: an
+>     unresolved alias means the coordinate comparison cannot even be
+>     attempted, so it is never misreported as a mismatch instead.
+> 12. **`FROZEN-SOURCE-ID-MISMATCH`** (rfc-origin-as-identity.md §7.1 D2,
+>     S5) — a manifest dep's declared origin (`git=`/`local=`/`tarball=`/a
+>     bare registry name), evaluated **AFTER** any `overrides {}` rule
+>     redirects it (reusing the same override-reconciliation helper
+>     `BindingResolver.__init__`/`BindingResolver::new` uses — never a
+>     second copy, and never the raw pre-override declaration), does not
+>     equal the corresponding locked dep's `source_id`. Scoped to
+>     root-authoritative claims only (an ordinary manifest dep declaration
+>     or an `overrides {}` target) — a purely transitive dep's own
+>     declaration lives inside another dep's fetched manifest, which the
+>     frozen path never re-reads, so there is nothing to compare it
+>     against. For a bare (unqualified) named dep, only the registry alias
+>     and name are compared (the namespace component needs a live index
+>     the frozen path does not have). Both preconditions are skipped
+>     entirely for a locked dep with no recorded `source_id` (a pre-S5
+>     lockfile, forward-compat).
 >
 > No other `FROZEN-*` *resolve-path preconditions* exist; this list is
 > closed. Two further `FROZEN-*` codes — `FROZEN-NO-LOCKFILE` and
@@ -888,12 +1000,17 @@ cross-references this section rather than restating the list.
 > path is entered (the caller, `_try_frozen` / `_try_workspace_frozen`,
 > checks for a present `milpa.lock` and an attached CAS; see
 > `spec/cli-contract.md` and `spec/errors.md`). They are a distinct layer
-> from the nine preconditions above and bring the catalog total to eleven
-> `FROZEN-*` codes.
+> from the twelve preconditions above and bring the catalog total to
+> fourteen `FROZEN-*` codes.
 
-> NORMATIVE: Conditions 1–5 and 6 are checked inside `resolve_frozen()`
-> (single-package path); conditions 7–9 are checked inside
-> `resolve_workspace_frozen()` (workspace path).
+> NORMATIVE: Conditions 1–5, 6, 11, and 12 are checked inside
+> `resolve_frozen()` (single-package path); conditions 7–9, 11, and 12 are
+> checked inside `resolve_workspace_frozen()` (workspace path). Conditions
+> 11/12 are ALSO checked by `milpa verify` (not just `--frozen`) via the
+> same SSOT wrapper (`check_source_id_preconditions_standalone` /
+> `check_source_id_preconditions_workspace`), positioned before the
+> disk-state check (manifest-vs-lockfile consistency before disk-vs-lockfile
+> consistency) — see `spec/cli-contract.md` §5.4 (verify).
 
 > NORMATIVE: Workspace-member deps are verified by computing their
 > on-disk `content_hash` and comparing against the lockfile's pinned
@@ -1058,288 +1175,314 @@ dev-dep `d` appear).
 
 ---
 
-## 10  Provenance precedence
+## 10  Source selection — the binding phase (`rfc-origin-as-identity.md`)
 
-This section defines which provenance (source) wins when multiple parts of
-the dependency graph declare conflicting sources for the same package name.
+> This section is a full rewrite superseding the prior "provenance
+> precedence" model (name-keyed unification + a name-scoped root-authority
+> suppression + a non-root same-source-agreement check). That model conflated
+> *unification* (which claims are one package) with *name*; under
+> coordinate-is-origin, unification is keyed by **origin** (`SourceId`), not
+> name, so the two concerns separate cleanly into §6b (keying) and this
+> section (which origin a reference resolves to, and what happens when two
+> claims disagree).
 
-### 10.0  Authority tiers (the provenance lattice)
+### 10.0  The model: coordinate-is-origin, the binding phase, and the bridge
 
-Not all provenance claims are equally trustworthy. A `git=`/`local=`/`tarball=`
-dep is a **self-declared, unauthenticated source assertion** — any package in
-the transitive graph can assert "name X lives at this source," which is the
-dependency-confusion / provenance-hijack vector. A **named** (index/registry)
-dep is not a source assertion at all — it is a *deference to the tianguis
-registry*, milpa's root of trust for names. These are not peer claims; milpa
-ranks them.
+Source selection rests on separating three decisions milpa makes, which MUST
+NOT be conflated (`rfc-origin-as-identity.md` §3):
 
-> NORMATIVE: Every provenance claim for a package name belongs to exactly one
-> **authority tier**:
+- **Origin** (`SourceId`, §6b) — a dep's identity *as a solver variable*: a
+  registry coordinate, a normalized git/tarball URL, an OCI coordinate, a
+  local path, or a workspace-member name. Version-independent, pre-fetch,
+  known from the manifest/index alone.
+- **Binding** — which origin a given **reference** (a root/override/member
+  declaration, or a transitive `requires` occurrence) resolves to, and what
+  happens when two references for the same `DepKey` disagree — the subject of
+  this section.
+- **Identity** (`content_hash`, `spec/identity.md`) — whether a *fetched* tree
+  is what was expected. Strictly post-fetch and orthogonal to binding: it
+  governs verification and CAS dedup, never which origin a reference binds
+  to. It DOES, however, enable one further, **post-fetch** unification of two
+  *different* origins that turn out to be byte-identical (§10.6) — a
+  merge-on-proof, never a merge-on-heuristic.
+
+> NORMATIVE: **Coordinate-is-origin.** A `named` (registry) reference's
+> origin **is** its registry coordinate (`RegistrySourceId`). A
+> `git=`/`local=`/`tarball=` reference's origin is its own declared URL/path.
+> The same bare name resolving through two different declared origins is
+> **not** automatically one package — a transitive
+> `"z3" git=(url)"…/org-a/nim-z3.git"` and a registry entry named `z3` at
+> `org-b/nimz3` are, by default, two unrelated packages that happen to share
+> an import label. milpa never auto-unifies them by inspecting/normalizing
+> URLs (undecidable, and a correctness/security hazard — `rfc-origin-as-
+> identity.md` §3.2). The bridge is `overrides {}` (§10.3): declaring the name
+> at the root explicitly rebinds it, Cargo-`[patch]`-style.
+
+> NORMATIVE: Orthogonality with the attestation policy (`attestation-policy`,
+> `RES-UNATTESTED-METADATA`, §13): this section decides which ORIGIN a
+> reference binds to; the attestation policy independently governs how much a
+> *named* (registry) resolution is trusted. A conformant implementation MUST
+> NOT fold attestation strength into binding. (The registry-shadow tripwire,
+> §10.5, is a distinct, narrower mechanism layered on the same
+> `attestation-policy` strict/permissive switch — it decides whether a
+> transitive claim that *shadows* a registry-owned name is accepted, not how
+> much a resolved registry entry is trusted.)
+
+### 10.1  The binding phase — root arbitrates, deterministic, pre-fetch where possible
+
+> NORMATIVE: A conformant implementation MUST maintain, for the duration of
+> one resolve, a **binding phase** that records at most one accepted
+> `SourceId` per `DepKey`, and arbitrates every claim (a `(DepKey, SourceId)`
+> pair asserted by some reference) against that record. Every reference in
+> the graph — root dep, `overrides {}` target, workspace member, standalone
+> root's own name (§14), and every transitive `requires` occurrence — asserts
+> exactly one claim.
+
+> NORMATIVE: **Root claims bind first, structurally.** The set of **root**
+> claims — every root manifest `deps`/`dev-deps` entry (after `overrides {}`
+> pre-emption, §10.3), every workspace member's own name, and (for a
+> standalone resolve) the root's own declared name (§14) — is constructed and
+> bound as a unit before any transitive claim is considered. Two root claims
+> disagreeing on one `DepKey` is unreachable by construction (an
+> implementation-internal invariant violation if it ever occurs, never a
+> user-facing error) because `overrides {}` pre-emption (§10.3) reconciles a
+> root dep declaration against a root override on the same name before
+> binding either.
+
+> NORMATIVE: **Arbitrating a transitive claim** against the binding phase's
+> current record for its `DepKey` yields exactly one of three outcomes:
 >
-> | Tier | Source | Trust |
-> |---|---|---|
-> | 1 (highest) | **Root** — a name in the root authority set (§10.1): root/member `deps`, `dev-deps`, `overrides {}` | the project owner |
-> | 2 | **Registry** — a `named` (index-resolved) claim | the attested registry |
-> | 3 (lowest) | **Self-declared URL** — a transitive `git=` / `local=` / `tarball=` claim | none |
+> - **New** — the `DepKey` has no existing binding. The claim's `SourceId` is
+>   recorded; the caller enqueues it for fetch (if not already in flight).
+> - **Duplicate** — the claim's `SourceId` equals the existing binding
+>   (structural equality on the frozen `SourceId`, §identity). A harmless
+>   no-op; resolution proceeds. Two `git=` claims naming the same URL at
+>   *different* `ref`s are a duplicate at the binding layer (`ref` is
+>   excluded from `SourceId` — it is a version, not an origin, §6b) — but a
+>   conformant implementation MUST still register the later claim's pinned
+>   `ref` as an additional candidate version for the bound origin; silently
+>   dropping it loses a real pin.
+> - **Lost-to-root** — the `DepKey` is already bound by a **root** claim, and
+>   the transitive claim's `SourceId` disagrees. The transitive claim is
+>   silently discarded (this IS the Cargo-`[patch]` semantics — the root
+>   always wins over an unrequested transitive opinion). Discarding a claim
+>   this way is not silent forever: an `overrides {}` rule that turns out to
+>   name nothing reachable is separately flagged by `RES-DEAD-OVERRIDE`
+>   (non-fatal), and a diagnostic surface (e.g. `milpa show`) MAY report which
+>   transitive claims lost to which root binding.
 >
-> The precedence rule is a total order on tiers: **a higher tier owns a name
-> against any lower-tier claim, deterministically and without error.** A
-> `RES-PROVENANCE-CONFLICT` is raised only for a disagreement *within the same
-> untrusted tier* — two tier-3 claims with different provenance keys for a name
-> that is neither root-declared (tier 1) nor present in the registry index
-> (tier 2). Two claims with the *same* provenance key are duplicates (dedup).
+> A transitive claim disagreeing with an **existing transitive** binding (no
+> root claim governs that `DepKey`) is **not** one of the three outcomes
+> above — it is a binding **conflict**:
 
-> NORMATIVE: **A name's authority tier is a property of the name, decided from
-> static, order-independent facts — not from which claims happen to collide.**
-> Root (tier 1) is an *explicit* per-build authority; the registry (tier 2) is
-> a *trusted default*, not an explicit per-build choice. A resolver MUST NOT
-> silently resolve a genuine source disagreement over a non-root name — it
-> either accepts an *agreeing* claim or escalates to the root.
-
-> NORMATIVE: **Registry validation (tier 2).** For a non-root name that exists
-> in the registry index, a transitive self-declared claim (`git=`/`tarball=`)
-> for that name MUST be validated against the registry's recorded source for
-> the name:
-> - **Agrees** (the self-declared source is the registry's own source for the
->   name — same git repository; a specific `ref` of that repository is still an
->   agreement, the ref only selects a version): the claim is ACCEPTED and
->   resolves normally. This is the benign common case — a transitive pinning a
->   specific commit of the registry's own package.
-> - **Disagrees** (a *different* source repository is recorded for the name):
->   the resolver MUST raise `RES-PROVENANCE-CONFLICT`. It MUST NOT silently
->   redirect the name to the registry (that would override a library's
->   deliberate fork), and MUST NOT silently honor the transitive's source
->   (that would let a transitive substitute a registry name's source). The
->   remedy is to declare the name in the root manifest (tier 1), where the
->   project owner arbitrates.
-> - **No git source recorded, but an OCI entry's `source_url` is** (the
->   registry entry is published via OCI, and the publisher recorded the git
->   repository the artifact was packed and published FROM — registry-protocol
->   §3.3's OCI `source` child): the resolver MUST prefer this recorded
->   `source_url` for the SAME URL comparison as the git-source case above,
->   BEFORE falling back to content identity. A claim whose git URL, normalized,
->   matches a `source_url` recorded for **any** version of the registry's
->   package entry is an AGREEMENT — ACCEPTED and resolves normally — even when
->   the transitive pins a ref/version that was never published to the registry
->   (e.g. pinning `@main` ahead of the newest published release): the ref only
->   selects a version of the same repo, exactly as for a recorded
->   `GitIndexProvenance`, and this decision never depends on `content_hash` at
->   all. A claim whose git URL matches no recorded `source_url` DISAGREES and
->   MUST raise `RES-PROVENANCE-CONFLICT` immediately — this is resolved
->   statically, pre-fetch, exactly like the git-vs-git disagreement case,
->   since a recorded `source_url` is just as directly comparable a fact as a
->   recorded git provenance.
-> - **Incomparable transport** (the registry has no comparable git source
->   recorded for the name at all, AND no OCI entry records a `source_url`
->   either — e.g. an OCI-only entry published before the `source_url` field
->   existed, or an entry with no provenance recorded — so NEITHER source-URL
->   comparison above can be performed): the resolver MUST NOT treat this as an
->   automatic disagreement. Instead it MUST fall back to **content identity**
->   — the legacy mechanism, retained for entries that record no comparable
->   source at all: a package published to the registry under one transport
->   and a transitive claim of the same package under a *different* transport
->   are the same package if and only if they resolve to the same
->   `content_hash` (identity is milpa's one transport-independent fact,
->   spec/identity.md). Compare the transitive's git source's fetched
->   `content_hash` against the `content_hash` recorded across **every**
->   version of the registry's package entry (not just the newest — mirroring
->   the git-URL comparison's "every version" rule):
->   - **Matches** any recorded `content_hash` → ACCEPTED (same package, a
->     different transport) — resolves normally, exactly like a URL agreement.
->   - **Matches none** of the recorded `content_hash` values → `RES-PROVENANCE-CONFLICT`
->     (a genuinely different package — a fork or a substitution).
->   - The registry records **no `content_hash` for any version** (empty/legacy
->     entries predating the identity mandate) — there is nothing to validate
->     against, even by identity → `RES-PROVENANCE-CONFLICT` immediately,
->     without fetching anything.
->
-> The agree/disagree-by-URL decision (against either a recorded git source or
-> a recorded OCI `source_url`) is made at claim-discovery time from the
-> static, pre-loaded index record, so it is order-independent and never
-> commits a candidate that a later (even mid-solve) claim would have to
-> retract. The incomparable-transport/content-identity decision is likewise a
-> static function of the name's registry record alone (never of which other
-> claims exist), but its *outcome* is necessarily confirmed only once the
-> transitive's own source has been fetched and content-hashed — a claim
-> pending this confirmation is accepted provisionally (never blocks or is
-> blocked by another pending/agreeing claim for the same name) and the
-> resolver MUST raise `RES-PROVENANCE-CONFLICT` immediately upon a confirmed
-> mismatch. A transport failure while fetching the transitive's source is an
-> ordinary fetch error, never reinterpreted as a provenance conflict. A
-> transitive claim for a name that is NOT root-declared and NOT in the
-> registry index is a plain tier-3 claim (§10.3).
-
-> NORMATIVE: This is §10.2's principle — *only the root may redirect a dep's
-> source* — made precise for named packages. A transitive that self-declares a
-> source **agreeing** with the registry has not redirected anything (it named
-> the same source), so it is accepted. A transitive that self-declares a source
-> **disagreeing** with the registry is attempting a redirection it has no
-> authority to make; rather than silently pick either the registry or the
-> transitive's source, the resolver escalates to the only authority that may
-> redirect a source — the root — via `RES-PROVENANCE-CONFLICT`. Root authority
-> (tier 1) is the sole silent override, because it is an explicit human choice,
-> not a guess.
-
-> NORMATIVE: The lattice is orthogonal to the **attestation policy** (§
-> `attestation-policy`, `RES-UNATTESTED-METADATA`). The lattice decides *which
-> tier owns* a name; the attestation policy independently decides *how much to
-> trust* a registry (tier-2) resolution. A conformant implementation MUST NOT
-> fold attestation strength into the tier comparison: a registry-known name is
-> tier-2-owned regardless of whether its entry is attested, and the attestation
-> policy then governs (warn vs `RES-UNATTESTED-METADATA`) exactly as it would
-> for any registry resolution.
-
-### 10.1  Root authority (tier 1)
-
-> NORMATIVE: The **root authority set** is the set of all package names
-> declared in the root manifest's `deps`, `dev-deps`, and `overrides {}`
-> blocks.  For a workspace, every workspace member contributes its `deps`,
-> `dev-deps`, and the workspace-level `overrides {}` block to the root
-> authority set.  Workspace members themselves are also root-authoritative
-> (they are not subject to transitive override).  For a standalone
-> (non-workspace) resolve, the root manifest's OWN declared `name` is
-> likewise root-authoritative (§14) — the standalone analog of a workspace
-> member being root-authoritative in its own name.
-
-> NORMATIVE: When a transitive dependency (a dep reachable via fetching
-> another dep's milpa.kdl or .nimble) declares a provenance for a package
-> name that is already in the root authority set, the transitive provenance
-> MUST be silently suppressed — it MUST NOT be fetched and MUST NOT
-> affect resolution.  The root manifest's declared provenance (the first
-> provenance registered for that name from the root) is the binding
-> specification.  This is deterministic and order-independent: root
-> authority is declared at parse time, not at BFS arrival time.
+> NORMATIVE: **`RES-BINDING-CONFLICT`.** When two *transitive* claims for one
+> `DepKey` disagree on `SourceId`, and no root claim binds that `DepKey`, a
+> conformant implementation MUST raise `RES-BINDING-CONFLICT` and MUST NOT
+> silently pick one. This covers URL-vs-URL (two `git=` claims at different
+> URLs) and named-vs-URL (a `named` claim's registry coordinate vs. a `git=`
+> claim's URL) alike — both are simply "two different `SourceId`s claiming one
+> `DepKey`." The remedy is to declare the name at the root via `overrides {}`
+> (§10.3), which promotes one of the two to root authority and the other is
+> then silently discarded (lost-to-root) rather than conflicting.
 
 This is the Cargo `[patch]`/`[replace]` / npm `overrides` / Go `replace`
 model: **only the top-level project being built can redirect a dep's
-source**.  An intermediate library cannot hijack another dep's provenance.
+origin.** An intermediate library cannot hijack another dep's binding.
 
-### 10.2  Transitive overrides are ignored
+> NOTE: The reference implementation is `BindingResolver`
+> (`rfc-origin-as-identity.md` §4.3): `__init__(root_claims)` binds every root
+> claim as a unit (raises if handed a non-root claim); `submit(claim)` accepts
+> only non-root claims and returns a `BindingDecision{accepted, outcome}` with
+> `outcome ∈ {NEW, DUPLICATE, LOST_TO_ROOT}`; a transitive-vs-transitive
+> disagreement raises `MilpaError(RES_BINDING_CONFLICT, …)` naming both
+> sources via `format_source_id`. Authority is a two-valued fact
+> (`Claim.is_root: bool`), never a priority lattice/tier integer. Keyed by
+> `DepKey`, never bare `name` (§6a) — `ns1::foo` and `ns2::foo` never
+> cross-bind.
 
-> NORMATIVE: A transitive dep's `overrides {}` block MUST be silently
-> ignored.  A conformant implementation MUST NOT apply overrides from a
-> fetched dep's milpa.kdl to any other dep in the graph.  Only the root
-> manifest's `overrides {}` block (and, for workspaces, the workspace-
-> level `overrides {}` block) apply.
+### 10.2  Pure and pre-fetch, with one necessary exception
 
-**Security rationale.** A dependency that can override another
-dependency's source is a supply-chain attack vector.  Restricting
-override authority to the root eliminates this class of attack: the
-project owner controls which sources are authoritative.
+> NORMATIVE: Binding-phase arbitration itself performs no I/O — it is a pure,
+> in-memory decision over already-known `SourceId` values. Every origin is
+> knowable **before** the corresponding tree is fetched: a `git=`/`local=`/
+> `tarball=` reference's origin comes directly from its own manifest
+> declaration; a `named` reference's origin comes from the pre-loaded
+> registry index. Fetching only ever selects a *version* within an already-
+> bound origin, never the origin itself.
 
-> NOTE: The reference implementation enforces this by never reading
-> `manifest.overrides` from a fetched transitive dep's milpa.kdl.
-> `_extract_from_milpa_kdl` reads only `manifest.deps` (and applies
-> `overrides_by_name` from the root's table, not from the fetched file).
+> NORMATIVE: The one necessary exception: constructing the claim for a
+> transitively-discovered **named** reference requires that its parent's tree
+> already be fetched and its manifest/`.nimble` parsed (to discover the
+> `requires` occurrence at all) — so *claim construction* for named
+> transitives is interleaved with BFS exactly as fetching is. The win of the
+> binding phase is a typed, pure arbitration seam replacing an ad hoc
+> side-table, not a synchronous up-front pass over the whole graph before any
+> fetch begins.
 
-### 10.3  Non-root provenance disagreement
+### 10.3  Overrides are the sole rebind bridge, and are root-only
 
-When a package name is not in the root authority set (tier 1), the resolver
-assigns its tier from §10.0 — registry-owned (tier 2) if the name is in the
-registry index, else tier 3 — and arbitrates accordingly.
+> NORMATIVE: `overrides {}` (§3.4 of `spec/manifest-grammar.md`) is the
+> **sole** mechanism for rebinding a name to a different origin than its
+> ordinary declaration/registry lookup would produce. An `overrides {}` rule
+> is applied — reconciled against any root dep declaration of the same name,
+> the override winning — **before** the binding phase's root claims are
+> constructed (§10.1), so a root dep declaration and a root override for the
+> same name never reach the binding phase as two disagreeing root claims.
 
-> NORMATIVE: If a non-root name is present in the registry index (tier 2), a
-> transitive self-declared claim (`git=`/`tarball=`) for that name is validated
-> against the registry's recorded source (§10.0), in preference order:
-> 1. A recorded git source (`GitIndexProvenance`) — a claim that AGREES (the
->    registry's own source repository) is accepted and resolves normally; a
->    claim that DISAGREES (a different source repository is recorded) MUST
->    raise `RES-PROVENANCE-CONFLICT`.
-> 2. Otherwise, an OCI entry's recorded `source_url` (the git repository the
->    artifact was published FROM) — the SAME URL comparison as step 1, so it
->    is preferred over content-identity: AGREES (same repo, any ref/version)
->    → accepted and resolves normally; DISAGREES (a different repo) MUST
->    raise `RES-PROVENANCE-CONFLICT`, resolved statically, pre-fetch.
-> 3. Only when NEITHER a git source nor an OCI `source_url` is recorded
->    (incomparable transport — e.g. an OCI-only entry predating the
->    `source_url` field) does the resolver fall back to CONTENT IDENTITY
->    (§10.0): the claim's fetched `content_hash` compared against every
->    `content_hash` recorded across the registry package's versions — a match
->    ACCEPTS the claim (same package, different transport), no match (or no
->    `content_hash` recorded at all to compare against) MUST raise
->    `RES-PROVENANCE-CONFLICT`.
+> NORMATIVE: A transitive dep's own `overrides {}` block (from a fetched
+> dep's `milpa.kdl`) MUST be silently ignored. A conformant implementation
+> MUST NOT apply overrides from any manifest but the root's (and, for a
+> workspace, the workspace-level `overrides {}` block). **Security
+> rationale:** a dependency that can override another dependency's origin is
+> a supply-chain attack vector; restricting override authority to the root
+> means only the project owner controls which origins are authoritative.
+
+> NORMATIVE: An override's target may itself be a *different registry
+> coordinate* than the overridden name (e.g. `chronos` → `acme::chronos-fork`)
+> — the binding phase's grouping key stays the **overridden** `DepKey`, while
+> the accepted `SourceId` describes the **new** coordinate. The lockfile
+> record, attestation subject, and diagnostics all read the accepted
+> `SourceId`'s own coordinate fields, never the overridden grouping key.
+
+> NOTE: The reference implementation never reads `manifest.overrides` from a
+> fetched transitive dep's `milpa.kdl` — `_extract_from_milpa_kdl` reads only
+> `manifest.deps`. Root reconciliation is `binding.reconcile_root_claims`,
+> shared by `BindingResolver.__init__`'s caller and the frozen-path
+> `FROZEN-SOURCE-ID-MISMATCH` precondition (§7.1 D2) so the two never
+> diverge.
+
+### 10.4  Workspace members and the standalone root's own name
+
+> NORMATIVE: A workspace member's own name is a root claim bound to a
+> `MemberSourceId` at workspace load — conflict-free by construction (member
+> names are unique, §11). A standalone (non-workspace) resolve's root
+> manifest's own declared `name` is likewise a root claim, bound to the same
+> `MemberSourceId`-shaped self-reference (§14: a standalone package is a
+> workspace-of-one). Both generalize into the same binding-phase arbitration
+> path as any other root claim — including `RES-WS-OVERRIDE-MEMBER-COLLISION`
+> (a workspace override naming a member) and the version-constraint checks of
+> §11.5/§14.3, which are orthogonal to *binding* (they gate the member/root
+> candidate's version, not which origin it binds to).
+
+### 10.5  The registry-shadow tripwire (dependency-confusion defense)
+
+Coordinate-is-origin means a `git=`/`tarball=`/`oci=` claim and a
+registry-owned coordinate sharing a bare name are, by default, simply two
+different packages — nothing about §10.1–§10.4 alone stops a transitive dep
+from quietly pinning a *different* repository under a name the registry
+already owns and trusts. Because milpa's positioning is supply-chain
+integrity and dependency-confusion is the canonical supply-chain attack, this
+defense is retained as an explicit, separate, pre-fetch check
+(`rfc-origin-as-identity.md` §6.1 / §11 D-Fork1) — layered on the
+`attestation-policy` seam, not folded into binding arbitration.
+
+> NORMATIVE: Before a **new** (previously-unbound) transitive `git=`/
+> `tarball=`/`oci=` claim is admitted, a conformant implementation MUST check
+> whether the claim's bare name is a coordinate the registry owns, in any
+> namespace:
 >
-> In every conflicting case, the resolver MUST NOT silently redirect the name
-> to the registry, and MUST NOT silently honor the transitive's source. The
-> remedy is to declare the name in the root manifest (tier 1). This holds
-> regardless of BFS discovery order (the registry record is a static,
-> pre-loaded fact) — the content-identity sub-case (step 3) is confirmed only
-> once the claim's source has been fetched, but the decision of WHICH of the
-> three steps applies is itself a static fact of the registry record alone.
+> - If the name is **not** registry-owned at all, nothing fires — this is an
+>   ordinary self-declared origin (`RES-BINDING-CONFLICT`, §10.1, still
+>   governs true multi-claim disagreements independently).
+> - If the name **is** registry-owned, compare the claim's normalized origin
+>   against every comparable upstream source the registry entry records
+>   (across every version of the owning package). A match is a legitimate
+>   same-repository pin — **silent accept**.
+> - Otherwise (the URL disagrees, or the entry is OCI-only with no comparable
+>   upstream source recorded at all) — raise `RES-REGISTRY-SHADOW`: **warn by
+>   default** (a git fork of a registry package is common and legitimate; the
+>   claim still proceeds to fetch), **hard-fail under `attestation-policy`
+>   strict** (the claim is never fetched).
 
-> NORMATIVE: If a non-root name is NOT in the registry index and receives two
-> tier-3 claims (self-declared `git=`/`tarball=`) with different provenance
-> keys, the resolver MUST raise `RES-PROVENANCE-CONFLICT`. It MUST NOT silently
-> pick one tier-3 provenance over the other.
+> NORMATIVE: This check is deliberately **pre-fetch, URL-only, and static** —
+> unlike the model it supersedes, it performs **no post-fetch content-hash
+> reconciliation**. An OCI-only registry entry pinned via a shadowing `git=`
+> claim can no longer be auto-accepted by comparing fetched bytes before
+> deciding whether to fetch at all; `content_hash` still verifies the fetched
+> bytes independently at materialization (§10.6), but does not participate in
+> this admission decision. This is an accepted, signed-off honest narrowing —
+> the alternative (fetch first, decide after) exposes the tree before the
+> decision is made.
 
-> NORMATIVE: If two claims declare the **same** provenance key (same transport
-> kind, same URL/path, same ref; or two named claims resolving to the same
-> registry entry) for the same package name, they are duplicates — the second
-> occurrence is suppressed and resolution proceeds normally.
+> NOTE: The reference implementation is `binding.check_registry_shadow`,
+> called for every NEW transitive `git=`/`tarball=`/`oci=` claim (never for
+> `registry`/`local`/`member` claims, and never re-run for a claim that is a
+> `DUPLICATE`/`LOST_TO_ROOT` outcome). It is gated off for a name already in
+> `root_authority` — a root's own explicit source choice is never
+> second-guessed by this tripwire.
 
-> NOTE: For URL deps, "same provenance key" means the same `(git_url, ref)`
-> pair.  Content-hash dedup (§3, Phase B) provides an additional unification
-> layer for packages from different URLs that happen to produce the same
-> content hash.  The provenance lattice fires first (pre-fetch, on the tier +
-> provenance key); content-hash dedup fires after fetch.
+### 10.6  Post-fetch cross-origin unification (content-hash, milpa's edge over Cargo)
 
-### 10.4  Orthogonality with dev-deps
+> NORMATIVE: After a claim is fetched, a conformant implementation MAY
+> collapse two or more *distinct* solved solver variables (distinct
+> `canonical(source_id)` values) into one, if and only if their fetched trees
+> share an identical `content_hash` AND an invariant guard holds (identical
+> `content_hash` ⇒ identical `requires` set; a violation is an internal
+> error, never a silent merge). This is **merge-on-proof**, strictly
+> post-fetch, and is the sole exception to "different origin = different
+> package": it does not weaken §10.0's prohibition on merging origins by
+> *heuristic* (URL-guessing), because it fires only on byte-identical
+> content — a dependency-confusion attack requires *different* bytes, which
+> never merge. A collapse MUST record **every** collapsed origin's own
+> observed provenance in the lockfile (§lockfile-schema §3.8/§4.0a) — the
+> audit trail survives even though the solver now treats them as one package.
+> Under coordinate-is-origin this unification is **cross-origin**: a registry
+> coordinate and a git URL that happen to fetch byte-identical trees collapse
+> to one solver variable, not merely to one on-disk directory — the
+> differentiator milpa has over Cargo's pure name+origin identity, realized
+> at the solver layer rather than only at the storage layer.
 
-> NORMATIVE: Provenance precedence is orthogonal to dev-dep propagation
-> (§9).  Suppressing a transitive provenance claim does NOT affect
+> NOTE: The reference implementation is `resolver.py`'s "Phase B"
+> content-hash dedup pass (`_dedup_candidates`), re-keyed by `source_id`
+> (`rfc-origin-as-identity.md` §4.5/§S4b) rather than by name — this fixes a
+> latent bug where two BFS parents reaching one repository under two
+> different labels sealed two separate `edge_cache` entries instead of
+> coalescing to one.
+
+### 10.7  Orthogonality with dev-deps
+
+> NORMATIVE: Source selection is orthogonal to dev-dep propagation (§9).
+> Discarding a losing transitive claim (lost-to-root, §10.1) does NOT affect
 > whether dev-deps are included — those are always governed by §9's
 > root-only dev-dep rule.
 
 The conformance fixture
 `conformance/spec-v1/fixture-065-root-override-precedence`
-verifies this rule: the root declares `shared` from `our-fork.example.com`;
-a transitive dep (`translib`) declares `shared` from `upstream.example.com`.
-The expected output shows `shared` resolved to the root's provenance
-(`our-fork.example.com`) and the upstream URL was not fetched.
+verifies the root-authority half of this model: the root declares `shared`
+from `our-fork.example.com`; a transitive dep (`translib`) declares `shared`
+from `upstream.example.com`. The expected output shows `shared` resolved to
+the root's origin (`our-fork.example.com`) and the upstream URL was not
+fetched (the transitive claim is `LOST_TO_ROOT`, §10.1).
 
 Cross-reference: `spec/manifest-grammar.md` §3.4 for the `overrides {}`
-block syntax.  `spec/errors.md` for `RES-PROVENANCE-CONFLICT`.
+block syntax (six target kinds: git/local/member/oci/tarball/registry, plus
+version-scoping). `spec/errors.md` for `RES-BINDING-CONFLICT`,
+`RES-REGISTRY-SHADOW`, and `RES-DEAD-OVERRIDE`.
 
-### 10.5  Provenance-gate precedence over version conflicts (Axis A interaction)
+### 10.8  When binding is decided (ordering)
 
-> NORMATIVE: A name's authority (§10.0) MUST be resolved at **claim-discovery
-> time** from static facts — the root authority set (tier 1, known at parse
-> time) and the registry index record (tier 2, known once the index is loaded)
-> — not from which claims later collide. Concretely: when a transitive
-> self-declared claim (`git=`/`tarball=`) is discovered for a name that is
-> root-declared or present in the registry index, the resolver MUST resolve its
-> disposition **at that point** — suppress it (root name), accept it (registry
-> name, source agrees), or raise `RES-PROVENANCE-CONFLICT` (registry name,
-> source disagrees) — before a disagreeing provenance is ever fetched, and
-> therefore before any declared version (§3.2) it might carry could enter the
-> solver's accumulated constraint set. Because this disposition is a static
-> function of the name and the registry record (not of claim collisions), it is
-> order-independent and never requires retracting an already-committed solver
-> candidate. This is what makes the rule robust to a tier-2 (registry) claim
-> that is only discovered later — e.g. mid-solve, as a transitive of another
-> named dep: any conflicting tier-3 claim for that name was already dispositioned
-> (accepted-if-agreeing or conflicted-if-disagreeing) at its own discovery, so no
-> stale, unvalidated tier-3 candidate can survive to be reconciled.
+> NORMATIVE: A `DepKey`'s binding is decided as claims are discovered, not by
+> a global post-hoc collision scan. Root claims (§10.1) are all bound before
+> any transitive claim is considered. For a `DepKey` with no root claim, the
+> **first** transitive claim registers the binding (`NEW`); a later claim
+> with the same `SourceId` is a `DUPLICATE`; a later claim with a *different*
+> `SourceId` raises `RES-BINDING-CONFLICT` (§10.1). Because a claim's
+> `SourceId` is a static fact of the claim itself (a `git=` URL directly; a
+> `named` claim's coordinate from the pre-loaded registry record), this holds
+> regardless of discovery order — a `named` claim discovered mid-solve (e.g.
+> as a transitive of another named dep) is arbitrated against the `DepKey`'s
+> already-registered binding at that point. That is a terminal outcome: no
+> already-committed solver candidate is ever retracted.
 
 > NORMATIVE: This ordering is load-bearing now that declared versions are
-> real (§3, Axis A): two disagreeing sources could each declare a
-> genuine, differing version for the same package name, and an
-> implementation that fetched both before gating would produce a generic
-> `SOLVE-CONFLICT` — a diagnostic regression versus the precise
-> `RES-PROVENANCE-CONFLICT` this section requires. Gating on the
-> provenance key (URL+ref, or equivalent) alone, independent of any
-> version either source carries, is what keeps this ordering correct
-> regardless of what either source declares.
+> real (§3, Axis A): two disagreeing origins could each declare a differing
+> version for the same name, and an implementation that admitted both before
+> arbitrating origins would degrade the precise `RES-BINDING-CONFLICT` into a
+> generic `SOLVE-CONFLICT`. Arbitrating on origin (independent of any version
+> either carries) keeps this correct.
 
-> NOTE: The reference implementation's BFS wave-drain loop calls
-> `_check_provenance_gate` and, on suppression, `continue`s before
-> submitting the fetch worker for the suppressed provenance (`resolver.py`)
-> — the conflicting source's manifest, and therefore any version it
-> declares, is never read.
-
-Cross-reference: `spec/errors.md` for `RES-PROVENANCE-CONFLICT` and
-`RES-VERSION-UNKNOWN-CONSTRAINED`; §3 for the declared-version mechanism
-this section's precedence protects.
+Cross-reference: `spec/errors.md` for `RES-BINDING-CONFLICT`; §3 for the
+declared-version mechanism this section's ordering protects.
 
 ---
 
@@ -1644,16 +1787,16 @@ provenance/version inconsistency at worst.
 
 ### 14.2  Suppression of transitive claims on the root's own name
 
-> NORMATIVE: The root's own declared `name` MUST be added to the root
-> authority set (§10.1) for a standalone resolve, exactly as a workspace
-> member's name is root-authoritative for a workspace resolve. Any
-> transitive claim on that name — whether a `named` (registry-style)
-> claim, or a self-declared `git=`/`tarball=`/`local=` claim — MUST be
-> suppressed by the same provenance-gate mechanism that suppresses any
-> other transitive claim on a root-authority name (§10.1, §10.5): it MUST
-> NOT be fetched, MUST NOT be looked up in the tianguis index, and MUST
-> NOT affect resolution. The root's own pre-registered candidate (§14.1)
-> is the sole candidate for that name.
+> NORMATIVE: The root's own declared `name` MUST be bound as a **root claim**
+> (§10.1/§10.4) for a standalone resolve, exactly as a workspace member's
+> name is a root claim for a workspace resolve. Any transitive claim on that
+> name — whether a `named` (registry-style) claim, or a self-declared
+> `git=`/`tarball=`/`local=` claim — MUST be suppressed by the same
+> binding-phase arbitration that suppresses any other transitive claim
+> disagreeing with a root binding (§10.1's `LOST_TO_ROOT` outcome): it MUST
+> NOT be fetched, MUST NOT be looked up in the tianguis index, and MUST NOT
+> affect resolution. The root's own pre-registered candidate (§14.1) is the
+> sole candidate for that name.
 
 ### 14.3  Version-constraint validation
 
@@ -1718,17 +1861,21 @@ provenance/version inconsistency at worst.
 > precedence helper §11.5 already uses for workspace members
 > (`_root_self_candidate_version`, a thin standalone-manifest-dir variant
 > of `_member_candidate_version`). Suppression (§14.2) is achieved by
-> pre-seeding the resolver's `provenance_gate` dict with a sentinel entry
-> for the root's own name (mirroring the existing `MemberTarget`-override
-> pre-seed technique in `resolve_workspace`) — the existing
-> `_check_provenance_gate` machinery then suppresses any subsequent
-> transitive claim with no additional gate logic. The version check
-> (§14.3) is a small, explicit, early check inline in the shared
-> `_run_bfs_wave_loop`'s `"named"` BFS-item branch, gated on an optional
-> `root_self_name`/`root_self_version` pair threaded through that function
-> (and `_s4a_run_fixpoint`) — `None` by default, so `resolve_workspace`
-> (which does not pass them) is entirely unaffected.
->
+> pre-registering the root's own name as a **root claim** bound to a
+> `MemberSourceId(member_name=<root's own name>)` self-reference (§10.4) —
+> the standalone analog of a workspace member's self-claim, and the same
+> `kind "member"` on-disk representation (`spec/lockfile-schema.md` §3.10).
+> The `BindingResolver` arbitration path (§10.1) then suppresses any
+> subsequent transitive claim on that name via the ordinary `LOST_TO_ROOT`
+> outcome, with no root-name-specific gate logic (this repeals and replaces
+> the prior `provenance_gate`/`_check_provenance_gate` side-table this NOTE
+> used to describe — §10). The version check (§14.3) is a small, explicit,
+> early check inline in the shared `_run_bfs_wave_loop`'s `"named"` BFS-item
+> branch, gated on an optional `root_self_name`/`root_self_version` pair
+> threaded through that function (and `_s4a_run_fixpoint`) — `None` by
+> default, so `resolve_workspace` (which does not pass them) is entirely
+> unaffected.
+
 > NOTE (known gap, out of scope for this rule): the same *mechanism* —
 > suppressing a THIRD-PARTY transitive dep's claim on a workspace member's
 > own name and validating its version constraint — is not currently wired
@@ -1761,8 +1908,14 @@ All codes are defined in `spec/errors.md`.
 | `FROZEN-MEMBER-NOT-IN-WORKSPACE` | Lockfile references member not present in workspace (§7.1 #8) |
 | `FROZEN-MEMBER-IDENTITY-DRIFT` | Member on-disk hash differs from lockfile pin (§7.1 #9) |
 | `FROZEN-EXCLUDE-NEWER-MISMATCH` | `--frozen` lockfile `exclude_newer` ≠ manifest's effective `resolution { exclude-newer }` (§7.1 #10) |
+| `FROZEN-REGISTRY-ALIAS-UNRESOLVED` | Locked `source { kind "registry" }` names a registry alias this machine doesn't recognize (§7.1 #11) |
+| `FROZEN-SOURCE-ID-MISMATCH` | Declared origin (post-override) ≠ locked `source_id` (§7.1 #12) |
 | `FETCH-ALL-FAILED` | Every mirror candidate failed (network error or identity mismatch) (§8a) |
-| `RES-PROVENANCE-CONFLICT` | Two transitive deps declare different provenances for the same name (§10.3) |
+| `RES-BINDING-CONFLICT` | Two transitive claims disagree on a `DepKey`'s origin and no root claim arbitrates (§10.1, supersedes `RES-PROVENANCE-CONFLICT`) |
+| `RES-REGISTRY-SHADOW` | A transitive `git=`/`tarball=`/`oci=` claim shadows a registry-owned coordinate with no comparable upstream match (§10.5) |
+| `RES-DEAD-OVERRIDE` | An `overrides {}` entry names a dep absent from the resolved graph (§10.1) |
+| `RES-IMPORT-COLLISION` | Two distinct source-ids export the same Nim import symbol (§4.6 of `rfc-origin-as-identity.md`) |
+| `SRC-ID-MALFORMED` | A raw origin fails `SourceId` well-formedness (registry/namespace/subpath validation) |
 | `MAN-PREDICATE-MIXED-NEGATION` | Predicate mixes negated and non-negated values (manifest-grammar §6) |
 | `RES-UNATTESTED-METADATA` | Strict policy: ≥1 named dep resolved from un-attested `.nimble` metadata (§13.3) |
 | `RES-ROOT-SELF-VERSION-CONSTRAINT` | Standalone root's own version does not satisfy a transitive's constraint on the root's own name (§14.3) |

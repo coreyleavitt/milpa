@@ -3,6 +3,10 @@ version 1
 strategy "maxver"
 
 dep "lib-tls" {
+    source {
+        kind "git"
+        url (url)"https://example.com/lib-tls"
+    }
     identity "dag-sha256:27860c5f0fde705d6be14422d18b622f9093d7a267e98286949418ae17e50fae"
     version "0.0.0"
     src_dir ""

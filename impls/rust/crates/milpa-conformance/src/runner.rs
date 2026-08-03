@@ -174,6 +174,12 @@ pub fn run_fixture(fx: &Fixture, target: &dyn Target, scratch: &Scratch) -> Verd
         (Expected::Success, Err(code)) => {
             Verdict::Fail(format!("expected success but errored with {code:?}"))
         }
+        // S5 (rfc-origin-as-identity.md §7.1): a `verify` success fixture has
+        // no byte-diff outputs of its own (verify only asserts pass/fail,
+        // like `parse-lockfile`) — the first-ever success-class `verify`
+        // fixture (fixture-460) exercises the D2 "overridden root dep"
+        // no-false-positive case.
+        (Expected::Success, Ok(Produced::NoByteDiff)) if fx.cmd == Cmd::Verify => Verdict::Pass,
         (Expected::Success, Ok(Produced::NoByteDiff)) => Verdict::Fail(
             "success fixture produced no byte-diff outputs (parse-lockfile has no success variant)"
                 .to_string(),
@@ -982,6 +988,19 @@ impl Target for MilpaTarget {
                             ) {
                                 return Err(e.code().to_string());
                             }
+                            // RFC origin-as-identity.md §7.1 D2/D3 (S5):
+                            // FROZEN-REGISTRY-ALIAS-UNRESOLVED (checked
+                            // first) + FROZEN-SOURCE-ID-MISMATCH (declared-
+                            // AFTER-override) — same SSOT wrapper
+                            // cli.cmd_verify calls, mirrored here so a
+                            // conformance fixture can exercise `verify`'s
+                            // check without the black-box CLI harness.
+                            if let Err(e) = milpa_core::check_source_id_preconditions_workspace(
+                                loaded_verify,
+                                &lock.deps,
+                            ) {
+                                return Err(e.code().to_string());
+                            }
                         }
                         Err(_) => {
                             // workspace load failed — fall through to disk check
@@ -991,6 +1010,15 @@ impl Target for MilpaTarget {
                             }
                             return Ok(Produced::NoByteDiff);
                         }
+                    }
+                }
+                // RFC origin-as-identity.md §7.1 D2/D3 (S5): standalone form
+                // of the same check, for a single-package project.
+                if let ManifestDoc::Package(ref manifest) = doc {
+                    if let Err(e) =
+                        milpa_core::check_source_id_preconditions_standalone(manifest, &lock.deps)
+                    {
+                        return Err(e.code().to_string());
                     }
                 }
 

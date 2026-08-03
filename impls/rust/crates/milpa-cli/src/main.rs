@@ -16,6 +16,7 @@ use milpa_core::{
     add_mirror, apply_workspace_manifest_change, baseline_sidecar_paths, build_flag_defines,
     build_index_state, canonical_digest, check_frozen_active_flags_mismatch,
     check_locked_drift,
+    check_source_id_preconditions_standalone, check_source_id_preconditions_workspace,
     check_workspace_frozen_active_flags_mismatch,
     dep_decl_store::DepDeclStore, discover_manifest, effective_trust_policy,
     fetch::{FetchError, FetcherRegistry}, fetch_verified_candidate_text, format_nimcfg,
@@ -686,6 +687,12 @@ fn cmd_show(dir: &Path) -> Result<i32, MilpaError> {
             let mut sorted_aliases = dep.aliases.clone();
             sorted_aliases.sort();
             println!("  aliases     {}", sorted_aliases.join(", "));
+            // RFC origin-as-identity.md §4.7/B3 (S3a-req): one human-readable
+            // note per dropped label naming the shared origin AND which label
+            // survived — the collapse must be VISIBLE, never just a bare list.
+            for note in milpa_core::collapse_notes(std::slice::from_ref(dep)) {
+                println!("  note        {note}");
+            }
         }
         // RFC per-entry-attestation.md P2 (§7): render the lockfile's
         // attestation block as an UNVERIFIED claim — no crypto has ever run
@@ -830,6 +837,15 @@ fn cmd_verify(
                 eprintln!("milpa-error: {}", e.code());
                 return Ok(1);
             }
+            // RFC origin-as-identity.md §7.1 D2/D3 (S5): FROZEN-REGISTRY-
+            // ALIAS-UNRESOLVED (checked first) + FROZEN-SOURCE-ID-MISMATCH
+            // (declared-AFTER-override) — the SAME SSOT check resolve_frozen
+            // runs, wired into `milpa verify` too (not just --frozen).
+            if let Err(e) = check_source_id_preconditions_standalone(manifest, &lock.deps) {
+                eprintln!("{}: {}", e.code(), message_of(&e));
+                eprintln!("milpa-error: {}", e.code());
+                return Ok(1);
+            }
         }
         Ok(milpa_manifest::ManifestDoc::Workspace(_)) => {
             // S11b (Breadth-P2c): workspace frozen-flags mismatch check.
@@ -855,6 +871,13 @@ fn cmd_verify(
                 false,
                 false,
             ) {
+                eprintln!("{}: {}", e.code(), message_of(&e));
+                eprintln!("milpa-error: {}", e.code());
+                return Ok(1);
+            }
+            // RFC origin-as-identity.md §7.1 D2/D3 (S5): same wiring as the
+            // standalone branch above, workspace form.
+            if let Err(e) = check_source_id_preconditions_workspace(&ws, &lock.deps) {
                 eprintln!("{}: {}", e.code(), message_of(&e));
                 eprintln!("milpa-error: {}", e.code());
                 return Ok(1);
@@ -2062,7 +2085,7 @@ fn cmd_add(dir: &Path, strategy_cli: Option<Strategy>, rest: &[String], no_index
 
         // Build proposed MEMBER manifest with the new dep.
         let mut proposed_member = existing.clone();
-        proposed_member.deps.push(Dep::Url(UrlDep {
+        proposed_member.deps.push(Dep::Url(UrlDep { subpath: None,
             name: name.clone(),
             git: url.clone(),
             git_ref: git_ref_ws.clone(),
@@ -2127,7 +2150,7 @@ fn cmd_add(dir: &Path, strategy_cli: Option<Strategy>, rest: &[String], no_index
         let git_ref_c = git_ref_ws.clone();
         let version_c = version_annotation.clone();
         mutate_manifest_file(&dir.join("milpa.kdl"), move |mut m| {
-            m.deps.push(Dep::Url(UrlDep {
+            m.deps.push(Dep::Url(UrlDep { subpath: None,
                 name: name_c,
                 git: url_c,
                 git_ref: git_ref_c,
@@ -2203,7 +2226,7 @@ fn cmd_add(dir: &Path, strategy_cli: Option<Strategy>, rest: &[String], no_index
     // resolve (cli-contract §5.6). Only on success do we write milpa.kdl +
     // milpa.lock atomically; on any failure both files are left unmodified.
     let mut proposed = existing.clone();
-    proposed.deps.push(Dep::Url(UrlDep {
+    proposed.deps.push(Dep::Url(UrlDep { subpath: None,
         name: name.clone(),
         git: url.clone(),
         git_ref: git_ref.clone(),
@@ -2259,7 +2282,7 @@ fn cmd_add(dir: &Path, strategy_cli: Option<Strategy>, rest: &[String], no_index
 
     // Resolution succeeded → commit both outputs.
     mutate_manifest_file(&dir.join("milpa.kdl"), move |mut m| {
-        m.deps.push(Dep::Url(UrlDep {
+        m.deps.push(Dep::Url(UrlDep { subpath: None,
             name: name.clone(),
             git: url.clone(),
             git_ref: git_ref.clone(),
@@ -2753,40 +2776,60 @@ fn strip_pins_for_upgrade(
     Ok(Some(result))
 }
 
-/// S5b: Convert a CLI dep-name from slash form to double-colon solver_var form.
+/// S5b audit (solver_var/from_solver_var CLI-wide audit, RFC
+/// `rfc-origin-as-identity.md` §10 item 12 / F7): `cmd_remove` is a
+/// LOCKFILE/manifest mutation operation, never a solver-key lookup — it must
+/// NOT route dep identity through `DepKey::solver_var()`/`from_solver_var()`.
+/// Both `LockedDep` and `ResolvedDep` store a qualified dep as two SEPARATE
+/// fields (`name` bare, `namespace` separate) — never joined with `::`
+/// (`DepKey::solver_var()`'s own contract is solver-internal only; it must
+/// never be written to disk, the lockfile, or `_deps/` paths). Mirrors
+/// Python cli.py's `cmd_remove` structured-`DepKey` rewrite exactly:
+/// `parse_dep_ref`/`dep_key_of`/`display_dep_ref` replace the former
+/// `desugar_dep_name`/`dep_remove_key`, which round-tripped identity through
+/// a joined `"ns::name"` string — silently breaking alias lookup (`LockedDep`/
+/// `ResolvedDep` compare against a BARE `name`, never `"ns::name"`) for any
+/// namespace-qualified dep.
 ///
-/// `"ns1/bar"` → `"ns1::bar"`.  Names without a slash are returned unchanged.
-/// Malformed slash forms (more than one slash, empty segments) are also
-/// returned unchanged — the guard in the caller will produce MAN-REMOVE-DEP-ABSENT.
-/// M1: routes through `DepKey::solver_var()` — SOLE join site for `::` in CLI.
-fn desugar_dep_name(name: &str) -> String {
+/// Parse a CLI slash-shorthand dep-name (`"ns1/bar"`) into `(namespace, bare)`
+/// WITHOUT joining them into the solver-internal form. Names without a slash
+/// return `(None, name)`. A malformed slash form (more than one slash, an
+/// empty segment) also returns `(None, name)` unchanged — the caller's
+/// existing-dep guard then reports `MAN-REMOVE-DEP-ABSENT` naming the
+/// original (unparsed) input, same as before this fix.
+fn parse_dep_ref(name: &str) -> (Option<String>, String) {
     if name.contains('/') {
         let parts: Vec<&str> = name.splitn(2, '/').collect();
         if parts.len() == 2 && !parts[0].is_empty() && !parts[1].is_empty()
             && !parts[1].contains('/')
         {
-            return milpa_manifest::DepKey {
-                name: parts[1].to_string(),
-                namespace: Some(parts[0].to_string()),
-            }.solver_var();
+            return (Some(parts[0].to_string()), parts[1].to_string());
         }
     }
-    name.to_string()
+    (None, name.to_string())
 }
 
-/// S5b: Compute the solver_var (remove-key) for a dep.
-///
-/// For `Dep::Named` with a namespace, returns `"ns::bare"`.
-/// For all other deps (or Named without namespace), returns the bare name.
-/// M1: routes through `DepKey::solver_var()` — SOLE join site for `::` in CLI.
-fn dep_remove_key(dep: &milpa_manifest::Dep) -> String {
+/// The structured `(name, namespace)` identity key for a manifest dep
+/// declaration — compared structurally against `canonical_key`, never as a
+/// joined string. For `Dep::Named` with a namespace, carries it; for every
+/// other dep (or a `Named` without one), `namespace` is `None`.
+fn dep_key_of(dep: &milpa_manifest::Dep) -> milpa_manifest::DepKey {
     if let milpa_manifest::Dep::Named(n) = dep {
-        return milpa_manifest::DepKey {
-            name: n.name.clone(),
-            namespace: n.namespace.clone(),
-        }.solver_var();
+        milpa_manifest::DepKey { name: n.name.clone(), namespace: n.namespace.clone() }
+    } else {
+        milpa_manifest::DepKey::bare(dep.name().to_string())
     }
-    dep.name().to_string()
+}
+
+/// User-facing display form for a `DepKey`: `"ns/name"` slash convention —
+/// the same on-disk convention `lockfile.rs`'s `req_name_to_lockfile` uses
+/// for qualified `requires` entries — never the `::`-joined solver-variable
+/// form, which is solver-internal only.
+fn display_dep_ref(key: &milpa_manifest::DepKey) -> String {
+    match &key.namespace {
+        None => key.name.clone(),
+        Some(ns) => format!("{ns}/{}", key.name),
+    }
 }
 
 /// `milpa remove <name>` — drop a dep from `milpa.kdl` and regenerate the
@@ -2826,17 +2869,22 @@ fn cmd_remove(dir: &Path, strategy_cli: Option<Strategy>, rest: &[String], no_in
         } else {
             None
         };
-        // S5b: desugar slash shorthand for workspace member remove.
-        let name_key_ws: String = desugar_dep_name(&name);
-        let canonical_ws: String = if let Some(ref lf) = shared_prior {
-            canonical_name_for(&name_key_ws, lf)
+        // S5b audit fix: parse slash shorthand into (namespace, bare) —
+        // never joined into the solver-internal `"ns::name"` form — then
+        // resolve alias→canonical on the BARE name only (aliases are a
+        // content-dedup convenience, orthogonal to the namespace axis; the
+        // parsed namespace carries through unchanged alongside it).
+        let (ns_ws, bare_ws) = parse_dep_ref(&name);
+        let canonical_bare_ws: String = if let Some(ref lf) = shared_prior {
+            canonical_name_for(&bare_ws, lf)
         } else {
-            name_key_ws.clone()
+            bare_ws.clone()
         };
+        let canonical_key_ws = milpa_manifest::DepKey { name: canonical_bare_ws, namespace: ns_ws };
 
-        // Guard: dep must be declared in the MEMBER's milpa.kdl.
-        // S5b: use dep_remove_key() to match qualified deps by solver_var.
-        if !existing.deps.iter().any(|d| dep_remove_key(d) == canonical_ws) {
+        // Guard: dep must be declared in the MEMBER's milpa.kdl. Match by the
+        // STRUCTURED (name, namespace) key — never a joined string.
+        if !existing.deps.iter().any(|d| dep_key_of(d) == canonical_key_ws) {
             eprintln!("remove: no dep {name:?} in milpa.kdl");
             eprintln!("milpa-error: MAN-REMOVE-DEP-ABSENT");
             return Ok(1);
@@ -2844,7 +2892,7 @@ fn cmd_remove(dir: &Path, strategy_cli: Option<Strategy>, rest: &[String], no_in
 
         // Build proposed member manifest without the dep.
         let mut proposed_member = existing.clone();
-        proposed_member.deps.retain(|d| dep_remove_key(d) != canonical_ws);
+        proposed_member.deps.retain(|d| dep_key_of(d) != canonical_key_ws);
 
         // Rebuild workspace with proposed member manifest and resolve.
         let ws_with_override = milpa_core::load_workspace_with_member_override(&ws, dir, proposed_member.clone())?;
@@ -2884,25 +2932,24 @@ fn cmd_remove(dir: &Path, strategy_cli: Option<Strategy>, rest: &[String], no_in
 
         // Atomic write: member manifest first, then shared workspace lock.
         // NO member-local lock written (D5 correctness point).
-        let canonical_c = canonical_ws.clone();
+        let canonical_key_ws_c = canonical_key_ws.clone();
         mutate_manifest_file(&dir.join("milpa.kdl"), move |mut m| {
-            // S5b: use dep_remove_key() so qualified deps are matched by solver_var.
-            m.deps.retain(|d| dep_remove_key(d) != canonical_c.as_str());
+            // Structured (name, namespace) match — never a joined string.
+            m.deps.retain(|d| dep_key_of(d) != canonical_key_ws_c);
             m
         })?;
         write_lockfile(&from_graph(&graph, strategy.as_str(), exclude_newer), &ws_lock_path)?;
-        eprintln!("removed {canonical_ws}");
+        eprintln!("removed {}", display_dep_ref(&canonical_key_ws));
         return Ok(0);
     }
 
-    // S5b: desugar slash shorthand in the dep name ("ns1/bar" → "ns1::bar").
-    // The solver_var form is what the lockfile stores and what dep_remove_key()
-    // returns for qualified Named deps.
-    let name_key: String = desugar_dep_name(&name);
+    // S5b audit fix: parse slash shorthand into (namespace, bare) — never
+    // joined into the solver-internal `"ns::name"` form (see `parse_dep_ref`'s
+    // doc comment). Alias→canonical resolution (D-update-remove, Phase D item
+    // 5) then runs on the BARE name only against `LockedDep`'s own bare
+    // `name`/`aliases` fields; the parsed namespace carries through unchanged.
+    let (ns, bare) = parse_dep_ref(&name);
 
-    // D-update-remove: alias→canonical resolution (Phase D item 5).
-    // If `name` is an alias of a canonical lockfile dep, resolve to the manifest
-    // dep name so the guard and mutation operate on the correct entry.
     let lock_path = dir.join("milpa.lock");
     // B7-gap (C3): use the shared soft-fail loader — same helper the other
     // resolve-triggering verbs (fetch/lock/add/update) use — so a missing or
@@ -2912,24 +2959,32 @@ fn cmd_remove(dir: &Path, strategy_cli: Option<Strategy>, rest: &[String], no_in
     // `None` into the `resolve()` call, so `milpa remove` dragged unrelated
     // transitives to newest-available instead of keeping them pinned.
     let prior_lock: Option<milpa_core::Lockfile> = maybe_prior_lockfile(&lock_path);
-    let canonical: String = if let Some(ref lf) = prior_lock {
-        canonical_name_for(&name_key, lf)
+    let canonical_bare: String = if let Some(ref lf) = prior_lock {
+        canonical_name_for(&bare, lf)
     } else {
-        name_key.clone()
+        bare.clone()
     };
+    let canonical_key = milpa_manifest::DepKey { name: canonical_bare, namespace: ns };
 
     // §5.7: reject if <dep> (resolved canonical) is not declared in milpa.kdl.
-    // S5b: use dep_remove_key() so that qualified deps ("ns1::bar") match.
-    if !existing.deps.iter().any(|d| dep_remove_key(d) == canonical) {
+    // Match by the STRUCTURED (name, namespace) key — never a joined string.
+    if !existing.deps.iter().any(|d| dep_key_of(d) == canonical_key) {
         eprintln!("remove: no dep {name:?} in milpa.kdl");
         eprintln!("milpa-error: MAN-REMOVE-DEP-ABSENT");
         return Ok(1);
     }
 
     // Collect prior aliases for the removed dep (for warning after re-resolve).
+    // Matched by the structured key (name AND namespace) against LockedDep's
+    // own separate `name`/`namespace` fields — never a joined solver_var string.
     let prior_aliases: Vec<String> = prior_lock
         .as_ref()
-        .and_then(|lf| lf.deps.iter().find(|d| d.name == canonical))
+        .and_then(|lf| {
+            lf.deps.iter().find(|d| {
+                milpa_manifest::DepKey { name: d.name.clone(), namespace: d.namespace.clone() }
+                    == canonical_key
+            })
+        })
         .map(|d| d.aliases.clone())
         .unwrap_or_default();
 
@@ -2937,7 +2992,7 @@ fn cmd_remove(dir: &Path, strategy_cli: Option<Strategy>, rest: &[String], no_in
     // (§5.7). Only on success do we commit both outputs; on any failure both
     // files are left unmodified (resolve runs before any write).
     let mut proposed = existing.clone();
-    proposed.deps.retain(|d| dep_remove_key(d) != canonical);
+    proposed.deps.retain(|d| dep_key_of(d) != canonical_key);
 
     let deps_dir = dir.join("_deps");
     let registry = build_registry();
@@ -2980,19 +3035,25 @@ fn cmd_remove(dir: &Path, strategy_cli: Option<Strategy>, rest: &[String], no_in
     // D-update-remove Phase D item 5: warn per alias that the prior lockfile
     // recorded for the removed dep. If the canonical is still in the new graph
     // (pulled in transitively), warn that its alias remains live; otherwise warn
-    // that the alias will be cleaned up.
+    // that the alias will be cleaned up. Matched by the structured key against
+    // ResolvedDep's own separate `name`/`namespace` fields — never a joined
+    // solver_var string.
+    let canonical_display = display_dep_ref(&canonical_key);
     {
-        let new_canonical_names: std::collections::HashSet<&str> =
-            graph.deps.iter().map(|d| d.name.as_str()).collect();
+        let new_canonical_keys: std::collections::HashSet<milpa_manifest::DepKey> = graph
+            .deps
+            .iter()
+            .map(|d| milpa_manifest::DepKey { name: d.name.clone(), namespace: d.namespace.clone() })
+            .collect();
         for alias in &prior_aliases {
-            if new_canonical_names.contains(canonical.as_str()) {
+            if new_canonical_keys.contains(&canonical_key) {
                 eprintln!(
-                    "warning: alias {alias:?} of removed dep {canonical:?} \
+                    "warning: alias {alias:?} of removed dep {canonical_display:?} \
                      is still required transitively; _deps/{alias} remains live"
                 );
             } else {
                 eprintln!(
-                    "warning: removing dep {canonical:?} also removes alias \
+                    "warning: removing dep {canonical_display:?} also removes alias \
                      {alias:?} (_deps/{alias} will be cleaned up)"
                 );
             }
@@ -3001,15 +3062,15 @@ fn cmd_remove(dir: &Path, strategy_cli: Option<Strategy>, rest: &[String], no_in
 
     // Resolution succeeded → commit both outputs.
     {
-        let canonical = canonical.clone();
+        let canonical_key = canonical_key.clone();
         mutate_manifest_file(&dir.join("milpa.kdl"), move |mut m| {
-            // S5b: use dep_remove_key() so qualified deps are matched by solver_var.
-            m.deps.retain(|d| dep_remove_key(d) != canonical.as_str());
+            // Structured (name, namespace) match — never a joined string.
+            m.deps.retain(|d| dep_key_of(d) != canonical_key);
             m
         })?;
     }
     write_lockfile(&from_graph(&graph, strategy.as_str(), exclude_newer), &dir.join("milpa.lock"))?;
-    eprintln!("removed {canonical}");
+    eprintln!("removed {canonical_display}");
     Ok(0)
 }
 
@@ -5840,6 +5901,7 @@ mod tests {
         });
         let dep = milpa_core::LockedDep {
             declared_version_source: None,
+            source_id: None,
             name: dep_name.to_string(),
             namespace: None,
             identity: Some(identity.to_string()),
@@ -5950,6 +6012,7 @@ mod tests {
         let ts = parse_iso8601_timestamp("2026-01-01T00:00:00Z").unwrap();
         let dep = milpa_core::LockedDep {
             declared_version_source: None,
+            source_id: None,
             name: "foo".to_string(),
             namespace: None,
             identity: Some(identity),

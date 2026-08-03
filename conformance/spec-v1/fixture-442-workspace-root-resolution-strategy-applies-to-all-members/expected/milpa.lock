@@ -3,6 +3,10 @@ version 1
 strategy "minver"
 
 dep "member-a" {
+    source {
+        kind "member"
+        name "member-a"
+    }
     identity "dag-sha256:4e4e0f6412cafc0a94f78c0e286a38c2cba73d905a6aa5a293a72a564146dda0"
     version "0.0.0"
     src_dir ""
@@ -15,6 +19,10 @@ dep "member-a" {
 }
 
 dep "member-b" {
+    source {
+        kind "member"
+        name "member-b"
+    }
     identity "dag-sha256:fd657708848f6861745bc82dae5125b4ca5ff947dbed02ce4f4ee56e7a736b14"
     version "0.0.0"
     src_dir ""
@@ -27,6 +35,11 @@ dep "member-b" {
 }
 
 dep "widget-a" {
+    source {
+        kind "registry"
+        registry "tianguis"
+        name "widget-a"
+    }
     identity "dag-sha256:0566e4068fee0b4cad65b3e09db2c3a40a9e93ed1145a3638bb9516f50327658"
     version "1.0.0"
     src_dir ""
@@ -41,6 +54,11 @@ dep "widget-a" {
 }
 
 dep "widget-b" {
+    source {
+        kind "registry"
+        registry "tianguis"
+        name "widget-b"
+    }
     identity "dag-sha256:586de6a827d1d963067828605b4c5340d16089fcc84a2cb212cf5f6372bd321b"
     version "1.0.0"
     src_dir ""

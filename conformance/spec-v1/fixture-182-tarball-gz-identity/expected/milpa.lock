@@ -3,6 +3,10 @@ version 1
 strategy "maxver"
 
 dep "foo" {
+    source {
+        kind "tarball"
+        url (url)"https://example.com/foo.tar.gz"
+    }
     identity "dag-sha256:2ab62f8e68e12f2733281a154fe8482f37f1b93da70fee32b4c3b258ed603455"
     version "1.0.0"
     declared_version_source "nimble"

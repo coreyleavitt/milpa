@@ -19,6 +19,7 @@ pub use milpa_types::{
 use milpa_types::ResolvedGraph;
 
 pub mod atomic_cache;
+pub mod binding;
 pub mod dag_identity;
 pub mod dep_decl;
 pub mod dep_decl_store;
@@ -31,6 +32,7 @@ pub mod fetch;
 pub mod fetchers;
 pub mod frozen;
 pub mod identity;
+pub mod import_slot;
 pub mod index_cache;
 pub mod index_ratchet_seam;
 pub mod index_trust;
@@ -44,12 +46,14 @@ pub mod registry;
 mod rekor_adapter;
 pub mod resolver;
 pub mod safe_extract;
+pub mod source_id;
 pub mod source_spec;
 pub mod store;
 // Standard trusted_root.json → ManualTrustRoot mapper (S1.5); consumed by `index_trust`.
 mod trust_root;
 pub mod workspace;
 
+pub use binding::{BindOutcome, BindingDecision, BindingResolver, Claim};
 pub use dag_identity::{compute_dag_identity, MaterializedEntry};
 pub use dep_decl::{dep_decl_hash, parse_dep_decl, MAX_DEP_DECL_SCHEMA_VERSION};
 pub use dep_decl_store::{
@@ -77,8 +81,9 @@ pub use index_ratchet_seam::{
 };
 pub use ratchet::{canonical_digest, Baseline, EntryKey, RatchetOutcome, Violation};
 pub use lockfile::{
-    check_locked_drift, format_lockfile, from_graph, load_lockfile, parse_lockfile,
-    strip_dep_pin, verify_against_graph, verify_lockfile_against_deps, write_lockfile,
+    check_locked_drift, collapse_notes, format_dep_origin, format_lockfile, from_graph,
+    load_lockfile, parse_lockfile, strip_dep_pin, verify_against_graph,
+    verify_lockfile_against_deps, write_lockfile, AliasedDep,
 };
 pub use manifest_writer::{
     add_mirror, apply_workspace_manifest_change, mutate_manifest_file,
@@ -92,12 +97,16 @@ pub use milpa_manifest::{format_manifest, format_workspace_manifest};
 // `From<ManifestError>` impl lives here, so `?` lifts parse errors at this
 // boundary.
 pub use fetch::{FetchError, Fetcher, FetcherRegistry, Receipt};
-pub use source_spec::parse_source_spec;
+pub use source_id::{canonical as source_id_canonical, format_source_id, normalize_source};
+pub use source_spec::{parse_source_spec, split_oci_target};
 pub use fetchers::{
     mocked_default_branch, oci_key, resolve_mock_key, stage_mock_content, url_key,
     CasAdmittingFetcher, DefaultRegistry, MockedFetcher,
 };
-pub use frozen::{rebuild_deps_view, resolve_frozen, resolve_workspace_frozen};
+pub use frozen::{
+    check_source_id_preconditions_standalone, check_source_id_preconditions_workspace,
+    rebuild_deps_view, resolve_frozen, resolve_workspace_frozen,
+};
 pub use identity::{
     compute_content_hash, enumerate_local_entries, parse_identity, SUPPORTED_ALGORITHMS,
 };

@@ -130,7 +130,7 @@ fn validate_commit_sha(sha: &str) -> Result<(), CoreError> {
     }
 }
 
-fn validate_oci_digest(digest: &str) -> Result<(), CoreError> {
+pub(crate) fn validate_oci_digest(digest: &str) -> Result<(), CoreError> {
     let ok = digest
         .strip_prefix("sha256:")
         .is_some_and(|hex| is_lower_hex(hex, 64));

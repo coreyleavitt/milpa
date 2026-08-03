@@ -41,6 +41,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from milpa.binding import DEFAULT_REGISTRY_ALIAS, Claim, reconcile_root_claims
 from milpa.context import MilpaEnv
 from milpa.errors import (
     FROZEN_CONSTRAINT_UNSATISFIED,
@@ -52,6 +53,8 @@ from milpa.errors import (
     FROZEN_MEMBER_DEP,
     FROZEN_MEMBER_IDENTITY_DRIFT,
     FROZEN_MEMBER_NOT_IN_WORKSPACE,
+    FROZEN_REGISTRY_ALIAS_UNRESOLVED,
+    FROZEN_SOURCE_ID_MISMATCH,
     FROZEN_STRATEGY_MISMATCH,
     MilpaError,
 )
@@ -64,8 +67,9 @@ from milpa.lockfile import (
     ResolvedDep,
     ResolvedGraph,
 )
-from milpa.manifest import Manifest, MemberDep, NamedDep
-from milpa.registry import EntryAttestation
+from milpa.manifest import Manifest, MemberDep, MemberTarget, NamedDep
+from milpa.registry import EntryAttestation, Index
+from milpa.source_id import RegistrySourceId, SourceId, format_source_id
 from milpa.version import DepKey, Strategy, VersionSet, parse_version
 from milpa.workspace import LoadedWorkspace
 
@@ -183,6 +187,171 @@ def _check_member_provenance_in_single_package(locked: LockedDep) -> None:
             )
 
 
+def _source_id_matches_declared(declared: SourceId, locked: SourceId) -> bool:
+    """Field-wise comparison for ``FROZEN-SOURCE-ID-MISMATCH`` (RFC
+    origin-as-identity.md §7.1 D2).
+
+    Plain frozen-dataclass equality for every kind EXCEPT ``RegistrySourceId``
+    with an unqualified (bare) manifest declaration: the frozen path has no
+    live tianguis index to resolve a bare name's real namespace (unlike a
+    live ``resolve()``, which calls ``resolved_registry_namespace``), so the
+    *namespace* component is not compared when the manifest declaration
+    itself carried no explicit qualifier — only the registry alias and name
+    (both knowable without an index). An EXPLICITLY-qualified declaration
+    (``ns/name``) still gets a full three-field comparison.
+    """
+    if isinstance(declared, RegistrySourceId) and isinstance(locked, RegistrySourceId):
+        if declared.registry != locked.registry or declared.name != locked.name:
+            return False
+        if declared.namespace is not None and declared.namespace != locked.namespace:
+            return False
+        return True
+    return declared == locked
+
+
+def _check_source_id_preconditions(
+    declared_deps: "list[object]",
+    overrides: "object",
+    lockfile_deps: "tuple[LockedDep, ...]",
+) -> None:
+    """``FROZEN-REGISTRY-ALIAS-UNRESOLVED`` (checked FIRST, short-circuits)
+    + ``FROZEN-SOURCE-ID-MISMATCH`` (declared-AFTER-override) — RFC
+    origin-as-identity.md §7.1 D2/D3.
+
+    Scope (normative): only locked deps that correspond to a ROOT-
+    authoritative claim (an ordinary manifest dep declaration, or an
+    ``overrides {}`` target) are checked — a purely transitive dep's "real"
+    declaration lives inside another dep's fetched manifest, which the
+    frozen path never re-reads (it never fetches), so there is nothing to
+    compare it against here. Workspace-member and standalone-root-self
+    entries (``MemberSourceId``) are likewise skipped — W1-W5 conflict-free-
+    by-construction, no manifest "declared origin" concept applies.
+
+    Reuses ``binding.reconcile_root_claims`` — the SAME override-application
+    helper ``BindingResolver.__init__`` uses — so an ``overrides {}``-
+    redirected dep is compared against its override TARGET, never its raw
+    declaration (a naive check would false-positive on every project using
+    ``overrides {}``, the very bridge the RFC promotes). No live tianguis
+    index is needed (or used) here: registry-namespace resolution for a bare
+    name would require one, so ``_source_id_matches_declared`` skips that
+    ONE component for an unqualified declaration rather than passing a real
+    index through the frozen path (which never fetches / never loads one).
+    """
+    declared_claims: "list[Claim]" = reconcile_root_claims(
+        declared_deps, list(overrides), index=Index()  # type: ignore[arg-type]
+    )
+    declared_by_key: "dict[DepKey, SourceId]" = {
+        DepKey.from_solver_var(c.name): c.source_id for c in declared_claims
+    }
+
+    for locked in lockfile_deps:
+        locked_sid = locked.source_id
+        if locked_sid is None:
+            continue  # pre-S5 lockfile — nothing to check (forward-compat)
+
+        # D3: FROZEN-REGISTRY-ALIAS-UNRESOLVED is checked FIRST and
+        # short-circuits — an unresolved alias must never be misreported as
+        # a coordinate mismatch (the comparison below is not even attempted).
+        if (
+            isinstance(locked_sid, RegistrySourceId)
+            and locked_sid.registry != DEFAULT_REGISTRY_ALIAS
+        ):
+            raise MilpaError(
+                FROZEN_REGISTRY_ALIAS_UNRESOLVED,
+                f"dep {locked.name!r}: lockfile references registry alias "
+                f"{locked_sid.registry!r}, which is not configured on this "
+                f"machine (known: {DEFAULT_REGISTRY_ALIAS!r}); the source-id "
+                f"coordinate cannot be verified — configure the alias or "
+                f"re-run 'milpa fetch'",
+                name=locked.name,
+                alias=locked_sid.registry,
+            )
+
+        key = DepKey(name=locked.name, namespace=locked.namespace)
+        declared_sid = declared_by_key.get(key)
+        if declared_sid is None:
+            continue  # not a root-authoritative claim at this scope — skip
+
+        if not _source_id_matches_declared(declared_sid, locked_sid):
+            raise MilpaError(
+                FROZEN_SOURCE_ID_MISMATCH,
+                f"dep {locked.name!r}: manifest declares "
+                f"{format_source_id(declared_sid)} but the lockfile records "
+                f"{format_source_id(locked_sid)} — the declared origin was "
+                f"edited without re-fetching; run 'milpa fetch' to "
+                f"regenerate the lockfile",
+                name=locked.name,
+                declared=format_source_id(declared_sid),
+                locked=format_source_id(locked_sid),
+            )
+
+    # A ``RegistryTarget`` override (`pkg "old-fork" named="widget"
+    # namespace="acme"`) redirects the subject to a DIFFERENT coordinate, so
+    # the locked dep is stored under the TARGET coordinate (widget/acme), not
+    # the subject — the subject-keyed loop above can never match it, and the
+    # FROZEN-SOURCE-ID-MISMATCH check was structurally unreachable for this one
+    # target kind. Detect an edited-without-refetch RegistryTarget override
+    # from the DECLARED side: the coordinate the override CURRENTLY resolves to
+    # MUST appear among the locked source-ids; if it doesn't, the target was
+    # changed since the lockfile was generated. (Git/Local/Tarball/Oci override
+    # targets keep the subject's own name on the locked dep, so the loop above
+    # already covers them; only RegistryTarget renames the dep.)
+    locked_reg_coords = {
+        (d.source_id.namespace, d.source_id.name)
+        for d in lockfile_deps
+        if isinstance(d.source_id, RegistrySourceId)
+    }
+    for claim in declared_claims:
+        if not claim.claimant.startswith("override:"):
+            continue
+        csid = claim.source_id
+        if not isinstance(csid, RegistrySourceId):
+            continue  # Git/Local/Tarball/Oci override → covered by the loop above
+        if (csid.namespace, csid.name) not in locked_reg_coords:
+            raise MilpaError(
+                FROZEN_SOURCE_ID_MISMATCH,
+                f"override redirects to {format_source_id(csid)}, which is not "
+                f"present in the lockfile — the `overrides {{}}` target was "
+                f"edited without re-fetching; run 'milpa fetch' to regenerate "
+                f"the lockfile",
+                name=csid.name,
+                declared=format_source_id(csid),
+            )
+
+
+def check_source_id_preconditions_standalone(
+    manifest: Manifest, lockfile_deps: "tuple[LockedDep, ...]"
+) -> None:
+    """Public SSOT wrapper for a standalone (single-package) project — used
+    by both ``resolve_frozen`` and ``milpa verify`` (``cli.cmd_verify``), so
+    the two entry points cannot structurally drift on this check.
+    """
+    all_deps = list(manifest.deps) + list(manifest.dev_deps)
+    _check_source_id_preconditions(
+        all_deps,
+        [ov for ov in manifest.overrides if not isinstance(ov.target, MemberTarget)],
+        lockfile_deps,
+    )
+
+
+def check_source_id_preconditions_workspace(
+    workspace: LoadedWorkspace, lockfile_deps: "tuple[LockedDep, ...]"
+) -> None:
+    """Public SSOT wrapper for a workspace — used by both
+    ``resolve_workspace_frozen`` and ``milpa verify`` (``cli.cmd_verify``).
+    """
+    members_by_name = {m.manifest.name: m for m in workspace.members}
+    ws_declared_deps: list[object] = []
+    for member in workspace.members:
+        for wsd in list(member.manifest.deps) + list(member.manifest.dev_deps):
+            if wsd.name in members_by_name or isinstance(wsd, MemberDep):
+                continue
+            ws_declared_deps.append(wsd)
+    _check_source_id_preconditions(
+        ws_declared_deps, workspace.workspace_manifest.overrides, lockfile_deps
+    )
+
+
 def _reconstruct_from_locked(locked: LockedDep) -> ResolvedDep:
     """Reconstruct a ResolvedDep from a LockedDep (frozen path reconstruction).
 
@@ -222,17 +391,19 @@ def _reconstruct_from_locked(locked: LockedDep) -> ResolvedDep:
             if locked.attestation is not None
             else None
         ),
-        # CR13/4: carry LockAttestation.namespace back onto registry_namespace
-        # — it is populated precisely so milpa verify's offline re-verification
-        # (RFC per-entry-attestation.md §7) can rebuild the exact
-        # pkg:tianguis/<namespace>/<name>@<version> subject coordinate from a
-        # frozen-reconstructed graph with no index available.
-        registry_namespace=(
-            locked.attestation.namespace or None if locked.attestation is not None else None
-        ),
         # A5: carry the sibling declared-version source straight through —
         # frozen reconstruction re-derives nothing (no solve, no re-fetch).
         declared_version_source=locked.declared_version_source,
+        # RFC origin-as-identity.md §4.1/§4.4/§7 (S5): the frozen path now
+        # threads the lockfile's own structured ``source_id`` straight onto
+        # the reconstructed ResolvedDep — no re-derivation, no parsing, just
+        # a direct passthrough of the typed struct already on LockedDep.
+        # This is what lets check_directory_slot_collisions and milpa verify's
+        # offline attestation-subject reconstruction use format_source_id
+        # (the typed formatter) on the frozen path too, not just fresh
+        # resolves (closes the "until a later slice populates it there too"
+        # gap the S3a docstring on ResolvedDep.source_id flagged).
+        source_id=locked.source_id,
     )
 
 
@@ -317,6 +488,11 @@ def resolve_frozen(
                 name=dep.name,
             )
 
+    # RFC origin-as-identity.md §7.1 D2/D3 (S5): FROZEN-REGISTRY-ALIAS-
+    # UNRESOLVED (checked first) + FROZEN-SOURCE-ID-MISMATCH (declared-
+    # AFTER-override). SSOT wrapper also used by `milpa verify` (cli.py).
+    check_source_id_preconditions_standalone(manifest, lockfile.deps)
+
     # Per-dep checks (3–8) for each locked dep
     for locked in lockfile.deps:
         # Condition 6: FROZEN-LOCAL-DEP (single-package only)
@@ -379,6 +555,20 @@ def resolve_frozen(
         resolved.append(_reconstruct_from_locked(locked))
 
     graph = ResolvedGraph(deps=tuple(resolved))
+
+    # RFC origin-as-identity.md §4.6 (S6 "F4" frozen-path reachability + S7):
+    # the import-slot check runs here too — no BindingResolver protects a
+    # lockfile reconstructed straight off disk, so this check must not wait
+    # for S5's structured on-disk source. check_import_slot_collisions runs
+    # the S6 directory-slot floor first (see lockfile.py's
+    # check_directory_slot_collisions docstring for why it needs no new
+    # source_id plumbing to cover this path), then the manifest_declared-
+    # fidelity symbol-level scan over the SAME CAS store rebuild_deps_view
+    # materializes from — see live_symbol_provider()'s docstring for why
+    # tree_scanned fidelity is not (yet) in the zero-config default.
+    from milpa.import_slot import check_import_slot_collisions, live_symbol_provider
+    check_import_slot_collisions(graph, live_symbol_provider(), store=env.store)
+
     from milpa.resolver import rebuild_deps_view
     rebuild_deps_view(graph, deps_dir, env.store)
     return graph
@@ -529,6 +719,11 @@ def resolve_workspace_frozen(
 
     members_by_name = {m.manifest.name: m for m in workspace.members}
 
+    # RFC origin-as-identity.md §7.1 D2/D3 (S5): FROZEN-REGISTRY-ALIAS-
+    # UNRESOLVED (checked first) + FROZEN-SOURCE-ID-MISMATCH (declared-
+    # AFTER-override). SSOT wrapper also used by `milpa verify` (cli.py).
+    check_source_id_preconditions_workspace(workspace, lockfile.deps)
+
     # Per-dep checks
     for locked in lockfile.deps:
         # Determine if this locked dep is a member or an external dep.
@@ -580,6 +775,13 @@ def resolve_workspace_frozen(
         resolved.append(_reconstruct_from_locked(locked))
 
     graph = ResolvedGraph(deps=tuple(resolved))
+
+    # RFC origin-as-identity.md §4.6 (S6 "F4" + S7): see resolve_frozen's
+    # identical hook above (manifest_declared fidelity only, live_symbol_
+    # provider()'s docstring has the why).
+    from milpa.import_slot import check_import_slot_collisions, live_symbol_provider
+    check_import_slot_collisions(graph, live_symbol_provider(), store=env.store)
+
     from milpa.resolver import rebuild_deps_view
     rebuild_deps_view(graph, deps_dir, env.store)
     return graph

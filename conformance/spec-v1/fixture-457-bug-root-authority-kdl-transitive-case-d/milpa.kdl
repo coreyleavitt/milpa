@@ -1,0 +1,27 @@
+// fixture-457: BUG-root-authority-kdl-transitive.md case D.
+//
+// Same shape as fixture-456 (case B), but root pins "softlink" via an
+// `overrides {}` rule (the spec-blessed remedy per §10.1) instead of a
+// direct root dep declaration — the OTHER form the bug report shows
+// collapsing resolution identically. "proptest" (a fetched dep) declares
+// "nim-z3" and "softlink" as git deps in its OWN milpa.kdl; the override
+// targets the exact same source (URL+ref) proptest's OWN claim on
+// "softlink" uses.
+//
+// Pre RFC origin-as-identity, the override-seeded provenance_gate entry
+// still collapsed the same way as case B: "nim-z3" — declared in
+// proptest's kdl and NOT overridden by anyone — lost its entire candidate
+// set as collateral damage (the bug report's "sibling package losing
+// candidates when a claim is suppressed" symptom).
+//
+// Expected (post RFC origin-as-identity S3a/S3b BindingResolver): resolves
+// cleanly — "proptest", "softlink" (via the override target), and "nim-z3"
+// all present, with no collateral candidate loss.
+name "t"
+kind "application"
+deps {
+    "proptest" git=(url)"https://example.com/proptest.git" ref="main"
+}
+overrides {
+    pkg "softlink" git=(url)"https://example.com/softlink.git" ref="main"
+}

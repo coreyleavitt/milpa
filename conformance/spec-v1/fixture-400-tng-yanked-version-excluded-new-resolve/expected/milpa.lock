@@ -3,6 +3,11 @@ version 1
 strategy "maxver"
 
 dep "bar" {
+    source {
+        kind "registry"
+        registry "tianguis"
+        name "bar"
+    }
     identity "dag-sha256:1902ed126344702d13e9323974de0840ca20483e0bef0bc5b1078890481970ef"
     version "1.0.0"
     src_dir "src"

@@ -11,14 +11,18 @@
 
 use std::path::Path;
 
-use milpa_manifest::{Dep, Manifest, Resolution};
+use milpa_manifest::{Dep, Manifest, Override, OverrideTarget, Resolution};
 use milpa_solver::{parse_version, Strategy};
 use milpa_types::{
-    EntryAttestation, LockedDep, Lockfile, ProvenanceRecord, ResolvedDep, ResolvedGraph, Timestamp,
+    DepKey, EntryAttestation, FetchableOrigin, LockedDep, Lockfile, ProvenanceRecord, ResolvedDep,
+    ResolvedGraph, SourceId, Timestamp,
 };
 
 use crate::error::{CoreError, MilpaError};
+use crate::registry::Index;
+use crate::source_id::format_source_id;
 use crate::store::CaStore;
+use crate::workspace::LoadedWorkspace;
 
 fn frozen(code: &'static str, message: impl Into<String>) -> MilpaError {
     MilpaError::Core(CoreError::Frozen(code, message.into()))
@@ -39,6 +43,10 @@ pub fn resolve_frozen(
     check_strategy(frozen_baseline_strategy(manifest.resolution), lock)?;
     check_exclude_newer(frozen_baseline_exclude_newer(manifest.resolution), lock)?;
     check_manifest_alignment(manifest, lock)?;
+    // RFC origin-as-identity.md §7.1 D2/D3 (S5): FROZEN-REGISTRY-ALIAS-
+    // UNRESOLVED (checked first) + FROZEN-SOURCE-ID-MISMATCH (declared-
+    // AFTER-override). SSOT wrapper also used by `milpa verify` (main.rs).
+    check_source_id_preconditions_standalone(manifest, &lock.deps)?;
 
     std::fs::create_dir_all(deps_dir).map_err(|e| {
         frozen(
@@ -99,9 +107,20 @@ pub fn resolve_frozen(
         }
         resolved.push(resolved_from_locked(locked)?);
     }
+    // RFC origin-as-identity.md §4.6 (S6, "F4" frozen-path reachability): the
+    // directory-slot import floor runs here too — no BindingResolver protects
+    // a lockfile reconstructed straight off disk, so this check must not wait
+    // for a later slice's structured on-disk source. See
+    // lockfile::check_directory_slot_collisions's doc comment for why it
+    // needs no new source_id plumbing to cover this path today.
+    let graph = ResolvedGraph { deps: resolved };
+    // S7 (rfc-origin-as-identity.md §4.6): the complete, symbol-level check —
+    // runs the S6 directory-slot floor internally as its own pre-filter.
+    // live_symbol_provider() is manifest_declared fidelity ONLY — see its
+    // own doc comment for the v1 scope rationale.
+    crate::import_slot::check_import_slot_collisions(&graph, &crate::import_slot::live_symbol_provider(), Some(store))?;
     // B-nimcfg: use rebuild_deps_view (SSOT) to create canonical + alias symlinks
     // and remove stale entries atomically.
-    let graph = ResolvedGraph { deps: resolved };
     rebuild_deps_view(&graph, deps_dir, store);
     Ok(graph)
 }
@@ -125,6 +144,11 @@ pub fn resolve_workspace_frozen(
     for member in &workspace.members {
         check_manifest_alignment(&member.manifest, lock)?;
     }
+    // RFC origin-as-identity.md §7.1 D2/D3 (S5): FROZEN-REGISTRY-ALIAS-
+    // UNRESOLVED (checked first) + FROZEN-SOURCE-ID-MISMATCH (declared-
+    // AFTER-override). SSOT wrapper also used by `milpa verify` (main.rs).
+    check_source_id_preconditions_workspace(workspace, &lock.deps)?;
+
     std::fs::create_dir_all(deps_dir).map_err(|e| {
         frozen(
             "FROZEN-IDENTITY-NOT-IN-STORE",
@@ -187,8 +211,13 @@ pub fn resolve_workspace_frozen(
             }
         }
     }
-    // B-nimcfg: use rebuild_deps_view (SSOT) for atomic _deps/ rebuild.
+    // RFC origin-as-identity.md §4.6 (S6, "F4"): see resolve_frozen's
+    // identical hook above. S7: check_import_slot_collisions runs the S6
+    // floor internally; live_symbol_provider() is manifest_declared fidelity
+    // ONLY — see its own doc comment for the v1 scope rationale.
     let graph = ResolvedGraph { deps: resolved };
+    crate::import_slot::check_import_slot_collisions(&graph, &crate::import_slot::live_symbol_provider(), Some(store))?;
+    // B-nimcfg: use rebuild_deps_view (SSOT) for atomic _deps/ rebuild.
     rebuild_deps_view(&graph, deps_dir, store);
     Ok(graph)
 }
@@ -467,6 +496,161 @@ fn check_manifest_alignment(manifest: &Manifest, lock: &Lockfile) -> Result<(), 
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// S5 — FROZEN-SOURCE-ID-MISMATCH / FROZEN-REGISTRY-ALIAS-UNRESOLVED
+// (rfc-origin-as-identity.md §7.1 D2/D3). Mirrors Python's `frozen.py`
+// `_source_id_matches_declared` / `_check_source_id_preconditions` /
+// `check_source_id_preconditions_standalone` / `check_source_id_preconditions_workspace`.
+// ---------------------------------------------------------------------------
+
+/// Field-wise comparison for `FROZEN-SOURCE-ID-MISMATCH` (RFC
+/// origin-as-identity.md §7.1 D2).
+///
+/// Plain equality for every kind EXCEPT `Registry` with an unqualified
+/// (bare) manifest declaration: the frozen path has no live tianguis index
+/// to resolve a bare name's real namespace (unlike a live resolve, which
+/// calls `resolved_registry_namespace`), so the *namespace* component is
+/// not compared when the manifest declaration itself carried no explicit
+/// qualifier — only the registry alias and name (both knowable without an
+/// index). An EXPLICITLY-qualified declaration still gets a full
+/// three-field comparison.
+fn source_id_matches_declared(declared: &SourceId, locked: &SourceId) -> bool {
+    if let (
+        SourceId::Fetchable(FetchableOrigin::Registry { registry: dr, namespace: dns, name: dn }),
+        SourceId::Fetchable(FetchableOrigin::Registry { registry: lr, namespace: lns, name: ln }),
+    ) = (declared, locked)
+    {
+        if dr != lr || dn != ln {
+            return false;
+        }
+        return match dns {
+            Some(ns) => Some(ns) == lns.as_ref(),
+            None => true,
+        };
+    }
+    declared == locked
+}
+
+/// `FROZEN-REGISTRY-ALIAS-UNRESOLVED` (checked FIRST, short-circuits) +
+/// `FROZEN-SOURCE-ID-MISMATCH` (declared-AFTER-override) — RFC
+/// origin-as-identity.md §7.1 D2/D3.
+///
+/// Scope (normative): only locked deps that correspond to a
+/// ROOT-authoritative claim (an ordinary manifest dep declaration, or an
+/// `overrides {}` target) are checked — a purely transitive dep's "real"
+/// declaration lives inside another dep's fetched manifest, which the
+/// frozen path never re-reads. Workspace-member and standalone-root-self
+/// entries (`SourceId::Member`) are likewise skipped — W1-W5
+/// conflict-free-by-construction, no manifest "declared origin" concept
+/// applies.
+///
+/// Reuses `binding::reconcile_root_claims` — the SAME override-application
+/// helper `BindingResolver::new` uses — so an `overrides {}`-redirected dep
+/// is compared against its override TARGET, never its raw declaration. No
+/// live tianguis index is needed (or used) here: an empty `Index::default()`
+/// makes a bare name's `resolved_registry_namespace` lookup return `None`,
+/// and `source_id_matches_declared` skips that ONE component for an
+/// unqualified declaration rather than requiring a real index (the frozen
+/// path never fetches / never loads one).
+fn check_source_id_preconditions(
+    declared_deps: &[Dep],
+    overrides: &[Override],
+    lockfile_deps: &[LockedDep],
+) -> Result<(), MilpaError> {
+    let index = Index::default();
+    let declared_claims = crate::binding::reconcile_root_claims(declared_deps, overrides, &index)?;
+    let mut declared_by_key: std::collections::BTreeMap<DepKey, SourceId> =
+        std::collections::BTreeMap::new();
+    for c in &declared_claims {
+        declared_by_key.insert(DepKey::from_solver_var(&c.name), c.source_id.clone());
+    }
+
+    for locked in lockfile_deps {
+        let Some(locked_sid) = &locked.source_id else {
+            continue; // pre-S5 lockfile — nothing to check (forward-compat)
+        };
+
+        // D3: FROZEN-REGISTRY-ALIAS-UNRESOLVED is checked FIRST and
+        // short-circuits — an unresolved alias must never be misreported as
+        // a coordinate mismatch (the comparison below is not even attempted).
+        if let SourceId::Fetchable(FetchableOrigin::Registry { registry, .. }) = locked_sid {
+            if registry != crate::binding::DEFAULT_REGISTRY_ALIAS {
+                return Err(frozen(
+                    "FROZEN-REGISTRY-ALIAS-UNRESOLVED",
+                    format!(
+                        "dep {:?}: lockfile references registry alias {registry:?}, which is \
+                         not configured on this machine (known: {:?}); the source-id \
+                         coordinate cannot be verified — configure the alias or re-run \
+                         'milpa fetch'",
+                        locked.name,
+                        crate::binding::DEFAULT_REGISTRY_ALIAS
+                    ),
+                ));
+            }
+        }
+
+        let key = DepKey { name: locked.name.clone(), namespace: locked.namespace.clone() };
+        let Some(declared_sid) = declared_by_key.get(&key) else {
+            continue; // not a root-authoritative claim at this scope — skip
+        };
+
+        if !source_id_matches_declared(declared_sid, locked_sid) {
+            return Err(frozen(
+                "FROZEN-SOURCE-ID-MISMATCH",
+                format!(
+                    "dep {:?}: manifest declares {} but the lockfile records {} — the \
+                     declared origin was edited without re-fetching; run 'milpa fetch' to \
+                     regenerate the lockfile",
+                    locked.name,
+                    format_source_id(declared_sid),
+                    format_source_id(locked_sid),
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Public SSOT wrapper for a standalone (single-package) project — used by
+/// both [`resolve_frozen`] and `milpa verify` (`main.rs`'s `cmd_verify`), so
+/// the two entry points cannot structurally drift on this check. Mirrors
+/// Python's `frozen.check_source_id_preconditions_standalone`.
+pub fn check_source_id_preconditions_standalone(
+    manifest: &Manifest,
+    lockfile_deps: &[LockedDep],
+) -> Result<(), MilpaError> {
+    let all_deps: Vec<Dep> = manifest.deps.iter().chain(manifest.dev_deps.iter()).cloned().collect();
+    let overrides: Vec<Override> = manifest
+        .overrides
+        .iter()
+        .filter(|ov| !matches!(ov.target, OverrideTarget::Member { .. }))
+        .cloned()
+        .collect();
+    check_source_id_preconditions(&all_deps, &overrides, lockfile_deps)
+}
+
+/// Public SSOT wrapper for a workspace — used by both
+/// [`resolve_workspace_frozen`] and `milpa verify` (`main.rs`'s
+/// `cmd_verify`). Mirrors Python's
+/// `frozen.check_source_id_preconditions_workspace`.
+pub fn check_source_id_preconditions_workspace(
+    workspace: &LoadedWorkspace,
+    lockfile_deps: &[LockedDep],
+) -> Result<(), MilpaError> {
+    let members_by_name: std::collections::BTreeSet<&str> =
+        workspace.members.iter().map(|m| m.name.as_str()).collect();
+    let mut ws_declared_deps: Vec<Dep> = Vec::new();
+    for member in &workspace.members {
+        for wsd in member.manifest.deps.iter().chain(member.manifest.dev_deps.iter()) {
+            if members_by_name.contains(wsd.name()) || matches!(wsd, Dep::Member(_)) {
+                continue;
+            }
+            ws_declared_deps.push(wsd.clone());
+        }
+    }
+    check_source_id_preconditions(&ws_declared_deps, &workspace.overrides, lockfile_deps)
+}
+
 /// Rebuild a [`ResolvedDep`] from a [`LockedDep`], deriving the transport
 /// provenance from the first record. `Member`/`Local` are unreachable here (they bail above).
 fn resolved_from_locked(locked: &LockedDep) -> Result<ResolvedDep, MilpaError> {
@@ -513,19 +697,18 @@ fn resolved_from_locked(locked: &LockedDep) -> Result<ResolvedDep, MilpaError> {
             rekor: a.rekor.clone(),
             bundle_pin: a.bundle_pin.clone(),
         }),
-        // CR13/4: LockAttestation.namespace is populated precisely so
-        // `milpa verify`'s offline re-verification (RFC per-entry-attestation.md
-        // §7) can rebuild the exact pkg:tianguis/<namespace>/<name>@<version>
-        // subject coordinate from a frozen-reconstructed graph with no index
-        // available — carry it back onto registry_namespace (empty string,
-        // the "no attestation" default, folds to None for round-trip symmetry
-        // with `_locked_from_resolved`'s `registry_namespace.unwrap_or_default()`).
-        registry_namespace: locked.attestation.as_ref().and_then(|a| {
-            if a.namespace.is_empty() { None } else { Some(a.namespace.clone()) }
-        }),
         // A5: carry the sibling declared-version source straight through —
         // frozen reconstruction re-derives nothing (no solve, no re-fetch).
         declared_version_source: locked.declared_version_source.clone(),
+        // RFC origin-as-identity §4.1/§4.4/§7 (S5): the frozen path now
+        // threads the lockfile's own structured `source_id` straight onto
+        // the reconstructed ResolvedDep — no re-derivation, no parsing, just
+        // a direct passthrough of the typed value already on LockedDep. This
+        // is what lets check_directory_slot_collisions and milpa verify's
+        // offline attestation-subject reconstruction use format_source_id
+        // (the typed formatter) on the frozen path too, not just fresh
+        // resolves.
+        source_id: locked.source_id.clone(),
     })
 }
 

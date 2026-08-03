@@ -3,6 +3,10 @@ version 1
 strategy "maxver"
 
 dep "mylib" {
+    source {
+        kind "local"
+        path "./src-tree"
+    }
     version "0.1.0"
     declared_version_source "nimble"
     src_dir ""

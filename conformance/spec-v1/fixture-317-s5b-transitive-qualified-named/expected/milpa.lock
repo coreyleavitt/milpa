@@ -3,6 +3,10 @@ version 1
 strategy "maxver"
 
 dep "foo" {
+    source {
+        kind "git"
+        url (url)"https://example.com/foo"
+    }
     identity "dag-sha256:78590d7fc3fffdc52e4588782086e18ca910b8f0b1247f92c5ba8ef72d352f00"
     version "0.0.0"
     src_dir ""
@@ -18,6 +22,12 @@ dep "foo" {
 
 dep "baz" {
     namespace "ns1"
+    source {
+        kind "registry"
+        registry "tianguis"
+        namespace "ns1"
+        name "baz"
+    }
     identity "dag-sha256:b3ef94f6e0c78594f82f4002c4d3d92ff8342189eeb8776b8ed86c06edca50ac"
     version "1.0.0"
     src_dir "src"

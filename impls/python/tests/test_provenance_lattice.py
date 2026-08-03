@@ -1,48 +1,30 @@
-"""#193 (resolver-semantics.md §10.0 — the three-tier provenance authority
-lattice), end to end through ``resolve()``, plus direct unit tests of the
-tier-aware gate AND the registry-validation mechanism.
+"""#193 (source selection / registry-shadow), end to end through ``resolve()``.
 
-Authority tiers (§10.0 NORMATIVE):
-    Tier 1 (highest)  Root      — root/member deps + dev-deps + overrides.
-    Tier 2            Registry — a ``named``/index claim (tianguis).
-    Tier 3 (lowest)   Self-URL — a transitive git=/local=/tarball= claim.
+**Post RFC origin-as-identity (S3a/S3b):** the old three-tier
+``provenance_gate``/``TIER_*``/``_check_provenance_gate``/
+``_validate_transitive_url_against_registry`` machinery this file used to
+exercise directly is DELETED (`docs/rfc-origin-as-identity.md` §6). Source
+selection is now two orthogonal mechanisms, both exercised below:
 
-A higher tier suppresses a lower-tier DISAGREEMENT (two claims for the same
-non-root name with different provenance keys), deterministically and without
-error. ``RES-PROVENANCE-CONFLICT`` fires only for a disagreement WITHIN the
-untrusted tier-3 tier, and only when no tier-2 claim exists for that name.
-
-**Design revision (validate-against-registry, resolver-semantics.md §10.0/
-§10.3 as revised):** the registry is a TRUSTED DEFAULT, not an explicit
-per-build choice. For a non-root name present in the registry index, a
-transitive self-declared ``git=``/``tarball=`` claim is VALIDATED against the
-registry's recorded source for the name:
-  - AGREES (same git repository the registry records — a differing ``ref``
-    is still agreement, the ref only selects a version) → the claim is
-    ACCEPTED and resolves normally, exactly like an ordinary tier-3 url dep
-    (it is fetched; content-hash dedup / ordinary solver version-negotiation
-    reconciles it with any registry-version candidate for the same name).
-    This SUPERSEDES the prior "membership-based redirect" design (a lone
-    agreeing url pin is no longer silently redirected to the registry — it
-    is accepted AS ITSELF).
-  - DISAGREES (a different source repository, or an incomparable transport,
-    e.g. this git= claim against an OCI-only registry entry) → the resolver
-    raises ``RES-PROVENANCE-CONFLICT`` — even for a LONE disagreeing claim,
-    with no competing claim anywhere else in the graph (this is the
-    headline behavioral change from the old disagreement-only design: a
-    transitive can no longer silently substitute a registry name's source,
-    nor can it silently redirect to the registry against the transitive's
-    own wishes).
+- **``BindingResolver`` (``binding.py``, §4.3)** — the deterministic binding
+  phase. A root/override claim always wins; two disagreeing TRANSITIVE
+  claims for the same name (no root claim to arbitrate) raise
+  ``RES-BINDING-CONFLICT``.
+- **The registry-shadow tripwire (``binding.check_registry_shadow``, §6.1)**
+  — a pre-fetch, name-triggered, URL-refined dependency-confusion check: a
+  transitive ``git=``/``tarball=``/``oci=`` claim whose bare name is also a
+  tianguis-owned coordinate is silently accepted if its source matches the
+  registry's recorded upstream, else raises ``RES-REGISTRY-SHADOW`` (warn by
+  default, hard-fail under ``attestation-policy strict``).
 
 This file's resolver-level scenarios exercise BOTH BFS discovery orderings
-(the ordering the mechanism must not be sensitive to, per §10.5) and prove
-the validation is a static, per-claim decision, never dependent on which
-other claims exist or when they are discovered.
+(the ordering neither mechanism may be sensitive to) and prove each decision
+is static and per-claim, never dependent on which other claims exist or when
+they are discovered.
 
-``tests/test_provenance_gate.py`` already covers the pre-#193 tier-3-vs-
-tier-3 shape (fixture-099) with real declared-version data; this file adds
-the registry (tier-2) validation dimension, plus a regression pin that the
-tier-3-vs-tier-3 case (no registry entry at all) still conflicts.
+``tests/test_provenance_gate.py`` covers the tier-3-vs-tier-3-shaped (now
+``RES-BINDING-CONFLICT``) case with real declared-version data end to end
+through ``resolve()``.
 """
 
 from __future__ import annotations
@@ -55,29 +37,14 @@ import pytest
 
 from milpa.cas import CAStore
 from milpa.context import MilpaEnv, ResolveParams
-from milpa.errors import MilpaError, RES_PROVENANCE_CONFLICT
+from milpa.errors import MilpaError, RES_BINDING_CONFLICT, RES_REGISTRY_SHADOW
 from milpa.fetchers.cas_admitting import CasAdmittingFetcher
 from milpa.fetchers.mocked import mocked_registry, url_key
 from milpa.identity import compute_content_hash
 from milpa.lockfile import ResolvedGraph
 from milpa.manifest import parse_manifest
-from milpa.registry import (
-    GitIndexProvenance,
-    IndexVersion,
-    OciIndexProvenance,
-    Package,
-    parse_index,
-)
-from milpa.resolver import (
-    TIER_REGISTRY,
-    TIER_ROOT,
-    TIER_SELF_URL,
-    _check_provenance_gate,
-    _NAMED_PKEY,
-    _normalize_git_source_url,
-    _validate_transitive_url_against_registry,
-    resolve,
-)
+from milpa.registry import parse_index
+from milpa.resolver import resolve
 
 
 # ---------------------------------------------------------------------------
@@ -236,17 +203,19 @@ def _dep(graph: ResolvedGraph, name: str):
 
 
 class TestDisagreeingUrlConflictsUrlDiscoveredFirst:
-    """A tier-3 URL claim for ``foo`` (a registry-known name) is reachable in
-    ONE hop from root (wave 1); a tier-2 named claim for ``foo`` is reachable
+    """A ``git=`` claim for ``foo`` (a registry-known name) is reachable in
+    ONE hop from root (wave 1); a ``named`` claim for ``foo`` is reachable
     only in TWO hops (wave 2). The url claim's source (``pin.example.com``)
     is a DIFFERENT repository from the registry's recorded source
-    (``registry.example.com``) — it DISAGREES.
+    (``registry.example.com``).
 
-    Under validate-against-registry, this raises ``RES-PROVENANCE-CONFLICT``
-    at the url claim's OWN discovery (wave 1) — before the competing named
-    claim (wave 2) is ever even reached, and regardless of it. This is the
-    order-independence guarantee (§10.5): the decision is a static function
-    of the url claim + the (already-loaded) registry record alone."""
+    Under ``BindingResolver`` (RFC origin-as-identity §4.3), this is TWO
+    EXPLICIT, competing non-root claims for one name — wrapA's git= claim
+    (wave 1, accepted — with a registry-shadow WARNING, S3c, since its bare
+    name shadows a registry coordinate at a different URL, but a fork of a
+    registry package is legitimate and warn-only by default) and wrapB2's
+    bare ``named`` claim (wave 2) — so it raises ``RES-BINDING-CONFLICT``
+    once the second claim arrives, regardless of discovery order."""
 
     def test_conflict_raised_when_url_claim_precedes_named_claim(
         self, tmp_path: Path
@@ -299,23 +268,27 @@ class TestDisagreeingUrlConflictsUrlDiscoveredFirst:
             f'    wrapB git=(url)"{wrap_b_url}" ref="main"\n'
             "}\n"
         )
-        with pytest.raises(MilpaError) as exc_info:
-            _resolve(root_kdl, env, tmp_path)
-        assert exc_info.value.slug == RES_PROVENANCE_CONFLICT
+        import warnings as _warnings
+        with _warnings.catch_warnings():
+            _warnings.simplefilter("ignore")
+            with pytest.raises(MilpaError) as exc_info:
+                _resolve(root_kdl, env, tmp_path)
+        assert exc_info.value.slug == RES_BINDING_CONFLICT
         assert "foo" in exc_info.value.message
 
-        # The disagreeing pin must genuinely never have been fetched —
-        # validated and rejected BEFORE any fetch is dispatched (§10.5).
+        # wrapA's pin WAS fetched (warn, not hard-fail, under the default
+        # policy) — the conflict is with wrapB2's LATER named claim, not a
+        # static pre-fetch rejection of wrapA's own claim.
         foo_pin_hash = _content_hash_for(mocked_dir, foo_pin_url, "v9.9.9")
-        assert not env.store.contains(foo_pin_hash)
+        assert env.store.contains(foo_pin_hash)
 
 
 class TestDisagreeingUrlConflictsNamedDiscoveredFirst:
-    """Same shape, roles swapped: the tier-2 named claim is reachable in ONE
-    hop (wave 1, enumerated inline), the disagreeing tier-3 URL claim only in
-    TWO hops (wave 2). The outcome MUST be identical: the url claim still
-    conflicts, at its own discovery, regardless of the registry claim already
-    being on record."""
+    """Same shape, roles swapped: the bare ``named`` claim is reachable in
+    ONE hop (wave 1, enumerated inline), the disagreeing ``git=`` claim only
+    in TWO hops (wave 2). The outcome MUST be identical to the reverse
+    ordering: ``BindingResolver`` raises ``RES-BINDING-CONFLICT`` once both
+    competing claims are on record, regardless of which arrived first."""
 
     def test_conflict_raised_when_named_claim_precedes_url_claim(
         self, tmp_path: Path
@@ -368,31 +341,41 @@ class TestDisagreeingUrlConflictsNamedDiscoveredFirst:
             f'    wrapB git=(url)"{wrap_b_url}" ref="main"\n'
             "}\n"
         )
-        with pytest.raises(MilpaError) as exc_info:
-            _resolve(root_kdl, env, tmp_path)
-        assert exc_info.value.slug == RES_PROVENANCE_CONFLICT
+        import warnings as _warnings
+        with _warnings.catch_warnings():
+            _warnings.simplefilter("ignore")
+            with pytest.raises(MilpaError) as exc_info:
+                _resolve(root_kdl, env, tmp_path)
+        assert exc_info.value.slug == RES_BINDING_CONFLICT
         assert "foo" in exc_info.value.message
 
+        # Here the disagreeing git= claim is the SECOND claim for "foo"
+        # (the bare named claim was already bound first) — the conflict is
+        # raised by ``BindingResolver.submit()`` itself, before this claim
+        # is ever dispatched to fetch.
         foo_pin_hash = _content_hash_for(mocked_dir, foo_pin_url, "v9.9.9")
         assert not env.store.contains(foo_pin_hash)
 
 
 class TestMidSolveResidualClosedByImmediateValidation:
-    """THE old residual (docs/rfc-provenance-lattice.handoff.md) — now closed
-    by construction under validate-against-registry, the same way the prior
-    membership-based redesign closed it, but via immediate REJECTION instead
-    of immediate redirect.
+    """THE old residual (docs/rfc-provenance-lattice.handoff.md) — closed by
+    ``BindingResolver`` (RFC origin-as-identity §4.3), the same way the
+    prior membership-based redesign closed it, but via genuine multi-claim
+    conflict detection rather than a discovery-order-sensitive gate.
 
-    ``foo`` is a registry-known name. An eager tier-3 URL transitive
-    (``wrapA``) claims ``foo`` via ``git=`` at a DIFFERENT repository than
-    the registry's — this is discovered and validated during the EAGER BFS
-    (before solve() ever starts), and conflicts immediately. The ONLY
-    competing tier-2 claim for ``foo`` lives inside the manifest of ANOTHER
-    registry package (``outer``), discoverable only mid-solve (when the
-    solver materialises ``outer``'s selected candidate) — strictly AFTER
-    wrapA's claim has already been validated and rejected. The conflict
-    fires without ever needing ``outer``'s claim to exist or be discovered:
-    the registry index alone (a static, pre-loaded fact) is enough."""
+    ``foo`` is a registry-known name. An eager ``git=`` transitive
+    (``wrapA``) claims ``foo`` at a DIFFERENT repository than the
+    registry's — discovered during the EAGER BFS (before solve() ever
+    starts); its bare name shadows a registry coordinate at a different
+    URL, so the registry-shadow tripwire (S3c) WARNS (default policy, not a
+    hard error — a fork is legitimate), and the claim is accepted and
+    fetched. The ONLY competing claim for ``foo`` lives inside the manifest
+    of ANOTHER registry package (``outer``), discoverable only mid-solve
+    (when the solver materialises ``outer``'s selected candidate) —
+    strictly AFTER wrapA's claim is already bound. When outer's own bare
+    ``foo`` claim is submitted, it disagrees with wrapA's already-bound
+    source-id and ``RES-BINDING-CONFLICT`` fires — regardless of how late
+    the competing claim surfaces."""
 
     def test_conflict_raised_before_mid_solve_claim_ever_surfaces(
         self, tmp_path: Path
@@ -441,25 +424,29 @@ class TestMidSolveResidualClosedByImmediateValidation:
             "    outer\n"
             "}\n"
         )
-        with pytest.raises(MilpaError) as exc_info:
-            _resolve(root_kdl, env, tmp_path)
-        assert exc_info.value.slug == RES_PROVENANCE_CONFLICT
+        import warnings as _warnings
+        with _warnings.catch_warnings():
+            _warnings.simplefilter("ignore")
+            with pytest.raises(MilpaError) as exc_info:
+                _resolve(root_kdl, env, tmp_path)
+        assert exc_info.value.slug == RES_BINDING_CONFLICT
         assert "foo" in exc_info.value.message
 
+        # wrapA's claim was the FIRST (only) claim on record when it was
+        # discovered — accepted (with a shadow warning) and genuinely
+        # fetched; outer's later, competing claim is what raises.
         foo_pin_hash = _content_hash_for(mocked_dir, foo_pin_url, "v9.9.9")
-        assert not env.store.contains(foo_pin_hash)
+        assert env.store.contains(foo_pin_hash)
 
 
 class TestTwoDisagreeingUrlsForRegistryNameBothConflict:
     """Three transitives claim ``shared``: one by bare name (registry), and
-    two via DIFFERENT self-declared URLs — both of which DISAGREE with the
-    registry's recorded source. Under validate-against-registry, EACH
-    disagreeing url is independently invalid (not merely "loses an
-    arbitration") — whichever the BFS reaches first raises
-    ``RES-PROVENANCE-CONFLICT``. (Under the prior membership-based redesign
-    this fixture demonstrated "registry wins, no conflict" — the design
-    revision inverts that outcome: a transitive can no longer silently
-    redirect to, or be silently overridden by, the registry.)"""
+    two via DIFFERENT self-declared URLs — neither of which matches the
+    registry's recorded source (each independently WARNS via the
+    registry-shadow tripwire, S3c, but is accepted). Under
+    ``BindingResolver`` (RFC origin-as-identity §4.3), these are THREE
+    mutually-disagreeing non-root claims for one name — whichever pair
+    ``BindingResolver`` compares second raises ``RES-BINDING-CONFLICT``."""
 
     def test_conflict_raised(self, tmp_path: Path) -> None:
         mocked_dir = tmp_path / "mocked-fetches"
@@ -529,9 +516,12 @@ class TestTwoDisagreeingUrlsForRegistryNameBothConflict:
             f'    r2 git=(url)"{r2_url}" ref="main"\n'
             "}\n"
         )
-        with pytest.raises(MilpaError) as exc_info:
-            _resolve(root_kdl, env, tmp_path)
-        assert exc_info.value.slug == RES_PROVENANCE_CONFLICT
+        import warnings as _warnings
+        with _warnings.catch_warnings():
+            _warnings.simplefilter("ignore")
+            with pytest.raises(MilpaError) as exc_info:
+                _resolve(root_kdl, env, tmp_path)
+        assert exc_info.value.slug == RES_BINDING_CONFLICT
         assert "shared" in exc_info.value.message
 
 
@@ -661,12 +651,14 @@ class TestLoneUrlPinOfRegistryNameAgreesIsAccepted:
 class TestLoneUrlPinOfRegistryNameDisagreesConflicts:
     """A transitive url-pins ``foo`` — a name that ALSO exists in the
     registry — at a DIFFERENT repository than the registry records, with NO
-    competing claim anywhere else in the graph. This is the headline
-    behavioral change from the pure disagreement-only design: a LONE
-    transitive claim can conflict with a KNOWN registry name, with no second
-    claim needed to arbitrate against."""
+    competing claim anywhere else in the graph. Under the registry-shadow
+    tripwire (RFC origin-as-identity §6.1/§11 D-Fork1, S3c) this is
+    NAME-TRIGGERED (bare name shadows a registry coordinate) +
+    URL-REFINED (the source doesn't match) — WARN by default (a fork is
+    legitimate and common; the claim still resolves and is genuinely
+    fetched), HARD-FAIL under ``attestation-policy strict``."""
 
-    def test_lone_disagreeing_url_pin_conflicts(self, tmp_path: Path) -> None:
+    def _stage_fixture(self, tmp_path: Path):
         mocked_dir = tmp_path / "mocked-fetches"
         mocked_dir.mkdir()
 
@@ -692,34 +684,57 @@ class TestLoneUrlPinOfRegistryNameDisagreesConflicts:
             content_hash=foo_registry_hash, commit_sha="4" * 40,
         )
         env = _env(tmp_path, mocked_dir, index_kdl)
+        return t1_url, foo_pin_hash, env
 
+    def test_warns_and_resolves_under_default_policy(self, tmp_path: Path) -> None:
+        t1_url, foo_pin_hash, env = self._stage_fixture(tmp_path)
         root_kdl = (
             'name "myapp"\nkind "application"\n'
             "deps {\n"
             f'    t1 git=(url)"{t1_url}" ref="main"\n'
             "}\n"
         )
+        import warnings as _warnings
+
+        with _warnings.catch_warnings(record=True) as caught:
+            _warnings.simplefilter("always")
+            graph = _resolve(root_kdl, env, tmp_path)
+        assert any("foo" in str(w.message) for w in caught)
+        foo = _dep(graph, "foo")
+        assert foo.identity == foo_pin_hash
+        assert env.store.contains(foo_pin_hash)
+
+    def test_hard_fails_under_strict_policy(self, tmp_path: Path) -> None:
+        t1_url, foo_pin_hash, env = self._stage_fixture(tmp_path)
+        root_kdl = (
+            'name "myapp"\nkind "application"\nattestation-policy "strict"\n'
+            "deps {\n"
+            f'    t1 git=(url)"{t1_url}" ref="main"\n'
+            "}\n"
+        )
         with pytest.raises(MilpaError) as exc_info:
             _resolve(root_kdl, env, tmp_path)
-        assert exc_info.value.slug == RES_PROVENANCE_CONFLICT
+        assert exc_info.value.slug == RES_REGISTRY_SHADOW
         assert "foo" in exc_info.value.message
-
         assert not env.store.contains(foo_pin_hash)
 
 
 class TestOciOnlyRegistryEntryContentHashMatchAccepted:
-    """The real gap this fixture closes (amoxtli's ``softlink`` case): the
-    registry entry for ``foo`` is OCI-only (e.g. published via
-    ``milpa publish`` FROM a git repo) — there is no git source recorded to
-    URL-compare against. A transitive pins ``foo`` by the ORIGINATING git
-    URL. The transitive's fetched content_hash MATCHES the registry's
-    recorded content_hash for a version of ``foo`` — same package,
-    different transport — so the claim is ACCEPTED and resolves normally,
-    exactly like the git-vs-git agreement case."""
+    """Historical note: under the retired validate-against-registry design
+    this fixture demonstrated ACCEPTANCE via a post-fetch content-hash
+    match (amoxtli's ``softlink`` case) — an OCI-only registry entry has no
+    git source recorded to URL-compare against, so that design deferred to
+    content identity. Under the registry-shadow tripwire (RFC
+    origin-as-identity §6.1/§11 D-Fork1, S3c, final design), there is NO
+    post-fetch content-hash reconciliation at all: an OCI-only entry has no
+    comparable upstream URL, so a git= claim shadowing its bare name always
+    WARNS (default policy — not a hard error; ``content_hash`` still
+    verifies bytes at materialization independently, just no longer
+    participates in this admission decision) and HARD-FAILS under
+    ``attestation-policy strict`` — regardless of whether the fetched
+    content happens to match the registry's recorded content_hash."""
 
-    def test_git_source_matching_oci_content_hash_is_accepted(
-        self, tmp_path: Path
-    ) -> None:
+    def _stage_fixture(self, tmp_path: Path):
         mocked_dir = tmp_path / "mocked-fetches"
         mocked_dir.mkdir()
 
@@ -742,30 +757,51 @@ class TestOciOnlyRegistryEntryContentHashMatchAccepted:
             digest="sha256:" + "b" * 64, content_hash=foo_hash,
         )
         env = _env(tmp_path, mocked_dir, index_kdl)
+        return t1_url, foo_hash, env
 
+    def test_warns_and_resolves_under_default_policy(self, tmp_path: Path) -> None:
+        t1_url, foo_hash, env = self._stage_fixture(tmp_path)
         root_kdl = (
             'name "myapp"\nkind "application"\n'
             "deps {\n"
             f'    t1 git=(url)"{t1_url}" ref="main"\n'
             "}\n"
         )
-        graph = _resolve(root_kdl, env, tmp_path)
+        import warnings as _warnings
 
+        with _warnings.catch_warnings(record=True) as caught:
+            _warnings.simplefilter("always")
+            graph = _resolve(root_kdl, env, tmp_path)
+        assert any("foo" in str(w.message) for w in caught)
         foo = _dep(graph, "foo")
         assert foo.identity == foo_hash
         assert env.store.contains(foo_hash)
 
+    def test_hard_fails_under_strict_policy(self, tmp_path: Path) -> None:
+        t1_url, foo_hash, env = self._stage_fixture(tmp_path)
+        root_kdl = (
+            'name "myapp"\nkind "application"\nattestation-policy "strict"\n'
+            "deps {\n"
+            f'    t1 git=(url)"{t1_url}" ref="main"\n'
+            "}\n"
+        )
+        with pytest.raises(MilpaError) as exc_info:
+            _resolve(root_kdl, env, tmp_path)
+        assert exc_info.value.slug == RES_REGISTRY_SHADOW
+        assert "foo" in exc_info.value.message
+        assert not env.store.contains(foo_hash)
+
 
 class TestOciOnlyRegistryEntryContentHashMismatchConflicts:
-    """Same shape as above, except the transitive's git source fetches to
-    DIFFERENT content than anything the registry has recorded for ``foo``
-    — a genuinely different package (e.g. a fork or a substitution) —
-    which MUST raise ``RES-PROVENANCE-CONFLICT``, discovered only after the
-    fetch (identity is the only comparable fact for an OCI-only entry)."""
+    """Same OCI-only shape, except the transitive's git source fetches to
+    DIFFERENT content than anything the registry has recorded for ``foo``.
+    Under the retired design this MUST raise post-fetch (content-hash is
+    the only comparable fact for an OCI-only entry). Under the
+    registry-shadow tripwire (S3c) the outcome is identical to the
+    content-hash-MATCH case above — content_hash no longer participates in
+    this decision at all — WARN by default, HARD-FAIL under strict."""
 
-    def test_git_source_not_matching_oci_content_hash_conflicts(
-        self, tmp_path: Path
-    ) -> None:
+    def _stage_fixture(self, tmp_path: Path):
         mocked_dir = tmp_path / "mocked-fetches"
         mocked_dir.mkdir()
 
@@ -797,29 +833,51 @@ class TestOciOnlyRegistryEntryContentHashMismatchConflicts:
             digest="sha256:" + "b" * 64, content_hash=foo_registry_hash,
         )
         env = _env(tmp_path, mocked_dir, index_kdl)
+        return t1_url, foo_fork_hash, env
 
+    def test_warns_and_resolves_under_default_policy(self, tmp_path: Path) -> None:
+        t1_url, foo_fork_hash, env = self._stage_fixture(tmp_path)
         root_kdl = (
             'name "myapp"\nkind "application"\n'
             "deps {\n"
             f'    t1 git=(url)"{t1_url}" ref="main"\n'
             "}\n"
         )
+        import warnings as _warnings
+
+        with _warnings.catch_warnings(record=True) as caught:
+            _warnings.simplefilter("always")
+            graph = _resolve(root_kdl, env, tmp_path)
+        assert any("foo" in str(w.message) for w in caught)
+        foo = _dep(graph, "foo")
+        assert foo.identity == foo_fork_hash
+        assert env.store.contains(foo_fork_hash)
+
+    def test_hard_fails_under_strict_policy(self, tmp_path: Path) -> None:
+        t1_url, foo_fork_hash, env = self._stage_fixture(tmp_path)
+        root_kdl = (
+            'name "myapp"\nkind "application"\nattestation-policy "strict"\n'
+            "deps {\n"
+            f'    t1 git=(url)"{t1_url}" ref="main"\n'
+            "}\n"
+        )
         with pytest.raises(MilpaError) as exc_info:
             _resolve(root_kdl, env, tmp_path)
-        assert exc_info.value.slug == RES_PROVENANCE_CONFLICT
+        assert exc_info.value.slug == RES_REGISTRY_SHADOW
         assert "foo" in exc_info.value.message
+        assert not env.store.contains(foo_fork_hash)
 
 
 class TestOciOnlyRegistryEntryEmptyContentHashConflicts:
     """The registry entry is OCI-only AND carries no ``content_hash``
-    (legacy entry, predating the identity mandate) — there is nothing to
-    validate against, even deferred. This MUST conflict immediately, at
-    gate time, exactly like the pre-existing "no comparable transport"
-    behavior — the transitive's git source must NEVER be fetched."""
+    (legacy entry, predating the identity mandate). Under the retired
+    design there was nothing to validate against, even deferred, so this
+    conflicted immediately. Under the registry-shadow tripwire (S3c) the
+    outcome is identical to the other OCI-only shapes above — an OCI-only
+    entry has no comparable URL regardless of whether it carries a
+    content_hash at all — WARN by default, HARD-FAIL under strict."""
 
-    def test_empty_content_hash_conflicts_before_fetch(
-        self, tmp_path: Path
-    ) -> None:
+    def _stage_fixture(self, tmp_path: Path):
         mocked_dir = tmp_path / "mocked-fetches"
         mocked_dir.mkdir()
 
@@ -842,20 +900,38 @@ class TestOciOnlyRegistryEntryEmptyContentHashConflicts:
             digest="sha256:" + "b" * 64, content_hash="",
         )
         env = _env(tmp_path, mocked_dir, index_kdl)
+        return t1_url, foo_hash, env
 
+    def test_warns_and_resolves_under_default_policy(self, tmp_path: Path) -> None:
+        t1_url, foo_hash, env = self._stage_fixture(tmp_path)
         root_kdl = (
             'name "myapp"\nkind "application"\n'
             "deps {\n"
             f'    t1 git=(url)"{t1_url}" ref="main"\n'
             "}\n"
         )
+        import warnings as _warnings
+
+        with _warnings.catch_warnings(record=True) as caught:
+            _warnings.simplefilter("always")
+            graph = _resolve(root_kdl, env, tmp_path)
+        assert any("foo" in str(w.message) for w in caught)
+        foo = _dep(graph, "foo")
+        assert foo.identity == foo_hash
+        assert env.store.contains(foo_hash)
+
+    def test_hard_fails_under_strict_policy(self, tmp_path: Path) -> None:
+        t1_url, foo_hash, env = self._stage_fixture(tmp_path)
+        root_kdl = (
+            'name "myapp"\nkind "application"\nattestation-policy "strict"\n'
+            "deps {\n"
+            f'    t1 git=(url)"{t1_url}" ref="main"\n'
+            "}\n"
+        )
         with pytest.raises(MilpaError) as exc_info:
             _resolve(root_kdl, env, tmp_path)
-        assert exc_info.value.slug == RES_PROVENANCE_CONFLICT
+        assert exc_info.value.slug == RES_REGISTRY_SHADOW
         assert "foo" in exc_info.value.message
-
-        # Cannot-validate case conflicts BEFORE any fetch is dispatched —
-        # same static, pre-fetch guarantee as the git-vs-git disagree path.
         assert not env.store.contains(foo_hash)
 
 
@@ -924,13 +1000,14 @@ class TestOciSourceUrlMatchAcceptedAcrossVersionDrift:
 
 class TestOciSourceUrlMismatchConflicts:
     """Same OCI-with-``source_url`` shape as above, except the transitive
-    pins a DIFFERENT repository — a genuine disagreement, raised
-    statically, before any fetch (no deferred content-hash check needed,
-    since ``source_url`` is a directly comparable fact)."""
+    pins a DIFFERENT repository. The registry-shadow tripwire (S3c)
+    compares the claim's normalized URL against the OCI entry's recorded
+    ``source_url`` (a directly comparable fact, same as a git provenance
+    URL) — a mismatch WARNS by default (the claim still resolves and is
+    genuinely fetched) and HARD-FAILS under ``attestation-policy strict``
+    (never fetched)."""
 
-    def test_different_repository_conflicts_before_fetch(
-        self, tmp_path: Path
-    ) -> None:
+    def _stage_fixture(self, tmp_path: Path):
         mocked_dir = tmp_path / "mocked-fetches"
         mocked_dir.mkdir()
 
@@ -961,21 +1038,39 @@ class TestOciSourceUrlMismatchConflicts:
             source_url=foo_registry_source_url,
         )
         env = _env(tmp_path, mocked_dir, index_kdl)
+        foo_fork_hash = _content_hash_for(mocked_dir, foo_fork_url, "main")
+        return t1_url, foo_fork_hash, env
 
+    def test_warns_and_resolves_under_default_policy(self, tmp_path: Path) -> None:
+        t1_url, foo_fork_hash, env = self._stage_fixture(tmp_path)
         root_kdl = (
             'name "myapp"\nkind "application"\n'
             "deps {\n"
             f'    t1 git=(url)"{t1_url}" ref="main"\n'
             "}\n"
         )
+        import warnings as _warnings
+
+        with _warnings.catch_warnings(record=True) as caught:
+            _warnings.simplefilter("always")
+            graph = _resolve(root_kdl, env, tmp_path)
+        assert any("foo" in str(w.message) for w in caught)
+        foo = _dep(graph, "foo")
+        assert foo.identity == foo_fork_hash
+        assert env.store.contains(foo_fork_hash)
+
+    def test_hard_fails_under_strict_policy(self, tmp_path: Path) -> None:
+        t1_url, foo_fork_hash, env = self._stage_fixture(tmp_path)
+        root_kdl = (
+            'name "myapp"\nkind "application"\nattestation-policy "strict"\n'
+            "deps {\n"
+            f'    t1 git=(url)"{t1_url}" ref="main"\n'
+            "}\n"
+        )
         with pytest.raises(MilpaError) as exc_info:
             _resolve(root_kdl, env, tmp_path)
-        assert exc_info.value.slug == RES_PROVENANCE_CONFLICT
+        assert exc_info.value.slug == RES_REGISTRY_SHADOW
         assert "foo" in exc_info.value.message
-
-        # Rejected BEFORE any fetch — source_url comparison is static and
-        # pre-fetch, same guarantee as the git-vs-git disagreement case.
-        foo_fork_hash = _content_hash_for(mocked_dir, foo_fork_url, "main")
         assert not env.store.contains(foo_fork_hash)
 
 
@@ -1095,8 +1190,10 @@ class TestLoneUrlPinOfNonRegistryNameStands:
 class TestUrlVsUrlStillConflictsWithNoRegistry:
     """Regression pin (fixture-099's shape): two transitives claim the same
     non-root name from two DIFFERENT urls, and the name has NO registry
-    entry at all — the lattice must NOT have weakened this case. Still
-    raises RES-PROVENANCE-CONFLICT."""
+    entry at all — no shadow check is even possible (nothing to shadow).
+    ``BindingResolver`` (RFC origin-as-identity §4.3) still raises
+    ``RES-BINDING-CONFLICT``: two non-root claims for one name, no root
+    claim to arbitrate."""
 
     def test_raises_conflict(self, tmp_path: Path) -> None:
         mocked_dir = tmp_path / "mocked-fetches"
@@ -1137,467 +1234,5 @@ class TestUrlVsUrlStillConflictsWithNoRegistry:
         )
         with pytest.raises(MilpaError) as exc_info:
             _resolve(root_kdl, env, tmp_path)
-        assert exc_info.value.slug == RES_PROVENANCE_CONFLICT
+        assert exc_info.value.slug == RES_BINDING_CONFLICT
         assert "shared" in exc_info.value.message
-
-
-# ---------------------------------------------------------------------------
-# Unit tests: the tier-aware gate directly (no resolve() plumbing)
-# ---------------------------------------------------------------------------
-
-
-class TestCheckProvenanceGateTierSemantics:
-    """Direct unit tests of ``_check_provenance_gate``'s tier arithmetic —
-    resolver-semantics.md §10.0. Complements the resolver-level scenarios
-    above (which prove the mechanism wired correctly into the BFS) with a
-    fast, plumbing-free check of the gate's own decision table.
-
-    NOTE: since the validate-against-registry rework, a registry-index url
-    claim never reaches this gate at TIER_SELF_URL at all (it is validated
-    and either accepted-bypassing-the-gate or rejected outright at its own
-    discovery — see ``TestValidateTransitiveUrlAgainstRegistry`` below). So
-    these tests exercise the gate's OWN tier arithmetic in isolation
-    (root suppression, tier-2/tier-3 arbitration for a NON-index name that
-    happens to receive both a ``named`` and a ``git=`` claim, tier-3-vs-
-    tier-3 conflict) — the same decision table as before #193's revision;
-    only the CALLERS' routing for registry-owned url claims changed."""
-
-    def test_first_claim_registers_and_proceeds(self) -> None:
-        gate: dict = {}
-        assert _check_provenance_gate(
-            "foo", ("url", "u1", "main"), gate, set(), tier=TIER_SELF_URL,
-        ) is True
-        assert gate["foo"] == (("url", "u1", "main"), TIER_SELF_URL)
-
-    def test_same_pkey_dedups(self) -> None:
-        gate: dict = {}
-        _check_provenance_gate("foo", ("url", "u1", "main"), gate, set(), tier=TIER_SELF_URL)
-        assert _check_provenance_gate(
-            "foo", ("url", "u1", "main"), gate, set(), tier=TIER_SELF_URL,
-        ) is False
-
-    def test_named_claims_always_dedup_same_sentinel(self) -> None:
-        gate: dict = {}
-        _check_provenance_gate("foo", _NAMED_PKEY, gate, set(), tier=TIER_REGISTRY)
-        assert _check_provenance_gate(
-            "foo", _NAMED_PKEY, gate, set(), tier=TIER_REGISTRY,
-        ) is False
-
-    def test_root_wins_over_tier3_url(self) -> None:
-        gate: dict = {}
-        root_authority = {"foo"}
-        _check_provenance_gate(
-            "foo", ("url", "root-u", "main"), gate, root_authority, tier=TIER_SELF_URL,
-        )
-        assert _check_provenance_gate(
-            "foo", ("url", "evil-u", "main"), gate, root_authority, tier=TIER_SELF_URL,
-        ) is False
-        # Root's own entry is untouched.
-        assert gate["foo"] == (("url", "root-u", "main"), TIER_ROOT)
-
-    def test_root_wins_over_tier2_named(self) -> None:
-        gate: dict = {}
-        root_authority = {"foo"}
-        _check_provenance_gate(
-            "foo", ("url", "root-u", "main"), gate, root_authority, tier=TIER_SELF_URL,
-        )
-        assert _check_provenance_gate(
-            "foo", _NAMED_PKEY, gate, root_authority, tier=TIER_REGISTRY,
-        ) is False
-        assert gate["foo"] == (("url", "root-u", "main"), TIER_ROOT)
-
-    def test_tier2_beats_tier3_arriving_after(self) -> None:
-        """Tier-3 registers first; a differently-keyed tier-2 claim arrives
-        second — it wins (overwrites the gate), proceed=True. (Reachable
-        only for a NON-index name: an index-member name's url claims never
-        reach this gate — see the class docstring.)"""
-        gate: dict = {}
-        _check_provenance_gate(
-            "foo", ("url", "u1", "main"), gate, set(), tier=TIER_SELF_URL,
-        )
-        assert _check_provenance_gate(
-            "foo", _NAMED_PKEY, gate, set(), tier=TIER_REGISTRY,
-        ) is True
-        assert gate["foo"] == (_NAMED_PKEY, TIER_REGISTRY)
-
-    def test_tier3_suppressed_when_arriving_after_tier2(self) -> None:
-        """Tier-2 registers first; a tier-3 claim arrives second — it is
-        suppressed BEFORE any fetch would be dispatched, proceed=False."""
-        gate: dict = {}
-        _check_provenance_gate("foo", _NAMED_PKEY, gate, set(), tier=TIER_REGISTRY)
-        assert _check_provenance_gate(
-            "foo", ("url", "u1", "main"), gate, set(), tier=TIER_SELF_URL,
-        ) is False
-        # The registry entry stays authoritative.
-        assert gate["foo"] == (_NAMED_PKEY, TIER_REGISTRY)
-
-    def test_tier3_vs_tier3_conflicts_when_no_tier2(self) -> None:
-        gate: dict = {}
-        _check_provenance_gate(
-            "foo", ("url", "u1", "main"), gate, set(), tier=TIER_SELF_URL,
-        )
-        with pytest.raises(MilpaError) as exc_info:
-            _check_provenance_gate(
-                "foo", ("url", "u2", "main"), gate, set(), tier=TIER_SELF_URL,
-            )
-        assert exc_info.value.slug == RES_PROVENANCE_CONFLICT
-
-    def test_tier3_vs_tier3_no_conflict_once_tier2_on_record(self) -> None:
-        """Once a tier-2 claim has been recorded for a name, a differing
-        tier-3 claim is just suppressed (registry already won) — the
-        tier-3-vs-tier-3 conflict branch is never reached."""
-        gate: dict = {}
-        _check_provenance_gate("foo", _NAMED_PKEY, gate, set(), tier=TIER_REGISTRY)
-        _check_provenance_gate(
-            "foo", ("url", "u1", "main"), gate, set(), tier=TIER_SELF_URL,
-        )
-        # A SECOND, differently-keyed tier-3 claim must also just be
-        # suppressed, not raise — the registry entry already resolved the
-        # disagreement for this name.
-        assert _check_provenance_gate(
-            "foo", ("url", "u2", "main"), gate, set(), tier=TIER_SELF_URL,
-        ) is False
-
-
-# ---------------------------------------------------------------------------
-# Unit tests: the registry-validation mechanism directly (no resolve()
-# plumbing) — resolver-semantics.md §10.0/§10.3, the validate-against-
-# registry rework.
-# ---------------------------------------------------------------------------
-
-
-class TestNormalizeGitSourceUrl:
-    """Direct unit tests of ``_normalize_git_source_url`` — the comparison
-    normalization used by ``_validate_transitive_url_against_registry``."""
-
-    def test_trailing_git_suffix_stripped(self) -> None:
-        assert (
-            _normalize_git_source_url("https://example.com/foo.git")
-            == _normalize_git_source_url("https://example.com/foo")
-        )
-
-    def test_trailing_slash_stripped(self) -> None:
-        assert (
-            _normalize_git_source_url("https://example.com/foo/")
-            == _normalize_git_source_url("https://example.com/foo")
-        )
-
-    def test_scheme_and_host_case_insensitive(self) -> None:
-        assert (
-            _normalize_git_source_url("HTTPS://Example.COM/foo.git")
-            == _normalize_git_source_url("https://example.com/foo.git")
-        )
-
-    def test_path_case_preserved(self) -> None:
-        # Path casing is NOT normalized — many git hosts are path-case-sensitive.
-        assert (
-            _normalize_git_source_url("https://example.com/Foo.git")
-            != _normalize_git_source_url("https://example.com/foo.git")
-        )
-
-    def test_different_hosts_differ(self) -> None:
-        assert (
-            _normalize_git_source_url("https://a.example.com/foo.git")
-            != _normalize_git_source_url("https://b.example.com/foo.git")
-        )
-
-
-class TestValidateTransitiveUrlAgainstRegistry:
-    """Direct unit tests of ``_validate_transitive_url_against_registry`` —
-    the agree/disagree/incomparable decision (resolver-semantics.md
-    §10.0/§10.3 NORMATIVE "Registry validation")."""
-
-    def test_agrees_same_url_same_ref(self) -> None:
-        pkg = Package(
-            name="foo", namespace="",
-            versions=(
-                _iv_git("1.0.0", url="https://registry.example.com/foo.git", ref="v1.0.0"),
-            ),
-        )
-        # No raise == agreement.
-        _validate_transitive_url_against_registry(
-            "foo", "https://registry.example.com/foo.git", pkg,
-        )
-
-    def test_agrees_same_repo_different_ref(self) -> None:
-        pkg = Package(
-            name="foo", namespace="",
-            versions=(
-                _iv_git("1.0.0", url="https://registry.example.com/foo.git", ref="v1.0.0"),
-            ),
-        )
-        # Different ref, same repo: still an agreement (ref only selects a version).
-        _validate_transitive_url_against_registry(
-            "foo", "https://registry.example.com/foo.git", pkg,
-        )
-
-    def test_agrees_matches_an_older_versions_provenance(self) -> None:
-        # The claim matches version 1.0.0's recorded source, not the newest
-        # (2.0.0's) — agreement checks EVERY version's provenance, not just
-        # the latest.
-        pkg = Package(
-            name="foo", namespace="",
-            versions=(
-                _iv_git("2.0.0", url="https://registry.example.com/foo-v2.git", ref="v2.0.0"),
-                _iv_git("1.0.0", url="https://registry.example.com/foo.git", ref="v1.0.0"),
-            ),
-        )
-        _validate_transitive_url_against_registry(
-            "foo", "https://registry.example.com/foo.git", pkg,
-        )
-
-    def test_agrees_normalized_git_suffix_and_case(self) -> None:
-        pkg = Package(
-            name="foo", namespace="",
-            versions=(
-                _iv_git("1.0.0", url="https://Registry.example.com/foo.git", ref="v1.0.0"),
-            ),
-        )
-        # No ".git" suffix on the claim, different host casing: still agrees.
-        _validate_transitive_url_against_registry(
-            "foo", "https://registry.example.com/foo", pkg,
-        )
-
-    def test_disagrees_different_repository(self) -> None:
-        pkg = Package(
-            name="foo", namespace="",
-            versions=(
-                _iv_git("1.0.0", url="https://registry.example.com/foo.git", ref="v1.0.0"),
-            ),
-        )
-        with pytest.raises(MilpaError) as exc_info:
-            _validate_transitive_url_against_registry(
-                "foo", "https://pin.example.com/foo.git", pkg,
-            )
-        assert exc_info.value.slug == RES_PROVENANCE_CONFLICT
-        assert "foo" in exc_info.value.message
-
-    def test_oci_only_entry_with_content_hash_defers(self) -> None:
-        # The registry entry is OCI-only — a git= claim can never be
-        # URL-compared to it, so the decision is DEFERRED to content
-        # identity: the function returns the set of recorded content_hash
-        # values (never raises directly) so the caller can validate once
-        # the transitive's git source is fetched and hashed. This is the
-        # #193-gap fix: an OCI artifact published FROM a git repo and a
-        # transitive pinning that repo by URL are the SAME package.
-        pkg = Package(
-            name="foo", namespace="",
-            versions=(
-                IndexVersion(
-                    version="1.0.0",
-                    content_hash="sha256:" + "a" * 64,
-                    provenances=(
-                        OciIndexProvenance(
-                            registry="ghcr.io", repository="example/foo",
-                            digest="sha256:" + "b" * 64,
-                        ),
-                    ),
-                ),
-            ),
-        )
-        result = _validate_transitive_url_against_registry(
-            "foo", "https://example.com/foo.git", pkg,
-        )
-        assert result == frozenset({"sha256:" + "a" * 64})
-
-    def test_oci_only_entry_multiple_versions_defers_union_of_hashes(self) -> None:
-        # Content_hash is gathered across ALL versions, not just the
-        # newest — mirrors _registry_git_provenances' "every version"
-        # convention for the git-comparison path.
-        pkg = Package(
-            name="foo", namespace="",
-            versions=(
-                IndexVersion(
-                    version="2.0.0",
-                    content_hash="sha256:" + "c" * 64,
-                    provenances=(
-                        OciIndexProvenance(
-                            registry="ghcr.io", repository="example/foo",
-                            digest="sha256:" + "d" * 64,
-                        ),
-                    ),
-                ),
-                IndexVersion(
-                    version="1.0.0",
-                    content_hash="sha256:" + "a" * 64,
-                    provenances=(
-                        OciIndexProvenance(
-                            registry="ghcr.io", repository="example/foo",
-                            digest="sha256:" + "b" * 64,
-                        ),
-                    ),
-                ),
-            ),
-        )
-        result = _validate_transitive_url_against_registry(
-            "foo", "https://example.com/foo.git", pkg,
-        )
-        assert result == frozenset({"sha256:" + "a" * 64, "sha256:" + "c" * 64})
-
-    def test_disagrees_oci_only_entry_no_content_hash_recorded(self) -> None:
-        # OCI-only AND no content_hash recorded either (legacy entry) —
-        # nothing to validate against even deferred — immediate conflict.
-        pkg = Package(
-            name="foo", namespace="",
-            versions=(
-                IndexVersion(
-                    version="1.0.0",
-                    content_hash="",
-                    provenances=(
-                        OciIndexProvenance(
-                            registry="ghcr.io", repository="example/foo",
-                            digest="sha256:" + "b" * 64,
-                        ),
-                    ),
-                ),
-            ),
-        )
-        with pytest.raises(MilpaError) as exc_info:
-            _validate_transitive_url_against_registry(
-                "foo", "https://example.com/foo.git", pkg,
-            )
-        assert exc_info.value.slug == RES_PROVENANCE_CONFLICT
-
-    def test_disagrees_no_provenance_at_all(self) -> None:
-        # A package version with no provenance recorded whatsoever, and no
-        # content_hash either — also incomparable by source or identity —
-        # immediate conflict.
-        pkg = Package(
-            name="foo", namespace="",
-            versions=(
-                IndexVersion(version="1.0.0", content_hash="", provenances=()),
-            ),
-        )
-        with pytest.raises(MilpaError) as exc_info:
-            _validate_transitive_url_against_registry(
-                "foo", "https://example.com/foo.git", pkg,
-            )
-        assert exc_info.value.slug == RES_PROVENANCE_CONFLICT
-
-    def test_defers_no_provenance_at_all_but_content_hash_present(self) -> None:
-        # No provenance recorded at all, but content_hash IS present — same
-        # deferred path as OCI-only (the "incomparable transport" branch is
-        # keyed on absence of GitIndexProvenance, not on OCI specifically).
-        pkg = Package(
-            name="foo", namespace="",
-            versions=(
-                IndexVersion(
-                    version="1.0.0", content_hash="sha256:" + "e" * 64, provenances=(),
-                ),
-            ),
-        )
-        result = _validate_transitive_url_against_registry(
-            "foo", "https://example.com/foo.git", pkg,
-        )
-        assert result == frozenset({"sha256:" + "e" * 64})
-
-    def test_agrees_oci_source_url_match_no_git_provenance(self) -> None:
-        # An OCI-only entry that DOES carry a source_url: a git= claim
-        # matching that source_url is an outright AGREE (returns None, no
-        # deferred content-hash check needed) — even though NO
-        # GitIndexProvenance is recorded at all. This is the amoxtli/
-        # softlink@main case in miniature: the transitive pins a ref that
-        # was never published as a registry version.
-        pkg = Package(
-            name="foo", namespace="",
-            versions=(
-                IndexVersion(
-                    version="1.0.0",
-                    content_hash="sha256:" + "a" * 64,
-                    provenances=(
-                        OciIndexProvenance(
-                            registry="ghcr.io", repository="example/foo",
-                            digest="sha256:" + "b" * 64,
-                            source_url="https://github.com/example/foo.git",
-                        ),
-                    ),
-                ),
-            ),
-        )
-        result = _validate_transitive_url_against_registry(
-            "foo", "https://github.com/example/foo.git", pkg,
-        )
-        assert result is None
-
-    def test_agrees_oci_source_url_normalized_git_suffix_and_case(self) -> None:
-        pkg = Package(
-            name="foo", namespace="",
-            versions=(
-                IndexVersion(
-                    version="1.0.0",
-                    content_hash="sha256:" + "a" * 64,
-                    provenances=(
-                        OciIndexProvenance(
-                            registry="ghcr.io", repository="example/foo",
-                            digest="sha256:" + "b" * 64,
-                            source_url="https://Github.com/example/foo.git",
-                        ),
-                    ),
-                ),
-            ),
-        )
-        result = _validate_transitive_url_against_registry(
-            "foo", "https://github.com/example/foo", pkg,
-        )
-        assert result is None
-
-    def test_disagrees_oci_source_url_different_repository(self) -> None:
-        # A recorded source_url that does NOT match the claim is a genuine
-        # disagreement — resolved statically, pre-fetch, exactly like the
-        # git-vs-git disagreement case (no deferred content-hash fallback).
-        pkg = Package(
-            name="foo", namespace="",
-            versions=(
-                IndexVersion(
-                    version="1.0.0",
-                    content_hash="sha256:" + "a" * 64,
-                    provenances=(
-                        OciIndexProvenance(
-                            registry="ghcr.io", repository="example/foo",
-                            digest="sha256:" + "b" * 64,
-                            source_url="https://github.com/example/foo.git",
-                        ),
-                    ),
-                ),
-            ),
-        )
-        with pytest.raises(MilpaError) as exc_info:
-            _validate_transitive_url_against_registry(
-                "foo", "https://github.com/example/foo-fork.git", pkg,
-            )
-        assert exc_info.value.slug == RES_PROVENANCE_CONFLICT
-        assert "foo" in exc_info.value.message
-
-    def test_oci_no_source_url_still_defers_to_content_hash(self) -> None:
-        # OCI provenance with source_url=None (unset) is indistinguishable
-        # from a legacy entry for THIS decision — falls through to the
-        # pre-existing content-hash fallback, unchanged.
-        pkg = Package(
-            name="foo", namespace="",
-            versions=(
-                IndexVersion(
-                    version="1.0.0",
-                    content_hash="sha256:" + "a" * 64,
-                    provenances=(
-                        OciIndexProvenance(
-                            registry="ghcr.io", repository="example/foo",
-                            digest="sha256:" + "b" * 64,
-                        ),
-                    ),
-                ),
-            ),
-        )
-        result = _validate_transitive_url_against_registry(
-            "foo", "https://example.com/foo.git", pkg,
-        )
-        assert result == frozenset({"sha256:" + "a" * 64})
-
-
-def _iv_git(version: str, *, url: str, ref: str):
-    """Build a minimal ``IndexVersion`` carrying one git provenance, for the
-    ``_validate_transitive_url_against_registry`` unit tests above."""
-    return IndexVersion(
-        version=version,
-        content_hash="sha256:" + "0" * 64,
-        provenances=(GitIndexProvenance(url=url, ref=ref, commit_sha=None),),
-    )

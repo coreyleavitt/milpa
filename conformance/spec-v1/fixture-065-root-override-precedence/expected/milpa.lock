@@ -3,6 +3,10 @@ version 1
 strategy "maxver"
 
 dep "shared" {
+    source {
+        kind "git"
+        url (url)"https://our-fork.example.com/shared"
+    }
     identity "dag-sha256:bf96b8218ab368e242f81123dd8de4d52bfc53a100f755737a08196d86f15b64"
     version "0.0.0"
     src_dir "src"
@@ -17,6 +21,10 @@ dep "shared" {
 }
 
 dep "translib" {
+    source {
+        kind "git"
+        url (url)"https://example.com/translib"
+    }
     identity "dag-sha256:b94cfc14af5c41b17dfbdff88d9bc521b353bde49cc04f3e945900f73f8d28d9"
     version "0.0.0"
     src_dir "src"

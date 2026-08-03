@@ -4,6 +4,12 @@ strategy "maxver"
 
 dep "bar" {
     namespace "ns1"
+    source {
+        kind "registry"
+        registry "tianguis"
+        namespace "ns1"
+        name "bar"
+    }
     identity "dag-sha256:69de9e0caa711713027881b3e947be025ed76188b863620e815c7b9e86a80f8a"
     version "1.0.0"
     src_dir "src"
@@ -19,6 +25,12 @@ dep "bar" {
 
 dep "bar" {
     namespace "ns2"
+    source {
+        kind "registry"
+        registry "tianguis"
+        namespace "ns2"
+        name "bar"
+    }
     identity "dag-sha256:c2b30f2c58b4ceaf2def12d8f0ec319962fdb5480afab43cbc810ebfcdcbaf28"
     version "2.0.0"
     src_dir "src"

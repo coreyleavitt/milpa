@@ -1,0 +1,7 @@
+name "proptest"
+kind "library"
+src_dir "src"
+deps {
+    "nim-z3" git=(url)"https://example.com/nim-z3.git" ref="main"
+    "softlink" git=(url)"https://example.com/softlink.git" ref="main"
+}

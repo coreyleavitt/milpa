@@ -1,5 +1,6 @@
 name "myapp"
 kind "application"
+attestation-policy "strict"
 deps {
     wrap git=(url)"https://example.com/wrap.git" ref="main"
 }

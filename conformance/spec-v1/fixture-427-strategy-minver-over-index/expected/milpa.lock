@@ -3,6 +3,11 @@ version 1
 strategy "minver"
 
 dep "widget" {
+    source {
+        kind "registry"
+        registry "tianguis"
+        name "widget"
+    }
     identity "dag-sha256:6ba4e3cff1fd5c6566ca9ebf2f5db359f65794a6c9c9e1dea18f21da0280ae21"
     version "1.0.0"
     src_dir "src"

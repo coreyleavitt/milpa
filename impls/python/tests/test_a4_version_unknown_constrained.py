@@ -268,7 +268,7 @@ package "asyncdispatch" {{
         assert by_name == {"chronos": ">=0.2.8", "asyncdispatch": "<=0.9.0"}
 
 
-class TestRegistryValidationPreemptsTransitiveVersionUnknown:
+class TestRegistryNamedRequireConflictsWithDisagreeingTransitivePin:
     """Historical note: this fixture used to be
     ``TestVersionUnknownConstrainedTransitive`` and asserted
     ``RES-VERSION-UNKNOWN-CONSTRAINED`` — ``bearssl`` was introduced ONLY by
@@ -280,33 +280,29 @@ class TestRegistryValidationPreemptsTransitiveVersionUnknown:
     ``chronos`` (mid-solve; a named dep's own manifest is read lazily, at
     materialisation, never during the eager BFS). It was later renamed
     ``TestRegistryRedirectClosesTransitiveVersionUnknown`` under the
-    (superseded) membership-based redesign, which silently REDIRECTED
-    wrapper's url pin to the registry (asserting a downstream
-    ``SOLVE-CONFLICT`` once ``bearssl`` resolved from the registry's
-    concrete ``0.1.0`` instead).
+    (superseded) membership-based redesign, then
+    ``TestRegistryValidationPreemptsTransitiveVersionUnknown`` under the
+    (also superseded) validate-against-registry redesign, which raised
+    ``RES-PROVENANCE-CONFLICT`` here (a lone disagreeing transitive claim
+    conflicting with a known registry name).
 
-    Under validate-against-registry (resolver-semantics.md §10.0/§10.3, the
-    final design), redirect is gone: wrapper's transitive ``git=`` claim for
-    ``bearssl`` (``https://example.com/bearssl.git``) is validated against
-    the registry's recorded source for ``bearssl``
-    (``https://example.com/bearssl-index-only.git``) — a DIFFERENT
-    repository. This DISAGREES, so it raises ``RES-PROVENANCE-CONFLICT``
-    immediately, at wrapper's own claim-discovery time (eager BFS) — before
-    ``bearssl`` ever becomes a version-unknown candidate, before ``chronos``
-    is ever materialised (mid-solve), and before the solver ever runs. The
-    version-unknown-constrained machinery and the downstream
-    ``SOLVE-CONFLICT`` this test used to exercise are both entirely
-    preempted: the provenance lattice's validation (§10.5's claim-discovery-
-    time ordering) takes precedence over every later mechanism, including
-    the version-unknown-constrained special path this test file is
-    otherwise about. This is a second, independent proof (alongside
-    ``test_provenance_lattice.py``'s dedicated mid-solve-residual test) that
-    the validation is order-independent: it doesn't matter that the
-    competing tier-2 claim here (``chronos``'s own ``requires "bearssl"``)
-    is discovered strictly mid-solve, long after wrapper's claim was already
-    rejected."""
+    Under ``BindingResolver`` (RFC origin-as-identity §4.3), chronos's OWN
+    ``.nimble`` ``requires "bearssl >= 0.2.8"`` line IS a real, explicit
+    ``named`` claim on ``bearssl`` (discovered mid-solve, when chronos is
+    materialised — RFC origin-as-identity §4.3's "claim construction for
+    named deps stays interleaved with the BFS waves" note applies equally
+    to this lazy, solve-time materialisation site) — so this is no longer a
+    LONE transitive shadowing a registry name (that would be
+    ``RES-REGISTRY-SHADOW``, warn-by-default); it is TWO EXPLICIT,
+    disagreeing non-root claims for one name (wrapper's ``git=`` pin vs
+    chronos's ``named`` requirement), which ``RES-BINDING-CONFLICT``
+    governs — raised as soon as chronos's claim is submitted, regardless of
+    ``bearssl``'s version-unknown status (the conflict preempts the
+    version-unknown-constrained check this file is otherwise about,
+    exactly as the retired validate-against-registry design's
+    ``RES-PROVENANCE-CONFLICT`` did)."""
 
-    def test_disagreeing_transitive_pin_conflicts_before_version_unknown_ever_applies(
+    def test_disagreeing_transitive_pin_conflicts_with_named_require(
         self, tmp_path: Path
     ) -> None:
         mocked_dir = tmp_path / "mocked-fetches"
@@ -379,19 +375,29 @@ package "chronos" {{
             "    chronos\n"
             "}\n"
         )
-        err = _resolve_and_expect_error(tmp_path, root_kdl, env)
-        from milpa.errors import RES_PROVENANCE_CONFLICT
-        assert err.slug == RES_PROVENANCE_CONFLICT
+        import warnings as _warnings
+        from milpa.errors import RES_BINDING_CONFLICT
+
+        with _warnings.catch_warnings(record=True) as _caught:
+            _warnings.simplefilter("always")
+            err = _resolve_and_expect_error(tmp_path, root_kdl, env)
+        assert err.slug == RES_BINDING_CONFLICT
         assert "bearssl" in err.message
 
-        # Stronger than the slug/message check: wrapper's url pin for
-        # bearssl must genuinely NEVER have been fetched — validated and
-        # rejected at claim-discovery time, before dispatch, long before
-        # chronos (the mid-solve competing claim) is ever materialised.
+        # The registry-shadow tripwire (S3c) ALSO fires, earlier, as a
+        # WARNING (default, non-strict attestation-policy) — wrapper's
+        # eager git= claim on bearssl shadows the registry's OWN "bearssl"
+        # entry at a different repository — but does not block the fetch;
+        # it is chronos's LATER, explicit ``named`` claim (mid-solve) that
+        # raises RES-BINDING-CONFLICT.
+        assert any("bearssl" in str(w.message) for w in _caught)
+
+        # wrapper's url pin for bearssl WAS fetched (eager BFS, well before
+        # chronos is ever materialised/selected during solving).
         bearssl_pin_hash = _content_hash_for(
             mocked_dir, "https://example.com/bearssl.git", "main", "bearssl"
         )
-        assert not env.store.contains(bearssl_pin_hash)
+        assert env.store.contains(bearssl_pin_hash)
 
 
 class TestVersionUnknownUnconstrainedRegression:

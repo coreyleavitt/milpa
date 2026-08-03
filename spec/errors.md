@@ -308,6 +308,18 @@ The frozen fast path requires a lockfile, but none is present.
 
 **Triggered:** _try_frozen / _try_workspace_frozen find no milpa.lock at the project (or workspace) root; with --frozen this is exit 1 rather than a silent fall-through to full resolution.
 
+### `FROZEN-REGISTRY-ALIAS-UNRESOLVED`
+
+A locked dep's `source { kind "registry" … }` node names a registry alias this machine's configuration does not recognize.
+
+**Triggered:** `resolve_frozen`/`resolve_workspace_frozen` (`rfc-origin-as-identity.md` §7.1 D3) check, for every locked dep whose `source_id` is a `RegistrySourceId`, whether `.registry` (the configured alias slug, e.g. `"tianguis"`) is one this machine actually has configured — today the single hardcoded `DEFAULT_REGISTRY_ALIAS`, forward-compatible with a future multi-alias config. Checked **FIRST**, before `FROZEN-SOURCE-ID-MISMATCH` — an unresolved alias means the coordinate comparison cannot even be attempted, so it must never be misreported as a mismatch instead.
+
+### `FROZEN-SOURCE-ID-MISMATCH`
+
+A manifest dep's declared origin (`git=`/`local=`/`tarball=`/a bare registry name — evaluated AFTER any `overrides {}` rule redirects it) does not match the lockfile record's own `source_id`.
+
+**Triggered:** `resolve_frozen`/`resolve_workspace_frozen` (`rfc-origin-as-identity.md` §7.1 D2) apply `normalize_source` to the manifest dep's declared origin — reusing the SAME override-reconciliation helper (`binding.reconcile_root_claims`) `BindingResolver.__init__` uses, so an `overrides {}`-redirected dep is compared against its override TARGET, never its raw declaration (a naive check would false-positive on every project using `overrides {}`) — and compare it to the corresponding `LockedDep.source_id`. A mismatch means the manifest's `git=`/`local=`/`tarball=` URL (or override target) was edited without re-running `milpa fetch`; the frozen/verify path fails closed rather than silently reconstructing a graph for an origin that no longer matches what was actually fetched. For a bare (unqualified) named dep, the namespace component is not compared (frozen mode has no live index to resolve it against) — only the registry alias and name.
+
 ### `FROZEN-STRATEGY-MISMATCH`
 
 The requested resolution strategy differs from what the lockfile was built with.
@@ -393,6 +405,12 @@ An unexpected error escaped milpa's typed error handlers — an internal failure
 **Triggered:** The outermost CLI entry-point wrapper catches an exception that no typed handler (ManifestError, SolverError, NotFrozen, …) accounted for, emits this sentinel slug to stderr, and exits 1.  Guarantees the R3 invariant — every exit-1 failure carries a `milpa-error:` line — is mechanically enforceable.
 
 ## LOCK
+
+### `LOCK-DEP-AMBIGUOUS-NAME`
+
+A bare (unqualified) dep name given to `milpa update <dep>` / `--upgrade <dep>` matches locked deps in 2 or more distinct namespaces.
+
+**Triggered:** the scoped pin-strip helper (`_strip_pins_for_upgrade`, `cli.py`) is asked to resolve a bare dep name and finds more than one `LockedDep` sharing that bare `name` across different `namespace` values. Rather than silently picking one and deleting the sibling's lockfile entry, the caller must disambiguate with the `ns/name` slash-shorthand (e.g. `milpa update ns1/foo`).
 
 ### `LOCK-DEP-FIELD-ARITY`
 
@@ -495,6 +513,30 @@ Unknown provenance `kind` value.
 A dep's `src_dir` value in the lockfile contains an unsafe character (ASCII control character 0x00–0x1F, 0x7F, or Unicode line separator U+2028/U+2029).
 
 **Triggered:** The lockfile parse boundary validates `src_dir` against the same unsafe-char predicate as the manifest parse (`MAN-SRC-DIR-UNSAFE`).  A poisoned `milpa.lock` with a newline or control character in `src_dir` would otherwise flow to `nim.cfg --path:` on frozen reconstruction.  Both impls validate at the lockfile parse boundary so all consumers (`verify`, `frozen`, `show`) are covered.
+
+### `LOCK-SRC-FIELD-ARITY`
+
+A `source { … }` child field must have exactly one value.
+
+**Triggered:** A `source` block's child node (e.g. `url`, `registry`, `subpath`) has wrong arity (`rfc-origin-as-identity.md` §7 — the structured on-disk `source` node, uv's typed-children model).
+
+### `LOCK-SRC-FIELD-MISSING`
+
+A `source { … }` block is missing a required field for its `kind`.
+
+**Triggered:** A required field (e.g. `url` for `kind "git"`, `registry`/`name` for `kind "registry"`, `path` for `kind "local"`) is absent from the `source` block.
+
+### `LOCK-SRC-KIND-MISSING`
+
+A `source { … }` block is missing the `kind` discriminator.
+
+**Triggered:** No `kind` field is found in the `source` block.
+
+### `LOCK-SRC-KIND-UNKNOWN`
+
+Unknown `source` block `kind` value.
+
+**Triggered:** The `kind` field is not one of: `git`, `oci`, `tarball`, `local`, `registry`, `member`.
 
 ### `LOCK-SUBMODULE-FIELD-INVALID`
 
@@ -893,6 +935,14 @@ pkg override takes one positional argument (the dep name).
 
 **Triggered:** `pkg "..."` arity is wrong or arg is non-string.
 
+### `MAN-OVERRIDE-DIGEST-MISSING`
+
+pkg override's oci form is missing the required `digest` property.
+
+**Triggered:** `pkg "..." oci="<registry>/<repository>"` has no `digest=...`
+(rfc-origin-as-identity.md §7 B5, S8b — the oci override target's
+counterpart to the git target's `ref=`).
+
 ### `MAN-OVERRIDE-DUPLICATE`
 
 Duplicate override for the same name.
@@ -911,6 +961,26 @@ Unknown override kind.
 
 **Triggered:** An overrides-block child is not `pkg`.
 
+### `MAN-OVERRIDE-NAMED-MISSING`
+
+pkg override's registry form is missing or has an empty `named` property.
+
+**Triggered:** `pkg "..." named=...` is absent, non-string, or empty
+(rfc-origin-as-identity.md §7 B5, S8b — the `RegistryTarget` override, which
+redirects a direct-source dep TO a tianguis registry coordinate).
+
+### `MAN-OVERRIDE-OCI-MALFORMED`
+
+pkg override's `oci=` coordinate is missing, empty, or not a well-formed
+`<registry>/<repository>` string.
+
+**Triggered:** `pkg "..." oci=...` is absent/empty, or does not contain a
+`/` with a non-empty registry and repository on either side
+(rfc-origin-as-identity.md §7 B5, S8b). Digest-format validation
+(`sha256:<64-hex>`) is deferred to resolve/fetch time
+(`OciProvenance.__post_init__`, `TNG-BAD-OCI-DIGEST`/`TNG-UNSAFE-OCI-FIELD`)
+— this slug covers only the coordinate-shape check at parse time.
+
 ### `MAN-OVERRIDE-REF-MISSING`
 
 pkg override is missing required `ref` property.
@@ -921,16 +991,23 @@ pkg override is missing required `ref` property.
 
 A `pkg` override rule must have exactly one provenance target form.
 
-**Triggered:** A `pkg` override has zero target forms (no `git=`, `local=`, or
-`member` child), or has multiple forms simultaneously (e.g. both `local=` and
-`git=`). Exactly one of `git=(url)"..." ref="..."`, `local="<path>"`, or a
-`{ member "<name>" }` child is required per `pkg` rule.
+**Triggered:** A `pkg` override has zero target forms (no `git=`, `local=`,
+`oci=`, `tarball=`, `named=`, or `member` child), or has multiple forms
+simultaneously (e.g. both `local=` and `git=`). Exactly one of
+`git=(url)"..." ref="..."`, `local="<path>"`, `oci="<registry>/<repository>"
+digest="sha256:..."`, `tarball=(url)"..."`, `named="<name>"`, or a
+`{ member "<name>" }` child is required per `pkg` rule
+(rfc-origin-as-identity.md §7 B5 — the four original forms plus the S8b
+additions: `oci`, `tarball`, and `named`/registry).
 
 ### `MAN-OVERRIDE-UNKNOWN-PROPS`
 
 Unknown property on a pkg override.
 
-**Triggered:** A pkg override has a property not in {git, ref, local}.
+**Triggered:** A pkg override has a property not in {git, ref, local, oci,
+digest, tarball, sha256, strip_components, named, namespace, subpath,
+version}, or a `subpath=` on a form other than git/oci/tarball (Local/
+Member/Registry carry no subpath concept — rfc-origin-as-identity.md §4.1).
 
 ### `MAN-PACKAGE-VERSION-INVALID`
 
@@ -981,6 +1058,18 @@ Predicate value has an unsupported type annotation (only `(not)` recognized).
 Predicate value must be a string.
 
 **Triggered:** A predicate's value is non-string.
+
+### `MAN-PROVIDES-MODULE-ARITY`
+
+A `provides.module` child has the wrong arity or a non-string argument.
+
+**Triggered:** S7 (`rfc-origin-as-identity.md` §4.6): the top-level `provides { }` block declares a package's own Nim import symbols. Each child MUST be named `module` and carry exactly one positional string argument (a Nim-importable module path — plain data, not a URL). A `module` node with zero, multiple, or a non-string argument raises this error.
+
+### `MAN-PROVIDES-UNKNOWN-NODE`
+
+Unknown child node name inside a `provides { }` block.
+
+**Triggered:** S7 (`rfc-origin-as-identity.md` §4.6): a `provides { }` block child whose name is not `module`.
 
 ### `MAN-REMOVE-DEP-ABSENT`
 
@@ -1176,6 +1265,18 @@ The published version does not match a git tag pointing at HEAD.
 
 ## RES
 
+### `RES-BINDING-CONFLICT`
+
+Two transitive claims disagree on a dep's source-id (origin) and no root claim exists for that name to arbitrate between them.
+
+**Triggered:** `BindingResolver.submit` (`rfc-origin-as-identity.md` §4.3) receives a non-root claim whose `source_id` differs from the already-bound `source_id` for the same `DepKey`, and the existing binding was itself established by another transitive claim (not a root/override claim). A transitive claim that instead disagrees with a ROOT binding does not raise this error — it is silently discarded (`BindOutcome.LOST_TO_ROOT`, Cargo-`[patch]` semantics: the root wins). The message names both disagreeing sources (via `format_source_id`) and the remedy: declare the dep at the root via `overrides {}` to pick one source authoritatively.
+
+### `RES-DEAD-OVERRIDE`
+
+A root `overrides {}` entry names a dep that is absent from the resolved graph — dead config that silently does nothing (`rfc-origin-as-identity.md` §10 item 12 / B10, S5b).
+
+**Triggered:** after the graph is fully resolved (`resolve()`/`resolve_workspace()` alike), every `overrides {}` entry's name is checked against the final resolved dep-name set. An override whose name matches no resolved dep — typically a typo, or a dep that was later removed from `deps {}` without removing its now-orphaned override — emits a non-fatal `UserWarning` naming the dead override target and noting it matched no dependency; resolution still succeeds (same warn-only pattern as `RES-REGISTRY-SHADOW`'s default policy — no slug is embedded in the message text itself, the constant exists for the bijection lint and for future strict-mode wiring). An override that redirects an ACTUALLY-declared or actually-referenced dep (its name matches a dep present in the resolved graph) never triggers this warning, regardless of whether the redirect targets a root-declared dep or patches a purely transitive one (RFC §5 "Overrides").
+
 ### `RES-EXCLUDE-NEWER-EMPTY`
 
 An active `exclude_newer` time-bound filtered every candidate version of a named/index dep out of its enumerated candidate set.
@@ -1188,11 +1289,30 @@ An active `exclude_newer` time-bound rejected a git/url dep's pinned commit beca
 
 **Triggered:** resolution-semantics RFC §3 Axis D / §6 D-D1/D-D2: git/url deps are pinned to one author-chosen `ref` (branch, tag, or exact commit), not a candidate set milpa selects among — so `exclude_newer` **validates** the resolved commit rather than filtering a candidate list the way `RES-EXCLUDE-NEWER-EMPTY` does for index/named deps. After the dep is fetched (or its pin reused from a prior lock, `_git_pin_for_url_dep` — including a branch ref, which is reproducible once locked), milpa reads the resolved commit's own **committer date** — never an annotated tag's tagger date, even when `ref` names a tag: the SHA passed to `git log` is always an already-peeled `^{commit}` object (`GitFetcher`'s `_git_committer_date`, a bounded transport addition reading off the already-full local clone with no extra network round trip). If that committer date is provably `> exclude_newer`, this error fires naming the dep, its commit SHA, its committer date, and the bound. **Unconditional, with no fallback**: unlike an index dep, a git/url dep has exactly one candidate, so there is nothing to re-select — newly setting or tightening `exclude_newer` over an already-locked pin whose date now exceeds the bound always hits this error (the LTS-snapshot/security-freeze scenario Axis D is motivated by). Local/tarball deps have no commit and are not validated by this check (no meaningful timestamp exists for them). Like `RES-EXCLUDE-NEWER-EMPTY`, this is a reproducibility/LTS aid, not a security control — committer dates are forgeable (§6 D-D3).
 
+### `RES-IMPORT-COLLISION`
+
+Two distinct source-ids export the same Nim import symbol and cannot both be materialized into one build — the complete, symbol-level import-slot check (`rfc-origin-as-identity.md` §4.6).
+
+**Triggered (two layers, S6 + S7):** the check runs post-solve/post-dedup, over the FINAL resolved graph (fresh `resolve()`/`resolve_workspace()`, and the `--frozen`/`verify` reconstruction path alike), before anything is written under `_deps/`.
+
+- **S6 — the directory-slot floor (`lockfile.check_directory_slot_collisions`, retained as a fast-path pre-filter, run FIRST).** A pure function of each dep's projected slot (`dep_dir_name(name, namespace)`, the same SSOT `_deps/` layout function `rebuild_deps_view` uses): deps are grouped by slot, and any group of size ≥2 is compared by `identity` (content_hash). If every dep in the group shares one identity — the same-bytes/different-origin case §3.3 celebrates as milpa's edge over Cargo (S4b) — this does **not** raise; it raises only when the slot collides **and** the content differs. A directory-slot collision always *implies* a symbol collision (same slot ⇒ same import path), so S7 never needs to redo this work when S6 already found one.
+- **S7 — the complete symbol-level check (`import_slot.check_import_slot_collisions`), which subsumes S6 at every live call site.** Gathers each dep's `ImportSlot` set from a `SymbolProviderPort` and compares every pair of distinct deps sharing a module; the SAME `content_hash` short-circuit applies pairwise. Two `SymbolProviderPort` adapters exist, composed declared-beats-inferred (`ComposedSymbolProvider` / `default_symbol_provider()`): `ManifestDeclaredSymbolProvider` reads an author's own `provides { module "…" }` manifest block (fidelity `manifest_declared`); `FetchedTreeSymbolProvider` falls back, only when nothing is declared, to deriving a module name from each `*.nim` file's stem found under the dep's materialized tree (fidelity `tree_scanned`). **`tree_scanned` fidelity is a pure filename heuristic** — empirically, wiring it into a hard-fail default produced false positives against unrelated, already-correct behavior wherever two independent packages (or independent test-fixture mocks) happen to ship a generically-named `*.nim` file, extremely common in practice (`utils.nim`, `types.nim`, and this repo's own mocked-fetch test conventions all reuse such names across genuinely unrelated trees). Two mitigations exist: (a) `_is_exempt_pair` — a pair is never compared when separated by different, non-`None` **registry namespaces** (the registry's own npm-`@scope`-style multi-tenancy mechanism — the same axis the S6 floor already treats as non-colliding) or connected by a direct **`requires`** edge (a coexistence the consumer, or that dep's own manifest, explicitly chose); neither exemption weakens `manifest_declared` collisions, which are never incidental. (b) **the live default composition is narrower than the full mechanism**: the four real call sites (`resolve()`, `resolve_workspace()`, `resolve_frozen`, `resolve_workspace_frozen`) compose `check_import_slot_collisions` with `live_symbol_provider()` — `ManifestDeclaredSymbolProvider` ALONE, not `FetchedTreeSymbolProvider`'s fallback — because `manifest_declared` fidelity has zero false-positive risk (an author's own assertion is ground truth) while `tree_scanned` fidelity's risk persisted even after exemption (a). `default_symbol_provider()`'s full declared-then-scanned composition remains fully implemented and independently tested for direct/future use (matching this check's own "phased", §4.6 framing); it is simply not (yet) part of the zero-config hard-fail default.
+
+**Coverage statement (current, precise — supersedes the pre-S7 caveat):** a non-raising run means no import-symbol collision was found among the modules an author explicitly declared via `provides {}` (`manifest_declared` fidelity), subject to the two `_is_exempt_pair` exemptions above. It does **not** currently compare inferred, filename-derived (`tree_scanned`) modules — that fidelity tier is fully implemented and tested but not wired into the live default (see above) — nor does it cover a dep whose materialized tree could not be located at check time (no CAS `identity` yet — local/member deps, or a pre-S5 frozen lockfile reconstruction; the S6 directory-slot floor still protects these). Diagnostics name both origins (`format_source_id` on a fresh resolve; the provenance-derived `format_dep_origin` when no in-memory `source_id` is available, e.g. the frozen path pre-S5).
+
 ### `RES-LOCKED-DRIFT`
 
 `--locked` was passed on `fetch`/`lock`, but the freshly-resolved graph deviates from the committed `milpa.lock` — or no committed lockfile exists to compare against at all.
 
 **Triggered:** `--locked` always performs a REAL resolve (with the B2 minimal-change/prior-lock preference applied, exactly like a plain `fetch`/`lock`) and then asserts the result is identical to the committed lock — distinct from `--frozen`, which skips solving entirely and only reconstructs. The comparison (resolution-semantics RFC §3 Axis B / §6 D-B2) is **identity-based**: it keys on content-hash `identity` + the `provenances` set, **never** on the version label. So the one-time Axis-A `0.0.1`→real-declared-version relabel of an identity-unchanged git/url/local/tarball dep is compatible, not drift. Raised when: (a) a dep's resolved `identity` differs from its locked `identity`; (b) a dep's resolved provenance set differs from its locked provenance set (e.g. a different commit/URL/digest) even though `identity` is unchanged; (c) a dep is present in one side and absent from the other (added/removed since the lock was committed); or (d) there is no committed `milpa.lock` at all — `--locked` cannot guarantee reproducibility with nothing to reproduce. The message names every drifted/added/removed package and what deviated.
+
+### `RES-MEMBER-OUTSIDE-WORKSPACE`
+
+A `member "<name>"` dep is declared in a single-package (non-workspace) manifest.
+
+**Triggered:** root-seed time. A `member` reference is workspace-only topology — it names a sibling member within the same `workspace { member … }` closure and is resolved against that closure, never fetched. In a single-package manifest there is no workspace closure and therefore no candidate to bind it to. Both implementations raise this coded error at the root-seed arm rather than degrading: the reference names an authoring mistake (a `member` node that belongs in a workspace root, or a dependency that should have been declared with `git=`/`local=`), and failing closed surfaces it precisely. This supersedes the two pre-fix behaviours the origin-as-identity code review (D3) found diverging — Python silently dropped the edge; Rust pushed an unsatisfiable singleton term that surfaced as a cryptic `SOLVE-CONFLICT` naming an internal sentinel version rather than the real cause.
+
+**Fix:** If the dependency is a genuine workspace sibling, declare a `workspace { member … }` block and resolve from the workspace root. If it is a cross-repo dependency, declare it with `git=` or `local=` instead of `member`.
 
 ### `RES-NO-INDEX`
 
@@ -1208,11 +1328,11 @@ Two flags declared mutually-exclusive via `conflicts` are both active on the sam
 
 **Payload (normative, required):** `{dep, flag_a, flag_b, sources_a, sources_b}` where `dep` is the dep name, `flag_a`/`flag_b` are the conflicting flag names (lexicographic order), and `sources_a`/`sources_b` are the activation-source sets for each flag. Source sets are serialized as a sorted list of source names using enum declaration order: `"default"`, `"edge_request"`, `"enables_rule"` (the three `ActivationSource` variants). The payload must be byte-identical across both impls.
 
-### `RES-PROVENANCE-CONFLICT`
+### `RES-REGISTRY-SHADOW`
 
-Two transitive deps declare different provenance (source) for the same package name and the root does not override that name. The resolver cannot unambiguously choose between two different source trees for the same package name.
+A transitive `git=`/`tarball=`/`oci=` claim's bare name is also a name the tianguis registry owns (in any namespace), and the registry has no comparable upstream source recorded that matches the claim's own normalized source — the pre-fetch dependency-confusion tripwire (`rfc-origin-as-identity.md` §6.1/§11 D-Fork1).
 
-**Triggered:** A package name is first encountered via one transport (URL/local/named) and then a transitive dep requests it via a different, incompatible transport/URL, and the root manifest has no authority over that name (it is not declared in deps, dev-deps, or overrides).
+**Triggered:** `binding.check_registry_shadow` runs before a NEW (previously-unbound) transitive `git=`/`tarball=`/`oci=` claim is admitted. The claim's bare name is looked up against the registry index (`Index.lookup_bare`, across every namespace an ambiguous bare name resolves to). If the name is not registry-owned at all, nothing fires — this is an ordinary self-declared source (`RES-BINDING-CONFLICT` still governs true multi-claim disagreements independently). If it IS registry-owned, the claim's normalized source is compared against every recorded `GitIndexProvenance.url` and `OciIndexProvenance.source_url` across every version of every owning package: a match is a legitimate same-repository pin and is accepted silently. No match (the URL disagrees, or the registry entry is OCI-only with no comparable upstream URL recorded at all) raises a diagnostic naming the shadowed registry coordinate — under the default (`warn`) `attestation-policy`, this is a non-fatal warning (a fork of a registry package is common and legitimate) and the claim still proceeds to fetch; under `attestation-policy "strict"` it is a hard error instead, and the claim is never fetched. Unlike the retired `RES-PROVENANCE-CONFLICT` validate-against-registry mechanism this superseded, there is no post-fetch content-hash reconciliation — `content_hash` still verifies the fetched bytes independently at materialization, but no longer participates in this pre-fetch admission decision.
 
 ### `RES-ROOT-SELF-VERSION-CONSTRAINT`
 
@@ -1263,6 +1383,14 @@ A workspace override name also appears as a workspace member.
 No version solution exists — dep constraints are unsatisfiable.
 
 **Triggered:** PubGrub exhausts all backtracking options and finds no consistent assignment.  SolverError.chain carries the structured ConflictChain narrating why.
+
+## SRC
+
+### `SRC-ID-MALFORMED`
+
+A raw origin fails `SourceId` well-formedness: an invalid registry `alias`/`name` charset, an invalid `namespace` segment (empty, `..`, or an unsafe character), an OCI `registry` containing `/`, a base URL/OCI coordinate containing a literal `#subdirectory=` fragment, a `subpath` value that is empty, absolute, or contains a `..` traversal segment, a free-text origin field containing a control character or Unicode line separator, or a declared git URL containing a raw `#` fragment.
+
+**Triggered:** `source_id.normalize_source(raw)` (`rfc-origin-as-identity.md` §4.1/§4.2, round-2.5 revision; broadened by code-review S2/D1) — the sole validation boundary now that `SourceId` has no `parse()` (the frozen dataclass is the authoritative representation; `canonical()` is a one-way, never-parsed-back key). Checks: `RegistrySourceId.registry`/`.name` MUST match the manifest package-name alphabet `[A-Za-z0-9_-]+`; `RegistrySourceId.namespace`, when present, is validated per-`/`-segment (non-empty, not `..`, no unsafe chars — NOT the stricter `valid_dep_name` charset, since real namespaces are host-qualified domain names containing `.`); `OciSourceId.registry` MUST NOT contain `/` (a real OCI registry is `host[:port]` only); a `git+`/`tar+`/`oci+` base MUST NOT itself contain a literal `#subdirectory=` substring (would collide with the subpath delimiter in the one-way key); a `subpath`-bearing kind's subpath MUST be non-empty, MUST NOT begin with `/` (absolute), and MUST NOT contain a `..` segment (mirrors the `EXTRACT-ZIP-SLIP` discipline); `GitSourceId.url` (post-normalize), `TarballSourceId.url`, `OciSourceId.registry`/`.repository`, and `LocalSourceId.path` MUST NOT contain a character `contains_unsafe_char` flags (ASCII C0/C1 controls or Unicode line separators U+2028/U+2029 — code-review S2, closing a control-char-injection gap into diagnostic sinks like `milpa show`'s provenance formatter); and a declared `GitSourceId.url` MUST NOT contain a raw `#` fragment (code-review D1 — a fragment collides with milpa's own reserved `#subdirectory=` one-way-key delimiter, so it is rejected outright rather than silently stripped; a `?query` on a git URL IS silently stripped, since it is transport/auth noise, not identity-bearing — this closes a prior Python/Rust divergence where Python silently dropped both fragment and query while Rust preserved both). This is the sole error `normalize_source` raises on bad input.
 
 ## TNG
 

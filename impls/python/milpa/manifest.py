@@ -96,9 +96,12 @@ from milpa.errors import (
     MAN_NAME_MISSING,
     MAN_NAME_TYPE,
     MAN_OVERRIDE_ARITY,
+    MAN_OVERRIDE_DIGEST_MISSING,
     MAN_OVERRIDE_DUPLICATE,
     MAN_OVERRIDE_GIT_MISSING,
     MAN_OVERRIDE_KIND,
+    MAN_OVERRIDE_NAMED_MISSING,
+    MAN_OVERRIDE_OCI_MALFORMED,
     MAN_OVERRIDE_REF_MISSING,
     MAN_OVERRIDE_TARGET_AMBIGUOUS,
     MAN_OVERRIDE_UNKNOWN_PROPS,
@@ -110,6 +113,8 @@ from milpa.errors import (
     MAN_PREDICATE_UNKNOWN,
     MAN_PREDICATE_UNSUPPORTED_ANNOTATION,
     MAN_PREDICATE_VALUE_TYPE,
+    MAN_PROVIDES_MODULE_ARITY,
+    MAN_PROVIDES_UNKNOWN_NODE,
     MAN_RESOLUTION_BLOCK_INVALID,
     MAN_RESOLUTION_EXCLUDE_NEWER_INVALID,
     MAN_RESOLUTION_STRATEGY_INVALID,
@@ -202,12 +207,14 @@ _PACKAGE_TOP_LEVEL: frozenset[str] = frozenset(
         # resolution policy block. First appearance carries only `strategy`;
         # Axis D's `exclude-newer` extends it in a later slice.
         "resolution",
+        # S7 (rfc-origin-as-identity.md §4.6): declared Nim import symbols.
+        "provides",
     }
 )
 
 # Property names recognized on a UrlDep node (dispatched to UrlDep, not NamedDep).
 _URL_DEP_KNOWN_PROPS: frozenset[str] = frozenset(
-    {"git", "ref", "platform", "arch", "nim", "milpa", "flag", "optional", "version"}
+    {"git", "ref", "platform", "arch", "nim", "milpa", "flag", "optional", "version", "subpath"}
 )
 
 # Implementation detail of valid_dep_name — do NOT call .match() on this
@@ -319,6 +326,14 @@ class UrlDep:
     only when the fetched package's own manifest/tag (steps 1-3) yield none.
     ``None`` when absent (the common case — most git deps ship a real version
     or a version-shaped tag and never need this escape hatch).
+
+    ``subpath`` (rfc-origin-as-identity.md §4.1/S8): the dep lives at this
+    location INSIDE the fetched tree, not the repo root.  ``None`` (the
+    common case) means the repo root.  Threaded into ``GitSourceId.subpath``
+    at source-id construction (``binding.py``); escape-guarded (no `..`, no
+    absolute path) by ``source_id.normalize_source`` at resolve time — the
+    parser itself does not validate the string (single validation boundary,
+    per ``source_id.py``'s module docstring).
     """
 
     name: str
@@ -329,6 +344,7 @@ class UrlDep:
     flag_requests: tuple[FlagRequest, ...] = ()
     optional: bool = False
     version: Version | None = None
+    subpath: str | None = None
 
 
 @dataclass(frozen=True)
@@ -423,6 +439,9 @@ class TarballDep:
 
     ``version`` is the A3b ``version=`` annotation (§3 Axis A (b) step 4) —
     see ``UrlDep.version`` for the full rationale; ``None`` when absent.
+
+    ``subpath`` (rfc-origin-as-identity.md §4.1/S8) — see ``UrlDep.subpath``
+    for the full rationale; threaded into ``TarballSourceId.subpath``.
     """
 
     name: str
@@ -431,6 +450,7 @@ class TarballDep:
     strip_components: int = 0
     predicates: tuple[Predicate, ...] = ()
     version: Version | None = None
+    subpath: str | None = None
 
 
 @dataclass(frozen=True)
@@ -464,10 +484,14 @@ class GitTarget:
 
     Corresponds to ``pkg "name" git=(url)"..." ref="..."`` (the original
     git form, unchanged behavior).  Identity-bearing; CAS-admissible.
+
+    ``subpath`` (rfc-origin-as-identity.md §4.1/S8b): redirect to a
+    subdirectory of the fork, not its root — see ``UrlDep.subpath``.
     """
 
     git: str
     ref: str
+    subpath: str | None = None
 
 
 @dataclass(frozen=True)
@@ -493,17 +517,93 @@ class MemberTarget:
     member_name: str
 
 
-# Discriminated union of all override target kinds (S8, RFC #23 §3.3).
-OverrideTarget = GitTarget | LocalTarget | MemberTarget
+@dataclass(frozen=True)
+class OciTarget:
+    """Override target: replace a dep with a fixed OCI artifact.
+
+    Corresponds to ``pkg "name" oci="<registry>/<repository>"
+    digest="sha256:..."`` (rfc-origin-as-identity.md §7 B5, S8b — one of the
+    four override targets that complete the "overrides {} is milpa's sole
+    rebind bridge across every transport" claim).  Identity-bearing;
+    CAS-admissible; resolved as a direct, index-independent OCI pull (the
+    manifest has no first-class ``oci=`` DEP-declaration grammar — only this
+    override form; see resolver.py's ``_OciOverrideDep``).
+
+    ``digest`` is the OCI content digest (``sha256:<64-hex>``) — validated
+    at resolve/fetch time by ``OciProvenance.__post_init__``
+    (``TNG-BAD-OCI-DIGEST``/``TNG-UNSAFE-OCI-FIELD``); the manifest parser
+    itself only checks presence/non-emptiness (single validation boundary,
+    mirroring ``UrlDep.git``'s shallow parse-time check).
+
+    ``subpath`` (§4.1) — see ``UrlDep.subpath``.
+    """
+
+    registry: str
+    repository: str
+    digest: str
+    subpath: str | None = None
+
+
+@dataclass(frozen=True)
+class TarballTarget:
+    """Override target: replace a dep with a tarball URL.
+
+    Corresponds to ``pkg "name" tarball=(url)"<URL>" [sha256="<hex>"]
+    [strip_components=<N>]`` (rfc-origin-as-identity.md §7 B5, S8b).
+    Mirrors ``TarballDep`` field-for-field; resolved via the same
+    ``_process_tarball_worker`` path.  Identity-bearing; CAS-admissible.
+
+    ``subpath`` (§4.1) — see ``UrlDep.subpath``.
+    """
+
+    url: str
+    sha256: str | None = None
+    strip_components: int = 0
+    subpath: str | None = None
+
+
+@dataclass(frozen=True)
+class RegistryTarget:
+    """Override target: redirect a dep TO a tianguis registry coordinate.
+
+    Corresponds to ``pkg "name" named="<registry-name>" [namespace="<ns>"]``
+    (rfc-origin-as-identity.md §7 B5, S8b) — the inverse of the ordinary
+    git=/local=/tarball=/oci= overrides: instead of pinning a NAMED dep to a
+    direct source, this redirects a direct-source (or differently-named
+    registry) dep INTO the registry, at a possibly different coordinate
+    (``name``/``namespace``) than the overridden dep's own declared name.
+
+    No ``subpath`` — a registry entry is already scoped to exactly its
+    published subtree (``RegistrySourceId`` carries no subpath either).
+
+    Composes with ``Override.version`` (D-A3): when set, the override rule's
+    ``version=`` becomes an EXACT constraint on the redirected registry
+    lookup (``== <version>``) — the one override-target kind where "scoped
+    to a version" is a real solver constraint, not just a declared-version
+    fallback label, because the registry (unlike git/tarball/oci) always
+    carries real per-version data to constrain against.
+    """
+
+    name: str
+    namespace: str | None = None
+
+
+# Discriminated union of all override target kinds (S8/S8b, RFC #23 §3.3 +
+# rfc-origin-as-identity.md §7 B5 "overrides {} is the sole rebind bridge").
+OverrideTarget = (
+    GitTarget | LocalTarget | MemberTarget | OciTarget | TarballTarget | RegistryTarget
+)
 
 
 @dataclass(frozen=True)
 class Override:
-    """A pkg-form override (S8 discriminated union, RFC #23 §3.3).
+    """A pkg-form override (S8/S8b discriminated union, RFC #23 §3.3 +
+    rfc-origin-as-identity.md §7 B5).
 
     ``name`` is the dep name to intercept.  ``target`` is exactly one of
-    ``GitTarget``, ``LocalTarget``, or ``MemberTarget`` — never a mix.
-    Zero or multiple targets in the same ``pkg`` rule raise
+    ``GitTarget``, ``LocalTarget``, ``MemberTarget``, ``OciTarget``,
+    ``TarballTarget``, or ``RegistryTarget`` — never a mix.  Zero or
+    multiple targets in the same ``pkg`` rule raise
     ``MAN-OVERRIDE-TARGET-AMBIGUOUS``.
 
     Project-wide scope.  Does not propagate to downstream consumers.
@@ -667,6 +767,17 @@ class Manifest:
     # CLI > manifest > lockfile-recorded > default chain falls through
     # either way).
     resolution: "Resolution | None" = None
+    # S7 (rfc-origin-as-identity.md §4.6): the package's own declared Nim
+    # import symbols — ``provides { module "x"; module "y" }``.  Consumed by
+    # ``import_slot.ManifestDeclaredSymbolProvider`` as the manifest_declared
+    # fidelity tier of the post-solve import-slot check (declared-beats-
+    # inferred over ``FetchedTreeSymbolProvider``'s tree_scanned fallback).
+    # Empty tuple (the default) means this manifest declares no ``provides``
+    # block — NOT that the package exports no modules; it means the checker
+    # falls back to scanning the fetched tree instead. Order is insertion-
+    # order from the source (round-trip stable); duplicates are legal in the
+    # grammar (deduped only where consumed, e.g. as a frozenset of slots).
+    provides: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1174,6 +1285,8 @@ def _parse_manifest_doc(doc: KdlDocument) -> Manifest:
     index_history_policy_explicit: bool = False
     # C3: resolution { strategy "..." } block (rfc-resolution-semantics.md §3 Axis C)
     resolution: Resolution | None = None
+    # S7 (rfc-origin-as-identity.md §4.6): provides { module "..." } block.
+    provides: list[str] = []
     seen_top_level: set[str] = set()
 
     for n in nodes(doc):
@@ -1337,6 +1450,10 @@ def _parse_manifest_doc(doc: KdlDocument) -> Manifest:
             # resolution policy block.
             resolution = _parse_resolution_block(n)
 
+        elif nm == "provides":
+            # S7 (rfc-origin-as-identity.md §4.6): declared Nim import symbols.
+            provides = _parse_provides_block(n)
+
     if name is None:
         raise MilpaError(
             MAN_NAME_MISSING,
@@ -1411,6 +1528,7 @@ def _parse_manifest_doc(doc: KdlDocument) -> Manifest:
         index_history_policy=index_history_policy,
         index_history_policy_explicit=index_history_policy_explicit,
         resolution=resolution,
+        provides=tuple(provides),
     )
 
 
@@ -1885,6 +2003,22 @@ def _parse_url_dep(
     # A3b: version= annotation (§3 Axis A (b) step 4).
     version = _parse_dep_version_prop(n, context=f"dep {dep_name!r}")
 
+    # subpath= (rfc-origin-as-identity.md §4.1/S8): dep lives at this
+    # location INSIDE the fetched tree, not the repo root.  NOT validated
+    # here — normalize_source (source_id.py) is the sole validation
+    # boundary (escape-guard: no `..`, no absolute path); the parser only
+    # checks that a present value is a string.
+    subpath: str | None = None
+    if "subpath" in node_props(n):
+        subpath = node_prop_str(n, "subpath")
+        if subpath is None:
+            raise MilpaError(
+                MAN_DEP_UNKNOWN_PROPS,
+                f"dep {dep_name!r}: 'subpath=' must be a string",
+                dep=dep_name,
+                prop="subpath",
+            )
+
     return UrlDep(
         name=dep_name,
         git=git_url,
@@ -1894,6 +2028,7 @@ def _parse_url_dep(
         flag_requests=tuple(flag_requests),
         optional=optional,
         version=version,
+        subpath=subpath,
     )
 
 
@@ -2322,6 +2457,18 @@ def _parse_tarball_dep(
     """
     props = node_props(n)
 
+    # Check for unknown properties (anything except the tarball form's
+    # allowed set). Matches the sibling UrlDep/LocalDep parsers and Rust's
+    # ``parse_tarball_dep_inner`` allowlist (D4 divergence fix).
+    for prop_key in props:
+        if prop_key not in ("tarball", "sha256", "strip_components", "version", "subpath"):
+            raise MilpaError(
+                MAN_DEP_UNKNOWN_PROPS,
+                f"dep {dep_name!r}: TarballDep does not accept property {prop_key!r}",
+                dep=dep_name,
+                prop=prop_key,
+            )
+
     # --- tarball= URL ---
     tarball_url_v = node_prop_url(n, "tarball")
     if tarball_url_v is None:
@@ -2398,6 +2545,19 @@ def _parse_tarball_dep(
     # A3b: version= annotation (§3 Axis A (b) step 4).
     version = _parse_dep_version_prop(n, context=f"dep {dep_name!r}")
 
+    # subpath= (rfc-origin-as-identity.md §4.1/S8) — see UrlDep's subpath
+    # parsing for the full rationale (not validated here).
+    subpath: str | None = None
+    if "subpath" in props:
+        subpath = node_prop_str(n, "subpath")
+        if subpath is None:
+            raise MilpaError(
+                MAN_DEP_UNKNOWN_PROPS,
+                f"dep {dep_name!r}: 'subpath=' must be a string",
+                dep=dep_name,
+                prop="subpath",
+            )
+
     return TarballDep(
         name=dep_name,
         url=url,
@@ -2405,16 +2565,51 @@ def _parse_tarball_dep(
         strip_components=strip_components,
         predicates=outer_predicates,
         version=version,
+        subpath=subpath,
     )
+
+
+def _split_oci_coordinate(token: str, *, pkg_name: str) -> tuple[str, str]:
+    """Split an ``oci=`` override value ``<registry>/<repository>`` on its
+    FIRST ``/``.
+
+    Deliberately a small local duplicate of ``source_spec.split_oci_target``
+    (same "first-'/'-is-the-registry-boundary" rule; registry-protocol.md),
+    NOT an import of it: ``source_spec.py`` pulls in ``milpa.fetchers.oci``
+    at module scope, and ``manifest.py`` (pure grammar, no scripting, no
+    runtime-fetch knowledge — CLAUDE.md's declarative-manifest
+    non-negotiable) must not transitively depend on the fetchers layer.  One
+    pure string-split is a cheap, justified one-off rather than a layering
+    violation ([[feedback_minimal_over_completeness]]).
+    """
+    slash_pos = token.find("/")
+    if slash_pos == -1 or not token[:slash_pos] or not token[slash_pos + 1 :]:
+        raise MilpaError(
+            MAN_OVERRIDE_OCI_MALFORMED,
+            f"override for {pkg_name!r}: 'oci=' must be "
+            f"'<registry>/<repository>' (non-empty on both sides of the "
+            f"first '/'); got {token!r}",
+            name=pkg_name,
+            value=token,
+        )
+    return token[:slash_pos], token[slash_pos + 1 :]
 
 
 def _parse_overrides_block(block: KdlNode) -> list[Override]:
     """Parse an ``overrides { }`` block.
 
-    Each child MUST be named ``pkg``.  S8 grammar (RFC #23 §3.3):
-        git form:    ``pkg "<name>" git=(url)"<URL>" ref="<ref>"``
-        local form:  ``pkg "<name>" local="<relative-path>"``
-        member form: ``pkg "<name>" { member "<member-name>" }``
+    Each child MUST be named ``pkg``.  S8/S8b grammar (RFC #23 §3.3 +
+    rfc-origin-as-identity.md §7 B5 — the "overrides {} is milpa's sole
+    rebind bridge" claim, complete across every transport):
+        git form:      ``pkg "<name>" git=(url)"<URL>" ref="<ref>" [subpath="<p>"]``
+        local form:    ``pkg "<name>" local="<relative-path>"``
+        member form:   ``pkg "<name>" { member "<member-name>" }``
+        oci form:      ``pkg "<name>" oci="<registry>/<repository>" digest="sha256:..." [subpath="<p>"]``
+        tarball form:  ``pkg "<name>" tarball=(url)"<URL>" [sha256="<hex>"] [strip_components=<N>] [subpath="<p>"]``
+        registry form: ``pkg "<name>" named="<registry-name>" [namespace="<ns>"]``
+
+    Every form additionally accepts ``version=`` (D-A3, orthogonal to which
+    redirect form is chosen — see ``Override.version``).
 
     Exactly one provenance target per ``pkg`` rule; zero or multiple targets
     raises ``MAN-OVERRIDE-TARGET-AMBIGUOUS``.
@@ -2424,6 +2619,9 @@ def _parse_overrides_block(block: KdlNode) -> list[Override]:
     - ``pkg`` with no positional arg (arity 0) or non-string arg → ``MAN-OVERRIDE-ARITY``
     - Zero or multiple target forms → ``MAN-OVERRIDE-TARGET-AMBIGUOUS``
     - Missing ``ref=`` on git form → ``MAN-OVERRIDE-REF-MISSING``
+    - Missing/malformed ``oci=`` coordinate → ``MAN-OVERRIDE-OCI-MALFORMED``
+    - Missing ``digest=`` on oci form → ``MAN-OVERRIDE-DIGEST-MISSING``
+    - Missing/empty ``named=`` on registry form → ``MAN-OVERRIDE-NAMED-MISSING``
     - Unknown property → ``MAN-OVERRIDE-UNKNOWN-PROPS``
     - Duplicate name → ``MAN-OVERRIDE-DUPLICATE``
     """
@@ -2454,34 +2652,70 @@ def _parse_overrides_block(block: KdlNode) -> list[Override]:
 
         # Known properties across all forms; validate unknowns first.
         # A3b: 'version' is valid on every target form (D-A3 — orthogonal to
-        # which redirect form is chosen; labels that target's step 4).
-        _OVERRIDE_KNOWN_PROPS = frozenset({"git", "ref", "local", "version"})
+        # which redirect form is chosen; labels that target's step 4, or —
+        # registry form only — an exact-version solver constraint).
+        _OVERRIDE_KNOWN_PROPS = frozenset(
+            {
+                "git", "ref", "local", "version", "subpath",
+                "oci", "digest", "tarball", "sha256", "strip_components",
+                "named", "namespace",
+            }
+        )
         for prop_key in props:
             if prop_key not in _OVERRIDE_KNOWN_PROPS:
                 raise MilpaError(
                     MAN_OVERRIDE_UNKNOWN_PROPS,
                     f"override for {pkg_name!r}: unknown property {prop_key!r} "
-                    "(allowed: 'git', 'ref', 'local', 'version')",
+                    "(allowed: 'git', 'ref', 'local', 'oci', 'digest', "
+                    "'tarball', 'sha256', 'strip_components', 'named', "
+                    "'namespace', 'subpath', 'version')",
                     name=pkg_name,
                     prop=prop_key,
                 )
 
         has_git = "git" in props
         has_local = "local" in props
+        has_oci = "oci" in props
+        has_tarball = "tarball" in props
+        has_named = "named" in props
         # member form: a single child node named "member"
         member_children = [c for c in children if node_name(c) == "member"]
         has_member = len(member_children) > 0
 
         # Count target forms (exactly one required).
-        target_count = sum([has_git, has_local, has_member])
+        target_count = sum(
+            [has_git, has_local, has_member, has_oci, has_tarball, has_named]
+        )
         if target_count != 1:
             raise MilpaError(
                 MAN_OVERRIDE_TARGET_AMBIGUOUS,
                 f"override for {pkg_name!r}: exactly one provenance form is required "
-                f"(git, local, or member); got {target_count} "
-                f"({'none' if target_count == 0 else 'multiple forms mixed'})",
+                f"(git, local, member, oci, tarball, or named/registry); got "
+                f"{target_count} ({'none' if target_count == 0 else 'multiple forms mixed'})",
                 name=pkg_name,
             )
+
+        # subpath= — valid on git/oci/tarball forms only (mirrors SourceId:
+        # Local/Member/Registry carry no subpath concept).  Parsed once,
+        # here, since it's shared across those three forms.
+        subpath: str | None = None
+        if "subpath" in props:
+            subpath = node_prop_str(child, "subpath")
+            if subpath is None:
+                raise MilpaError(
+                    MAN_OVERRIDE_UNKNOWN_PROPS,
+                    f"override for {pkg_name!r}: 'subpath=' must be a string",
+                    name=pkg_name,
+                    prop="subpath",
+                )
+            if not (has_git or has_oci or has_tarball):
+                raise MilpaError(
+                    MAN_OVERRIDE_UNKNOWN_PROPS,
+                    f"override for {pkg_name!r}: 'subpath=' is only valid on "
+                    "the git, oci, or tarball override forms",
+                    name=pkg_name,
+                    prop="subpath",
+                )
 
         # --- Parse the selected target form ---
         target: OverrideTarget
@@ -2505,7 +2739,7 @@ def _parse_overrides_block(block: KdlNode) -> list[Override]:
                     f"override for {pkg_name!r}: missing required 'ref=' property",
                     name=pkg_name,
                 )
-            target = GitTarget(git=git_url, ref=ref)
+            target = GitTarget(git=git_url, ref=ref, subpath=subpath)
 
         elif has_local:
             local_path = node_prop_str(child, "local")
@@ -2516,6 +2750,88 @@ def _parse_overrides_block(block: KdlNode) -> list[Override]:
                     name=pkg_name,
                 )
             target = LocalTarget(path=local_path)
+
+        elif has_oci:
+            oci_coord = node_prop_str(child, "oci")
+            if not oci_coord:
+                raise MilpaError(
+                    MAN_OVERRIDE_OCI_MALFORMED,
+                    f"override for {pkg_name!r}: 'oci=' must be a non-empty "
+                    "'<registry>/<repository>' string",
+                    name=pkg_name,
+                )
+            registry, repository = _split_oci_coordinate(oci_coord, pkg_name=pkg_name)
+            digest = node_prop_str(child, "digest")
+            if not digest:
+                raise MilpaError(
+                    MAN_OVERRIDE_DIGEST_MISSING,
+                    f"override for {pkg_name!r}: oci form requires a "
+                    "'digest=' property (sha256:<64-hex>)",
+                    name=pkg_name,
+                )
+            target = OciTarget(
+                registry=registry, repository=repository, digest=digest, subpath=subpath,
+            )
+
+        elif has_tarball:
+            tarball_url_v = node_prop_url(child, "tarball")
+            if tarball_url_v is None:
+                raise MilpaError(
+                    MAN_DEP_TARBALL_URL,
+                    f"override for {pkg_name!r}: 'tarball=' must be a "
+                    "(url)-annotated, non-empty URL string",
+                    dep=pkg_name,
+                )
+            tb_url = str(tarball_url_v)
+            if not tb_url:
+                raise MilpaError(
+                    MAN_DEP_TARBALL_URL,
+                    f"override for {pkg_name!r}: 'tarball=' URL must not be empty",
+                    dep=pkg_name,
+                )
+            tb_sha256: str | None = None
+            if "sha256" in props:
+                tb_sha256 = node_prop_str(child, "sha256")
+                if tb_sha256 is None:
+                    raise MilpaError(
+                        MAN_DEP_TARBALL_SHA,
+                        f"override for {pkg_name!r}: 'sha256=' must be a string",
+                        dep=pkg_name,
+                    )
+            tb_strip: int = 0
+            if "strip_components" in props:
+                raw_strip = props.get("strip_components")
+                if isinstance(raw_strip, bool) or isinstance(raw_strip, float):
+                    raise MilpaError(
+                        MAN_DEP_TARBALL_STRIP,
+                        f"override for {pkg_name!r}: 'strip_components=' must "
+                        "be a non-negative integer",
+                        dep=pkg_name,
+                    )
+                strip_v = node_prop_int(child, "strip_components")
+                if strip_v is None or strip_v < 0:
+                    raise MilpaError(
+                        MAN_DEP_TARBALL_STRIP,
+                        f"override for {pkg_name!r}: 'strip_components=' must "
+                        "be a non-negative integer",
+                        dep=pkg_name,
+                    )
+                tb_strip = strip_v
+            target = TarballTarget(
+                url=tb_url, sha256=tb_sha256, strip_components=tb_strip, subpath=subpath,
+            )
+
+        elif has_named:
+            named_name = node_prop_str(child, "named")
+            if not named_name:
+                raise MilpaError(
+                    MAN_OVERRIDE_NAMED_MISSING,
+                    f"override for {pkg_name!r}: 'named=' must be a non-empty "
+                    "string (the registry package name to redirect to)",
+                    name=pkg_name,
+                )
+            named_namespace = node_prop_str(child, "namespace")
+            target = RegistryTarget(name=named_name, namespace=named_namespace)
 
         else:  # has_member
             mc = member_children[0]
@@ -2582,6 +2898,41 @@ def _parse_mirrors_block(block: KdlNode) -> list[str]:
         mirrors.append(str(url_v))
 
     return mirrors
+
+
+def _parse_provides_block(block: KdlNode) -> list[str]:
+    """Parse a top-level ``provides { }`` block (S7, rfc-origin-as-identity.md
+    §4.6): the package's own declared Nim import symbols.
+
+    Each child MUST be named ``module`` and carry exactly one string argument
+    (a Nim-importable module path — plain data, not a URL, so no ``(url)``
+    annotation applies here).
+
+    Error codes:
+    - Unknown child name → ``MAN-PROVIDES-UNKNOWN-NODE``
+    - Wrong arity or non-string arg → ``MAN-PROVIDES-MODULE-ARITY``
+    """
+    modules: list[str] = []
+
+    for child in node_children(block):
+        child_nm = node_name(child)
+        if child_nm != "module":
+            raise MilpaError(
+                MAN_PROVIDES_UNKNOWN_NODE,
+                f"unknown node {child_nm!r} in 'provides' block "
+                "(only 'module' is allowed)",
+                node=child_nm,
+            )
+        raw_args = node_args(child)
+        if len(raw_args) != 1 or not isinstance(raw_args[0], str):
+            raise MilpaError(
+                MAN_PROVIDES_MODULE_ARITY,
+                "'provides.module' takes exactly one positional string "
+                "argument (a Nim-importable module path)",
+            )
+        modules.append(raw_args[0])
+
+    return modules
 
 
 def _parse_enables_node(
@@ -3097,6 +3448,73 @@ def _kdl_str(s: str) -> str:
     )
 
 
+def _format_override_line(ov: "Override") -> str:
+    """Render one ``overrides {}`` ``pkg`` rule (S8/S8b, rfc-origin-as-identity.md
+    §7 B5) — single source of truth shared by ``format_manifest`` and
+    ``format_workspace_manifest`` (both packages and a workspace root use the
+    IDENTICAL override grammar; a previous divergence between the two
+    formatters silently dropped ``version=`` from workspace-root overrides,
+    fixed here by unifying rather than patching each copy separately).
+    """
+    t = ov.target
+    ov_version_suffix = (
+        f' version="{format_version_str(ov.version)}"' if ov.version is not None else ""
+    )
+    if isinstance(t, GitTarget):
+        subpath_suffix = f' subpath="{_kdl_str(t.subpath)}"' if t.subpath is not None else ""
+        return (
+            f'    pkg "{_kdl_str(ov.name)}"'
+            f' git=(url)"{_kdl_str(t.git)}"'
+            f' ref="{_kdl_str(t.ref)}"'
+            f'{subpath_suffix}'
+            f'{ov_version_suffix}'
+        )
+    if isinstance(t, LocalTarget):
+        return (
+            f'    pkg "{_kdl_str(ov.name)}"'
+            f' local="{_kdl_str(t.path)}"'
+            f'{ov_version_suffix}'
+        )
+    if isinstance(t, OciTarget):
+        subpath_suffix = f' subpath="{_kdl_str(t.subpath)}"' if t.subpath is not None else ""
+        return (
+            f'    pkg "{_kdl_str(ov.name)}"'
+            f' oci="{_kdl_str(t.registry)}/{_kdl_str(t.repository)}"'
+            f' digest="{_kdl_str(t.digest)}"'
+            f'{subpath_suffix}'
+            f'{ov_version_suffix}'
+        )
+    if isinstance(t, TarballTarget):
+        parts = [
+            f'    pkg "{_kdl_str(ov.name)}"',
+            f'tarball=(url)"{_kdl_str(t.url)}"',
+        ]
+        if t.sha256 is not None:
+            parts.append(f'sha256="{_kdl_str(t.sha256)}"')
+        if t.strip_components != 0:
+            parts.append(f"strip_components={t.strip_components}")
+        if t.subpath is not None:
+            parts.append(f'subpath="{_kdl_str(t.subpath)}"')
+        if ov.version is not None:
+            parts.append(f'version="{format_version_str(ov.version)}"')
+        return " ".join(parts)
+    if isinstance(t, RegistryTarget):
+        ns_suffix = f' namespace="{_kdl_str(t.namespace)}"' if t.namespace is not None else ""
+        return (
+            f'    pkg "{_kdl_str(ov.name)}"'
+            f' named="{_kdl_str(t.name)}"'
+            f'{ns_suffix}'
+            f'{ov_version_suffix}'
+        )
+    if isinstance(t, MemberTarget):
+        return (
+            f'    pkg "{_kdl_str(ov.name)}"{ov_version_suffix} {{\n'
+            f'        member "{_kdl_str(t.member_name)}"\n'
+            f'    }}'
+        )
+    raise TypeError(f"unrecognized OverrideTarget kind: {type(t)!r}")  # pragma: no cover
+
+
 def format_manifest(manifest: Manifest) -> str:
     """Serialize a ``Manifest`` to a KDL 2.0 string.
 
@@ -3186,37 +3604,14 @@ def format_manifest(manifest: Manifest) -> str:
 
     # overrides { pkg "name" git=(url)"..." ref="..." }
     #              pkg "name" local="<path>"
+    #              pkg "name" oci="<registry>/<repository>" digest="..."
+    #              pkg "name" tarball=(url)"..."
+    #              pkg "name" named="<name>" namespace="<ns>"
     #              pkg "name" { member "<name>" }
     if manifest.overrides:
         lines.append("overrides {")
         for ov in manifest.overrides:
-            t = ov.target
-            # A3b: version= annotation on the override rule itself (§3 Axis A
-            # (b) step 4, D-A3) — valid regardless of target form.
-            ov_version_suffix = (
-                f' version="{format_version_str(ov.version)}"' if ov.version is not None else ""
-            )
-            if isinstance(t, GitTarget):
-                lines.append(
-                    f'    pkg "{_kdl_str(ov.name)}"'
-                    f' git=(url)"{_kdl_str(t.git)}"'
-                    f' ref="{_kdl_str(t.ref)}"'
-                    f'{ov_version_suffix}'
-                )
-            elif isinstance(t, LocalTarget):
-                lines.append(
-                    f'    pkg "{_kdl_str(ov.name)}"'
-                    f' local="{_kdl_str(t.path)}"'
-                    f'{ov_version_suffix}'
-                )
-            elif isinstance(t, MemberTarget):
-                lines.append(
-                    f'    pkg "{_kdl_str(ov.name)}"{ov_version_suffix} {{'
-                )
-                lines.append(
-                    f'        member "{_kdl_str(t.member_name)}"'
-                )
-                lines.append("    }")
+            lines.append(_format_override_line(ov))
         lines.append("}")
         lines.append("")
 
@@ -3225,6 +3620,14 @@ def format_manifest(manifest: Manifest) -> str:
         lines.append("mirrors {")
         for url in manifest.self_mirrors:
             lines.append(f'    mirror (url)"{_kdl_str(url)}"')
+        lines.append("}")
+        lines.append("")
+
+    # provides { module "..." ... } — S7 (rfc-origin-as-identity.md §4.6).
+    if manifest.provides:
+        lines.append("provides {")
+        for module in manifest.provides:
+            lines.append(f'    module "{_kdl_str(module)}"')
         lines.append("}")
         lines.append("")
 
@@ -3382,30 +3785,12 @@ def format_workspace_manifest(ws: "WorkspaceManifest") -> str:
     lines.append("}")
     lines.append("")
 
-    # overrides { pkg "name" ... }
+    # overrides { pkg "name" ... } — same grammar as a package manifest's
+    # overrides block (S8/S8b); _format_override_line is the shared SSOT.
     if ws.overrides:
         lines.append("overrides {")
         for ov in ws.overrides:
-            t = ov.target
-            if isinstance(t, GitTarget):
-                lines.append(
-                    f'    pkg "{_kdl_str(ov.name)}"'
-                    f' git=(url)"{_kdl_str(t.git)}"'
-                    f' ref="{_kdl_str(t.ref)}"'
-                )
-            elif isinstance(t, LocalTarget):
-                lines.append(
-                    f'    pkg "{_kdl_str(ov.name)}"'
-                    f' local="{_kdl_str(t.path)}"'
-                )
-            elif isinstance(t, MemberTarget):
-                lines.append(
-                    f'    pkg "{_kdl_str(ov.name)}" {{'
-                )
-                lines.append(
-                    f'        member "{_kdl_str(t.member_name)}"'
-                )
-                lines.append("    }")
+            lines.append(_format_override_line(ov))
         lines.append("}")
         lines.append("")
 
@@ -3612,6 +3997,8 @@ def _format_dep_line(dep: Dep) -> str:
             parts.append(f"strip_components={dep.strip_components}")
         if dep.version is not None:
             parts.append(f'version="{format_version_str(dep.version)}"')
+        if dep.subpath is not None:
+            parts.append(f'subpath="{_kdl_str(dep.subpath)}"')
         node_body = " ".join(parts)
         if dep.predicates:
             inner = f"        {node_body}"
@@ -3644,6 +4031,9 @@ def _format_dep_line(dep: Dep) -> str:
     # version} pattern.  Present iff dep.version is set.
     if dep.version is not None:
         head += f' version="{format_version_str(dep.version)}"'
+    # subpath= — rfc-origin-as-identity.md §4.1/S8. Present iff dep.subpath is set.
+    if dep.subpath is not None:
+        head += f' subpath="{_kdl_str(dep.subpath)}"'
     # optional=#true — round-trip preservation (S7 RFC #23 §3.2).
     if dep.optional:
         head += " optional=#true"

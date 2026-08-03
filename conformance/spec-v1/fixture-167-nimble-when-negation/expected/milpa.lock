@@ -3,6 +3,10 @@ version 1
 strategy "maxver"
 
 dep "extra_a" {
+    source {
+        kind "git"
+        url (url)"https://github.com/example/extra_a"
+    }
     identity "dag-sha256:09bec745269cb05558daf4d56ec9501b084162faf10ff29b1b2f37ca6250e2e9"
     version "1.0.0"
     declared_version_source "nimble"
@@ -18,6 +22,10 @@ dep "extra_a" {
 }
 
 dep "extra_b" {
+    source {
+        kind "git"
+        url (url)"https://github.com/example/extra_b"
+    }
     identity "dag-sha256:b161297126c2d8e56260c3c0b83a292269c1cd6adaf5c514bb6577d8cdd4ab13"
     version "1.0.0"
     declared_version_source "nimble"
@@ -33,6 +41,10 @@ dep "extra_b" {
 }
 
 dep "extra_c" {
+    source {
+        kind "git"
+        url (url)"https://github.com/example/extra_c"
+    }
     identity "dag-sha256:d1b5504548065482e18f90b58cd089dd856c8be894f34c615bfdea6c7a0ebf7f"
     version "1.0.0"
     declared_version_source "nimble"
@@ -48,6 +60,10 @@ dep "extra_c" {
 }
 
 dep "foo" {
+    source {
+        kind "git"
+        url (url)"https://github.com/example/foo"
+    }
     identity "dag-sha256:597979430eb387b963a932b093035cc0c04ffbee425966be19da201438950239"
     version "1.0.0"
     declared_version_source "nimble"

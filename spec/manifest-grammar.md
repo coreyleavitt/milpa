@@ -121,8 +121,8 @@ uses the `(url)` annotation to mark URL strings.
 > NORMATIVE: A package manifest MUST contain exactly one `name` node and at
 > most one each of: `kind`, `deps`, `dev-deps`, `overrides`, `src_dir`, `flags`,
 > `mirrors`, `cas`, `spec-version`, `version`, `attestation-policy`,
-> `resolution`. Any other top-level node name MUST raise `MAN-UNKNOWN-TOP-LEVEL`.
-> Two `name` nodes MUST raise `MAN-NAME-DUPLICATE`.
+> `resolution`, `provides`. Any other top-level node name MUST raise
+> `MAN-UNKNOWN-TOP-LEVEL`. Two `name` nodes MUST raise `MAN-NAME-DUPLICATE`.
 
 > NORMATIVE: The `name` node MUST carry exactly one positional string argument
 > (the package name). Missing `name` raises `MAN-NAME-MISSING`; wrong arity or
@@ -201,6 +201,29 @@ uses the `(url)` annotation to mark URL strings.
 > one `(url)`-annotated URL argument. Unknown child names raise
 > `MAN-MIRRORS-UNKNOWN-CHILD`; wrong arity raises `MAN-MIRRORS-ARITY`; a plain
 > (unannotated) string raises `MAN-URL-ARG-TYPE`.
+
+#### `provides` block (rfc-origin-as-identity.md §4.6, S7)
+
+> NORMATIVE: The `provides` block declares the Nim import symbols **this
+> package** exports — the `manifest_declared` fidelity tier of the post-solve
+> import-slot check (`RES-IMPORT-COLLISION`, spec/errors.md). Each child node
+> MUST be named `module` and carry exactly one positional string argument (a
+> Nim-importable module path — plain data, not a URL; no `(url)` annotation
+> applies). Unknown child names raise `MAN-PROVIDES-UNKNOWN-NODE`; wrong arity
+> or a non-string argument raises `MAN-PROVIDES-MODULE-ARITY`.
+>
+> ```kdl
+> provides {
+>     module "foo"
+>     module "foo/bar"
+> }
+> ```
+>
+> The block is optional and may be empty. Absence (or an empty block) means
+> this manifest declares no import symbols — NOT that the package exports
+> none — the import-slot check falls back to scanning the fetched tree for
+> `*.nim` files instead (`tree_scanned` fidelity), never treating an absent
+> block as "provides nothing."
 
 #### `resolution` block (resolution-semantics RFC §3 Axis C/D / §5, C3/D1)
 
@@ -307,6 +330,17 @@ Grammar: `<name> git=(url)"<URL>" ref="<git-ref>" [<predicate-props>] [{ … }]`
 > (§3.4): the annotation *labels* a version, an override *redirects* the
 > source. A malformed `version=` value raises `MAN-DEP-VERSION-INVALID`.
 
+> NORMATIVE (`rfc-origin-as-identity.md` §4.1/§5, S8): A UrlDep MAY carry an
+> optional `subpath="<relative-path>"` property naming a subdirectory of the
+> fetched repository as the dep's actual source tree (a monorepo dependency,
+> e.g. `git=(url)"https://github.com/facebook/react.git" ref="main"
+> subpath="packages/react-dom"`). Threaded into the dep's `GitSourceId.subpath`
+> (`spec/identity.md` §4.1b) — the same repository at two different
+> `subpath=` values is two distinct origins, correctly. `subpath` MUST be a
+> POSIX-relative path with no leading `/` and no `..` segment; a malformed
+> value raises `SRC-ID-MALFORMED` (`spec/errors.md`, the same escape guard as
+> `EXTRACT-ZIP-SLIP`). Omitted (the common case) means the repository root.
+
 #### NamedDep
 
 Grammar:
@@ -352,14 +386,22 @@ Grammar:
 > The **canonical serialization** of a qualified NamedDep is the `namespace=`
 > attribute form; the slash-shorthand MUST NOT appear in generated manifests.
 
-> NORMATIVE: The solver variable for a NamedDep is:
+> NORMATIVE: A NamedDep reference's qualified-lookup form is:
 > - Bare dep (no namespace): `<name>`
 > - Qualified dep (has namespace): `<namespace>::<name>`
 >
-> The solver variable is SOLVER-INTERNAL ONLY — it MUST NOT appear in the
-> lockfile, `_deps/` layout, `nim.cfg` paths, or the `requires` list.
-> See `spec/resolver-semantics.md §6b` and `§6c` for the correct serialized
-> forms of qualified dep names on each surface.
+> This form is used only to construct the reference's `DepKey` and to look up
+> its binding (`spec/resolver-semantics.md` §6a/§6b) — it is NOT itself the
+> PubGrub solver variable. The solver variable is `canonical(source_id)`
+> (`spec/resolver-semantics.md` §6b, `spec/identity.md` §4.1b): for a NamedDep
+> this is the resolved `RegistrySourceId`'s canonical form
+> (`pkg+<alias>/[<namespace>/]<name>`), derived via the two-phase
+> name-resolution + canonicalization process (§6b), not this qualified string
+> directly. Both the `::` lookup form and the canonical solver-variable string
+> are SOLVER-INTERNAL ONLY — neither MUST appear in the lockfile, `_deps/`
+> layout, `nim.cfg` paths, or the `requires` list. See
+> `spec/lockfile-schema.md §3.10` and `spec/resolver-semantics.md §6c` for the
+> correct serialized forms of a qualified dep's origin and directory layout.
 
 > NOTE: NamedDeps are resolved against the tianguis index. The constraint
 > syntax is an opaque string passed to `VersionSet.from_constraint`; the
@@ -402,6 +444,13 @@ Grammar: `<name> tarball=(url)"<URL>" [sha256="<hex>"] [strip_components=<N>]`
 > malformed value raises `MAN-DEP-VERSION-INVALID`). This reach extension —
 > a tarball dep gets the same declared-version escape hatch as git/url/local
 > — avoids a constrained tarball dep having no remedy but the hard error.
+
+> NORMATIVE (`rfc-origin-as-identity.md` §4.1/§5, S8): A TarballDep MAY
+> likewise carry an optional `subpath="<relative-path>"` property, with the
+> identical grammar, escape-guard (`SRC-ID-MALFORMED` on a malformed value),
+> and `TarballSourceId.subpath` threading as UrlDep's `subpath=` above —
+> naming a subdirectory of the extracted (post-`strip_components`) archive as
+> the dep's actual source tree.
 
 > NORMATIVE: A conformant tarball fetcher MUST support the following compression
 > formats, detected by magic bytes on the downloaded archive before extraction:
@@ -480,26 +529,53 @@ Grammar: `member "<name>"`
 
 ### 3.4  The `overrides` block
 
-> NORMATIVE (S8 — RFC #23 §3.3): The `overrides` block contains zero or more
-> override rules. Each child MUST be named `pkg`. The positional argument is the
-> match name. Each `pkg` rule MUST carry **exactly one** provenance target form
-> from the following three:
+> NORMATIVE (S8/S8b — RFC #23 §3.3, complete per `rfc-origin-as-identity.md`
+> §7 B5): The `overrides` block contains zero or more override rules. Each
+> child MUST be named `pkg`. The positional argument is the match name.
+> `overrides {}` is milpa's **sole** source-rebind bridge (`spec/resolver-
+> semantics.md` §10.3 — the Cargo-`[patch]` mechanism): for the "sole bridge"
+> claim to hold, every fetchable origin kind MUST have a corresponding target
+> form. Each `pkg` rule MUST carry **exactly one** provenance target form
+> from the following six:
 >
-> - **Git form:** `pkg "<name>" git=(url)"<URL>" ref="<ref>"` — redirect to a git
->   fork. `git=` (URL-annotated string) and `ref=` (string) are both required.
->   Missing `ref=` raises `MAN-OVERRIDE-REF-MISSING`.
-> - **Local form:** `pkg "<name>" local="<relative-path>"` — redirect to a local
->   filesystem path (non-reproducible; see §3.3 carve-out in RFC #23).
+> - **Git form:** `pkg "<name>" git=(url)"<URL>" ref="<ref>" [subpath="<p>"]`
+>   — redirect to a git fork. `git=` (URL-annotated string) and `ref=`
+>   (string) are both required. Missing `ref=` raises
+>   `MAN-OVERRIDE-REF-MISSING`.
+> - **Local form:** `pkg "<name>" local="<relative-path>"` — redirect to a
+>   local filesystem path (non-reproducible; see §3.3 carve-out in RFC #23).
+>   No `subpath=` (a local path already names an exact directory).
 > - **Member form:** `pkg "<name>" { member "<member-name>" }` — redirect to a
 >   workspace member. The `member` child takes exactly one positional string
->   argument (the member name).
+>   argument (the member name). No `subpath=`.
+> - **OCI form:** `pkg "<name>" oci="<registry>/<repository>" digest="sha256:<hex>" [subpath="<p>"]`
+>   — redirect to an OCI artifact. `oci=` MUST be a non-empty
+>   `<registry>/<repository>` string (missing/malformed raises
+>   `MAN-OVERRIDE-OCI-MALFORMED`); `digest=` is required (missing raises
+>   `MAN-OVERRIDE-DIGEST-MISSING`). Digest-format validation
+>   (`sha256:<64-hex>`) happens at resolve/fetch time, not here.
+> - **Tarball form:** `pkg "<name>" tarball=(url)"<URL>" [sha256="<hex>"] [strip_components=<N>] [subpath="<p>"]`
+>   — redirect to a tarball URL. Same optional `sha256=`/`strip_components=`
+>   fields as a TarballDep (§3.2).
+> - **Registry form:** `pkg "<name>" named="<registry-name>" [namespace="<ns>"]`
+>   — redirect a direct-source dep (or another registry coordinate) TO a
+>   tianguis registry coordinate. `named=` MUST be non-empty (missing/empty
+>   raises `MAN-OVERRIDE-NAMED-MISSING`); `namespace=` is optional.
 >
-> Zero target forms, or more than one form simultaneously (e.g. both `local=` and
-> `git=`), raise `MAN-OVERRIDE-TARGET-AMBIGUOUS`.
+> `subpath=`, when present, MUST reject `..`-traversal and absolute paths
+> (mirrors `EXTRACT-ZIP-SLIP`/the `SourceId` escape guard,
+> `rfc-origin-as-identity.md` §4.1); it is valid ONLY on the git/oci/tarball
+> forms — present on any other form, or malformed, raises
+> `MAN-OVERRIDE-UNKNOWN-PROPS`.
+>
+> Zero target forms, or more than one form simultaneously (e.g. both `local=`
+> and `git=`), raise `MAN-OVERRIDE-TARGET-AMBIGUOUS`.
 >
 > Other error codes: unknown override kind → `MAN-OVERRIDE-KIND`; wrong arity →
 > `MAN-OVERRIDE-ARITY`; duplicate name → `MAN-OVERRIDE-DUPLICATE`; unknown property
-> → `MAN-OVERRIDE-UNKNOWN-PROPS` (known properties: `git`, `ref`, `local`, `version`).
+> → `MAN-OVERRIDE-UNKNOWN-PROPS` (known properties across all six forms: `git`,
+> `ref`, `local`, `oci`, `digest`, `tarball`, `sha256`, `strip_components`,
+> `named`, `namespace`, `subpath`, `version`).
 
 > NORMATIVE (resolution-semantics RFC §3 Axis A (b) step 4, D-A3): A `pkg`
 > override rule MAY additionally carry a `version="x.y.z"` property,
@@ -508,7 +584,11 @@ Grammar: `member "<name>"`
 > the redirected target's declared version, the same annotation concept as
 > the dep-form `version=` above, but attached to the override rule because a
 > purely transitive dep has no dep declaration of its own to annotate. A
-> malformed value raises `MAN-DEP-VERSION-INVALID`.
+> malformed value raises `MAN-DEP-VERSION-INVALID`. On the **registry** form
+> specifically, `version=` composes as an exact (`==`) solver constraint on
+> the redirected coordinate rather than merely a declared-version label (a
+> registry dep's version is never ambiguous, §resolver-semantics §3.2, so
+> there is no label to supply — the annotation instead pins the lookup).
 >
 > **Composition rule:** when a `pkg` rule redirects a dep, the declared-version
 > precedence (steps 1-4) re-runs against the *override target's* manifest, and
@@ -523,14 +603,32 @@ Grammar: `member "<name>"`
 >     pkg "stew" {
 >         member "stew"
 >     }
+>     pkg "widget" oci="ghcr.io/example/widget" digest="sha256:<64hex>" subpath="pkg/widget"
+>     pkg "gadget" tarball=(url)"https://example.com/gadget-1.4.0.tar.gz" sha256="<hex>"
+>     pkg "acme-chronos-fork" named="chronos" namespace="acme"
 > }
 > ```
 
 > NORMATIVE: An override applies project-wide (manifest-direct deps, transitive
 > URL deps, and named deps with the matching name). It does NOT propagate to
-> downstream consumers of this project. Overrides change provenance; identity
-> follows the target kind's rules (git: identity-bearing + CAS-admissible; local:
-> liveness-only; member: identity-bearing, not CAS-admissible).
+> downstream consumers of this project. Overrides change the target's origin
+> (`SourceId`, `rfc-origin-as-identity.md` §3/§4.1); identity/CAS-admissibility
+> follow the target kind's own rules (§identity.md §4.1): git/oci/tarball are
+> identity-bearing + CAS-admissible; local is liveness-only; member is
+> identity-bearing, not CAS-admissible; registry inherits whatever the
+> redirected coordinate's own resolved transport is.
+>
+> **Binding-phase framing** (`spec/resolver-semantics.md` §10.1/§10.3): an
+> override is reconciled against any root dep declaration of the same name
+> BEFORE the binding phase's root claims are constructed — a root dep
+> declaration and a root override for the same name never reach the binding
+> phase as two disagreeing root claims. When an override's target is itself a
+> *different* registry coordinate than the overridden name, the binding
+> phase's grouping key (`DepKey`) stays the overridden name/namespace, while
+> the accepted `SourceId` — and every downstream lockfile/attestation/
+> diagnostic read — describes the new coordinate. An override naming a dep
+> absent from the resolved graph raises no hard error but is flagged
+> non-fatally (`RES-DEAD-OVERRIDE`, `spec/resolver-semantics.md` §10.1).
 
 ### 3.5  The `flags` block
 
@@ -1227,6 +1325,7 @@ deps {
     // URL dep
     <name> git=(url)"<https|http|ssh|git URL>" ref="<git-ref>"
            [version="<x.y.z>"]           // A3b: declared-version annotation
+           [subpath="<relative-path>"]   // rfc-origin-as-identity.md §4.1/§5
            [platform="<token>" | platform=(not)"<token>"]
            [arch="<token>"     | arch=(not)"<token>"]
            [nim="<semver-or-constraint>"]
@@ -1245,7 +1344,8 @@ deps {
     <name> local="<path>" [version="<x.y.z>"]
 
     // Tarball dep
-    <name> tarball=(url)"<URL>" [sha256="<hex>"] [strip_components=<N>] [version="<x.y.z>"]
+    <name> tarball=(url)"<URL>" [sha256="<hex>"] [strip_components=<N>]
+           [version="<x.y.z>"] [subpath="<relative-path>"]
 
     // Workspace-internal member dep
     member "<member-name>"
@@ -1254,6 +1354,19 @@ deps {
     when platform="<token>" [arch="<token>"] ... {
         // any dep forms above
     }
+}
+```
+
+```kdl
+// overrides block — the sole source-rebind bridge (rfc-origin-as-identity.md
+// §7 B5); exactly one target form per rule, all six shown:
+overrides {
+    pkg "<name>" git=(url)"<URL>" ref="<ref>" [subpath="<p>"] [version="<x.y.z>"]
+    pkg "<name>" local="<relative-path>" [version="<x.y.z>"]
+    pkg "<name>" { member "<member-name>" }
+    pkg "<name>" oci="<registry>/<repository>" digest="sha256:<hex>" [subpath="<p>"] [version="<x.y.z>"]
+    pkg "<name>" tarball=(url)"<URL>" [sha256="<hex>"] [strip_components=<N>] [subpath="<p>"] [version="<x.y.z>"]
+    pkg "<name>" named="<registry-name>" [namespace="<ns>"] [version="<x.y.z>"]
 }
 ```
 

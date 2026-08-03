@@ -617,6 +617,25 @@ class TestMirrors:
         )
 
 
+class TestProvides:
+    """S7 (rfc-origin-as-identity.md §4.6): top-level provides {} round-trips."""
+
+    def test_provides_round_trip(self) -> None:
+        m = Manifest(name="pkg", deps=(), provides=("foo",))
+        reparsed = parse_manifest(format_manifest(m))
+        assert reparsed.provides == ("foo",)
+
+    def test_multiple_provides_round_trip(self) -> None:
+        m = Manifest(name="pkg", deps=(), provides=("foo", "foo/bar"))
+        reparsed = parse_manifest(format_manifest(m))
+        assert reparsed.provides == ("foo", "foo/bar")
+
+    def test_absent_provides_round_trip(self) -> None:
+        m = Manifest(name="pkg", deps=())
+        reparsed = parse_manifest(format_manifest(m))
+        assert reparsed.provides == ()
+
+
 class TestCasDir:
     """cas { dir } block round-trips correctly."""
 

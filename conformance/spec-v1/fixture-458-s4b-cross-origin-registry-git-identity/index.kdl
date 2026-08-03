@@ -1,0 +1,12 @@
+schema_version 1
+package "chronos" {
+    version "1.0.0" {
+        content_hash "dag-sha256:bf96b8218ab368e242f81123dd8de4d52bfc53a100f755737a08196d86f15b64"
+        provenance {
+            kind "git"
+            url "https://example.com/chronos.git"
+            ref "v1.0.0"
+            commit_sha "1111111111111111111111111111111111111111"
+        }
+    }
+}

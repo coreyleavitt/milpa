@@ -3,6 +3,10 @@ version 1
 strategy "maxver"
 
 dep "dep-git" {
+    source {
+        kind "git"
+        url (url)"https://example.com/shared"
+    }
     identity "dag-sha256:bf96b8218ab368e242f81123dd8de4d52bfc53a100f755737a08196d86f15b64"
     version "0.0.0"
     src_dir "src"
@@ -14,5 +18,11 @@ dep "dep-git" {
         url "https://example.com/shared.git"
         ref "main"
         commit_sha "abcdef1234567890abcdef1234567890abcdef12"
+    }
+    provenance {
+        origin "observed"
+        kind "tarball"
+        url "https://example.com/shared.tar.gz"
+        sha256 "<TARBALL-SHA256>"
     }
 }

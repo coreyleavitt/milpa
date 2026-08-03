@@ -38,6 +38,40 @@ fn invalid(msg: impl Into<String>) -> MilpaError {
     MilpaError::Core(CoreError::Resolver("CLI-SOURCE-SPEC-INVALID", msg.into()))
 }
 
+/// Split an `<registry>/<repository>` token on its FIRST `/`.
+///
+/// Single source of truth for milpa's `oci=` grammar: the registry is
+/// everything before the first `/`, the repository is everything after
+/// (which may itself contain further `/` separators, e.g.
+/// `ghcr.io/coreyleavitt/z3` -> `("ghcr.io", "coreyleavitt/z3")`). Mirrors
+/// Python's `split_oci_target` (`source_spec.py`).
+///
+/// Shared by `parse_source_spec`'s `oci=` branch (below). (Round-2.5,
+/// rfc-origin-as-identity.md §4.1: `source_id::parse` — which used to share
+/// this splitter, F8 — is deleted; `SourceId` no longer parses a flat
+/// string back into typed fields, so `OciSourceId`'s `registry`/`repository`
+/// are carried as already-separate fields end to end.)
+///
+/// # Errors
+/// Returns `MilpaError` (slug `CLI-SOURCE-SPEC-INVALID`) when *token*
+/// contains no `/`, or either side of the split is empty (`"ghcr.io/"`,
+/// `"/pkg"`, `"/"`).
+pub fn split_oci_target(token: &str) -> Result<(String, String), MilpaError> {
+    let Some(slash_pos) = token.find('/') else {
+        return Err(invalid(format!(
+            "registry/repository reference must contain '/'; got {token:?}"
+        )));
+    };
+    let (registry, repository) = (&token[..slash_pos], &token[slash_pos + 1..]);
+    if registry.is_empty() || repository.is_empty() {
+        return Err(invalid(format!(
+            "registry/repository reference must have a non-empty registry AND \
+             a non-empty repository on either side of the first '/'; got {token:?}"
+        )));
+    }
+    Ok((registry.to_string(), repository.to_string()))
+}
+
 /// Parse CLI source-spec tokens into a [`Provenance`] for `milpa hash`.
 ///
 /// # Parameters
@@ -140,16 +174,20 @@ pub fn parse_source_spec<S: AsRef<str>>(
                 "oci= value has empty digest (nothing after '@'); got {raw_oci:?}"
             )));
         }
-        // Split registry/repository on the first '/'.
-        let Some(slash_pos) = ref_part.find('/') else {
+        // Split registry/repository on the first '/' (SSOT: split_oci_target).
+        // R2-L1 (mirrors Python): only the genuine no-slash case gets the
+        // "oci=" -prefixed message here; any OTHER failure (empty registry
+        // or repository) is split_oci_target's own MilpaError, already
+        // carrying an accurate message and the CLI-SOURCE-SPEC-INVALID
+        // slug, so it is propagated unwrapped rather than reworded.
+        if !ref_part.contains('/') {
             return Err(invalid(format!(
                 "oci= registry/repository reference must contain '/'; got {ref_part:?}"
             )));
-        };
-        let registry = &ref_part[..slash_pos];
-        let repository = &ref_part[slash_pos + 1..];
+        }
+        let (registry, repository) = split_oci_target(ref_part)?;
         // Validate registry and repository: must not begin with '-' (TNG-UNSAFE-OCI-FIELD).
-        for (field_name, field_val) in [("registry", registry), ("repository", repository)] {
+        for (field_name, field_val) in [("registry", &registry), ("repository", &repository)] {
             if field_val.starts_with('-') {
                 return Err(invalid(format!(
                     "oci= {field_name} {field_val:?} must not begin with '-'"
@@ -166,8 +204,8 @@ pub fn parse_source_spec<S: AsRef<str>>(
             )));
         }
         return Ok(Provenance::Oci {
-            registry: registry.to_string(),
-            repository: repository.to_string(),
+            registry,
+            repository,
             digest: digest.to_string(),
             // Manifest `oci=` dep declarations have no `source` concept
             // (registry-protocol §3.3's manifest-grammar carve-out) — always

@@ -28,6 +28,7 @@ from milpa.manifest import (
     Dep,
     parse_manifest,
 )
+from milpa.registry import GitIndexProvenance, Index, IndexVersion, Package
 from milpa.resolver import resolve, resolve_workspace
 from milpa.version import Strategy
 
@@ -302,6 +303,66 @@ class TestRequiresRewrittenToCanonical:
 
 
 # ---------------------------------------------------------------------------
+# Test 3b: S3a-req — the collapse is VISIBLE (RFC origin-as-identity.md §4.7/B3)
+#
+# When the slot projection drops a declared label ("bar"), resolve() must
+# emit a low-severity note to stderr naming BOTH labels and the origin they
+# share — never a silent disappearance.
+# ---------------------------------------------------------------------------
+
+
+class TestAliasCollapseNoteIsVisible:
+    """resolve() emits a note when a declared label is dropped by dedup."""
+
+    def test_resolve_emits_collapse_note_to_stderr(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        mocked_dir = tmp_path / "mocked-fetches"
+        shared_kdl = 'name "shared"\nkind "library"\nsrc_dir "src"\n'
+        _write_mock_fetch_milpa_kdl(
+            mocked_dir, "https://example.com/foo.git", "main", "foo", shared_kdl, "sha-foo"
+        )
+        _write_mock_fetch_milpa_kdl(
+            mocked_dir, "https://example.com/bar.git", "main", "bar", shared_kdl, "sha-bar"
+        )
+
+        env = _make_env(mocked_dir, tmp_path)
+        m = _manifest([
+            _url_dep("foo", "https://example.com/foo.git"),
+            _url_dep("bar", "https://example.com/bar.git"),
+        ])
+        deps_dir = tmp_path / "_deps"
+        resolve(m, deps_dir=deps_dir, env=env, params=ResolveParams())
+
+        err = capsys.readouterr().err
+        assert "'bar'" in err and "'foo'" in err, (
+            f"expected a collapse note naming both 'bar' and 'foo' on stderr, got:\n{err!r}"
+        )
+        assert "git+https://example.com/foo.git" in err, (
+            f"expected the shared origin in the note, got:\n{err!r}"
+        )
+        assert "used 'foo'" in err, (
+            f"expected the note to say which label survived, got:\n{err!r}"
+        )
+
+    def test_no_dedup_no_note(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """No collapse occurred → no note printed (regression guard: not chatty)."""
+        mocked_dir = tmp_path / "mocked-fetches"
+        kdl_a = 'name "alpha"\nkind "library"\nsrc_dir "src"\n'
+        _write_mock_fetch_milpa_kdl(mocked_dir, "https://example.com/alpha.git", "main", "alpha", kdl_a, "sha-a")
+
+        env = _make_env(mocked_dir, tmp_path)
+        m = _manifest([_url_dep("alpha", "https://example.com/alpha.git")])
+        deps_dir = tmp_path / "_deps"
+        resolve(m, deps_dir=deps_dir, env=env, params=ResolveParams())
+
+        err = capsys.readouterr().err
+        assert "both name" not in err, f"no collapse occurred; unexpected note:\n{err!r}"
+
+
+# ---------------------------------------------------------------------------
 # Test 4: different content → NOT merged
 # ---------------------------------------------------------------------------
 
@@ -389,6 +450,70 @@ class TestThreeNamesSameContent:
 # ---------------------------------------------------------------------------
 
 
+def _make_dedup_workspace(tmp_path: Path, mocked_dir: Path) -> "object":
+    """Build a minimal LoadedWorkspace with two members each requiring a dep
+    that fetches to identical byte content — member-a declares it "foo",
+    member-b declares the SAME url/content under the DIFFERENT label "bar".
+    """
+    from milpa.manifest import Manifest
+    from milpa.workspace import LoadedMember, LoadedWorkspace, WorkspaceManifest
+
+    shared_kdl = 'name "shared"\nkind "library"\nsrc_dir "src"\n'
+    _write_mock_fetch_milpa_kdl(
+        mocked_dir, "https://example.com/foo.git", "main", "foo", shared_kdl, "sha-foo"
+    )
+    _write_mock_fetch_milpa_kdl(
+        mocked_dir, "https://example.com/bar.git", "main", "bar", shared_kdl, "sha-bar"
+    )
+
+    def _manifest_for(name: str, dep_name: str, dep_url: str) -> Manifest:
+        return Manifest(
+            name=name,
+            kind="library",
+            src_dir="src",
+            deps=[_url_dep(dep_name, dep_url)],
+            dev_deps=[],
+            overrides=[],
+            flags=[],
+            self_mirrors=[],
+            cas_dir="",
+            spec_version=1,
+            spec_version_explicit=False,
+            attestation_policy=None,
+        )
+
+    # Create fake member dirs so compute_content_hash has something to hash.
+    member_a_dir = tmp_path / "member-a"
+    member_a_dir.mkdir()
+    (member_a_dir / "milpa.kdl").write_text(
+        'name "pkg-a"\nkind "library"\nsrc_dir "src"\n', encoding="utf-8"
+    )
+    member_b_dir = tmp_path / "member-b"
+    member_b_dir.mkdir()
+    (member_b_dir / "milpa.kdl").write_text(
+        'name "pkg-b"\nkind "library"\nsrc_dir "src"\n', encoding="utf-8"
+    )
+
+    ws_manifest = WorkspaceManifest(members=("member-a", "member-b"), overrides=())
+    members = (
+        LoadedMember(
+            rel_path="member-a",
+            abs_dir=member_a_dir,
+            manifest=_manifest_for("pkg-a", "foo", "https://example.com/foo.git"),
+        ),
+        LoadedMember(
+            rel_path="member-b",
+            abs_dir=member_b_dir,
+            manifest=_manifest_for("pkg-b", "bar", "https://example.com/bar.git"),
+        ),
+    )
+    return LoadedWorkspace(
+        root_dir=tmp_path,
+        workspace_manifest=ws_manifest,
+        members=members,
+    )
+
+
 class TestWorkspaceDedupSameContent:
     """resolve_workspace() collapses byte-identical external deps from different members."""
 
@@ -397,66 +522,7 @@ class TestWorkspaceDedupSameContent:
         tmp_path: Path,
         mocked_dir: Path,
     ) -> "object":
-        """Build a minimal LoadedWorkspace with two members each requiring a dep
-        that fetches to identical byte content.
-        """
-        from milpa.manifest import Manifest
-        from milpa.workspace import LoadedMember, LoadedWorkspace, WorkspaceManifest
-
-        shared_kdl = 'name "shared"\nkind "library"\nsrc_dir "src"\n'
-        _write_mock_fetch_milpa_kdl(
-            mocked_dir, "https://example.com/foo.git", "main", "foo", shared_kdl, "sha-foo"
-        )
-        _write_mock_fetch_milpa_kdl(
-            mocked_dir, "https://example.com/bar.git", "main", "bar", shared_kdl, "sha-bar"
-        )
-
-        def _manifest_for(name: str, dep_name: str, dep_url: str) -> Manifest:
-            return Manifest(
-                name=name,
-                kind="library",
-                src_dir="src",
-                deps=[_url_dep(dep_name, dep_url)],
-                dev_deps=[],
-                overrides=[],
-                flags=[],
-                self_mirrors=[],
-                cas_dir="",
-                spec_version=1,
-                spec_version_explicit=False,
-                attestation_policy=None,
-            )
-
-        # Create fake member dirs so compute_content_hash has something to hash.
-        member_a_dir = tmp_path / "member-a"
-        member_a_dir.mkdir()
-        (member_a_dir / "milpa.kdl").write_text(
-            'name "pkg-a"\nkind "library"\nsrc_dir "src"\n', encoding="utf-8"
-        )
-        member_b_dir = tmp_path / "member-b"
-        member_b_dir.mkdir()
-        (member_b_dir / "milpa.kdl").write_text(
-            'name "pkg-b"\nkind "library"\nsrc_dir "src"\n', encoding="utf-8"
-        )
-
-        ws_manifest = WorkspaceManifest(members=("member-a", "member-b"), overrides=())
-        members = (
-            LoadedMember(
-                rel_path="member-a",
-                abs_dir=member_a_dir,
-                manifest=_manifest_for("pkg-a", "foo", "https://example.com/foo.git"),
-            ),
-            LoadedMember(
-                rel_path="member-b",
-                abs_dir=member_b_dir,
-                manifest=_manifest_for("pkg-b", "bar", "https://example.com/bar.git"),
-            ),
-        )
-        return LoadedWorkspace(
-            root_dir=tmp_path,
-            workspace_manifest=ws_manifest,
-            members=members,
-        )
+        return _make_dedup_workspace(tmp_path, mocked_dir)
 
     def test_workspace_external_dedup_single_canonical(self, tmp_path: Path) -> None:
         """Two workspace members → same-content external deps → one canonical node."""
@@ -506,6 +572,69 @@ class TestWorkspaceDedupSameContent:
         )
         assert "bar" not in pkg_b.requires, (
             f"pkg-b.requires should NOT contain 'bar' (aliased), got {pkg_b.requires!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Test 6b: S3a-req — the diamond-under-two-labels regression, at the nim.cfg
+# layer (RFC origin-as-identity.md §4.7/B3, spec/cli-contract.md §10 anchor
+# nimcfg.py:236's dep_by_name / _member_dep_closure).
+#
+# member-b declared its dep under the label "bar", which dedup then aliased
+# away in favor of member-a's "foo".  `_member_dep_closure` walks member-b's
+# OWN `requires` tuple through `dep_by_name` (keyed by CANONICAL name only)
+# — if `requires` still named the dropped label, the lookup would silently
+# return nothing and member-b's nim.cfg would be missing a --path: line for
+# its own (aliased) dependency.  This proves the closure does NOT drop it.
+# ---------------------------------------------------------------------------
+
+
+class TestWorkspaceNimcfgClosureSurvivesCollapse:
+    """member-b's nim.cfg --path: closure still includes the collapsed dep."""
+
+    def test_member_b_nimcfg_has_path_for_canonical_dep(self, tmp_path: Path) -> None:
+        from milpa.nimcfg import format_workspace_nimcfgs
+
+        mocked_dir = tmp_path / "mocked-fetches"
+        ws = _make_dedup_workspace(tmp_path, mocked_dir)
+        env = _make_env(mocked_dir, tmp_path)
+
+        deps_dir = tmp_path / "_deps"
+        graph = resolve_workspace(ws, deps_dir, env, ResolveParams())  # type: ignore[arg-type]
+
+        cfgs = format_workspace_nimcfgs(ws, graph)  # type: ignore[arg-type]
+
+        assert "member-a" in cfgs and "member-b" in cfgs
+        for member_rel, text in cfgs.items():
+            assert '--path:"../_deps/foo/src"' in text, (
+                f"{member_rel}/nim.cfg is missing the canonical dep's --path: "
+                f"line (the silent-drop bug — a requires edge still pointing "
+                f"at the dropped alias 'bar' would leave this out):\n{text}"
+            )
+            # The dropped label must never appear as its own _deps/ path — the
+            # alias's directory content is the SAME tree, but the closure walk
+            # must resolve to the canonical name, not fabricate a 'bar' entry.
+            assert '--path:"../_deps/bar' not in text, (
+                f"{member_rel}/nim.cfg must reference the canonical slot "
+                f"'foo', never the dropped label 'bar':\n{text}"
+            )
+
+    def test_resolve_workspace_emits_collapse_note_to_stderr(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        mocked_dir = tmp_path / "mocked-fetches"
+        ws = _make_dedup_workspace(tmp_path, mocked_dir)
+        env = _make_env(mocked_dir, tmp_path)
+
+        deps_dir = tmp_path / "_deps"
+        resolve_workspace(ws, deps_dir, env, ResolveParams())  # type: ignore[arg-type]
+
+        err = capsys.readouterr().err
+        assert "'bar'" in err and "'foo'" in err, (
+            f"expected a collapse note naming both 'bar' and 'foo' on stderr, got:\n{err!r}"
+        )
+        assert "used 'foo'" in err, (
+            f"expected the note to say which label survived, got:\n{err!r}"
         )
 
 
@@ -651,3 +780,233 @@ class TestWorkspaceCrossPkgEnableFixpoint:
             f"member-a.active_flags must be empty (internal resolver state, not lockfile-pinnable); "
             f"got {member_a.active_flags!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Test 8: S4b — cross-origin dedup (RFC origin-as-identity.md §3.3/§4.5)
+#
+# Phase B's original dedup pass only ever grouped EAGERLY-fetched (git/
+# tarball/local) candidates by content_hash — a NAMED (registry-resolved) dep
+# is a lazy stub until the solver actually queries its dependencies, so it
+# never carried an identity at the pre-solve point the old pass ran. S4b
+# moves the pass to run POST-solve, over the solver's final picks only, which
+# is exactly what lets a distinct SOURCE-ID (a RegistrySourceId coordinate,
+# not just another git= label) participate: milpa's §3.3 headline win —
+# "two distinct origins that fetch byte-identical trees collapse to one
+# canonical dep, never by heuristic, only by proven-identical bytes."
+# ---------------------------------------------------------------------------
+
+
+def _index_with_git_backed_named_dep(
+    *, name: str, version: str, url: str, ref: str, content_hash: str,
+) -> Index:
+    """A minimal Index with one named package whose sole version is backed
+    by a GitIndexProvenance — the registry-resolved side of a cross-origin
+    dedup group (materialized via the SAME git-URL fetch path a plain
+    ``git=`` dep uses, just reached through the registry instead)."""
+    return Index(
+        packages=[
+            Package(
+                name=name,
+                namespace="",
+                versions=(
+                    IndexVersion(
+                        version=version,
+                        content_hash=content_hash,
+                        provenances=(
+                            GitIndexProvenance(url=url, ref=ref, commit_sha=None),
+                        ),
+                    ),
+                ),
+            )
+        ]
+    )
+
+
+def _make_env_with_index(mocked_dir: Path, tmp_path: Path, index: Index | None) -> MilpaEnv:
+    cas_root = tmp_path / ".cas"
+    cas_root.mkdir(parents=True, exist_ok=True)
+    store = CAStore(cas_root)
+    inner = mocked_registry(mocked_dir)
+    fetcher = CasAdmittingFetcher(inner, store)
+    return MilpaEnv(fetcher=fetcher, index=index, store=store)
+
+
+class TestCrossOriginDedupRegistryAndGit:
+    """(a) A RegistrySourceId (named dep) and a GitSourceId (git= dep) that
+    fetch byte-identical trees collapse to ONE dep, carrying BOTH origins'
+    observed provenance — never just the survivor's."""
+
+    def test_registry_and_git_identical_content_collapse_to_one_dep(
+        self, tmp_path: Path
+    ) -> None:
+        mocked_dir = tmp_path / "mocked-fetches"
+        shared_kdl = 'name "shared"\nkind "library"\nsrc_dir "src"\n'
+        # The registry-backed candidate is materialized via the SAME git
+        # fetch path (url@ref) a plain git= dep uses — just reached through
+        # the index instead of the manifest directly.
+        _write_mock_fetch_milpa_kdl(
+            mocked_dir, "https://example.com/chronos.git", "v1.0.0",
+            "chronos", shared_kdl, "sha-registry",
+        )
+        _write_mock_fetch_milpa_kdl(
+            mocked_dir, "https://example.com/chronos-fork.git", "main",
+            "chronos-fork", shared_kdl, "sha-fork",
+        )
+
+        index = _index_with_git_backed_named_dep(
+            name="chronos",
+            version="1.0.0",
+            url="https://example.com/chronos.git",
+            ref="v1.0.0",
+            content_hash="sha256:" + "a" * 64,
+        )
+        env = _make_env_with_index(mocked_dir, tmp_path, index)
+
+        m = _manifest([
+            NamedDep(name="chronos", constraint=None),
+            _url_dep("chronos-fork", "https://example.com/chronos-fork.git"),
+        ])
+        deps_dir = tmp_path / "_deps"
+        graph = resolve(m, deps_dir=deps_dir, env=env, params=ResolveParams())
+
+        assert len(graph.deps) == 1, (
+            f"expected 1 dep after cross-origin collapse, got "
+            f"{[d.name for d in graph.deps]}"
+        )
+        dep = graph.deps[0]
+        assert {dep.name} | set(dep.aliases) == {"chronos", "chronos-fork"}, (
+            f"expected 'chronos'/'chronos-fork' as canonical+alias, got "
+            f"name={dep.name!r} aliases={dep.aliases!r}"
+        )
+
+    def test_both_origins_provenance_survive(self, tmp_path: Path) -> None:
+        """The collapsed dep's provenance list carries BOTH origins' observed
+        record — the registry's git URL AND the direct git= dep's git URL —
+        never only the canonical survivor's."""
+        mocked_dir = tmp_path / "mocked-fetches"
+        shared_kdl = 'name "shared"\nkind "library"\nsrc_dir "src"\n'
+        _write_mock_fetch_milpa_kdl(
+            mocked_dir, "https://example.com/chronos.git", "v1.0.0",
+            "chronos", shared_kdl, "sha-registry",
+        )
+        _write_mock_fetch_milpa_kdl(
+            mocked_dir, "https://example.com/chronos-fork.git", "main",
+            "chronos-fork", shared_kdl, "sha-fork",
+        )
+
+        index = _index_with_git_backed_named_dep(
+            name="chronos",
+            version="1.0.0",
+            url="https://example.com/chronos.git",
+            ref="v1.0.0",
+            content_hash="sha256:" + "a" * 64,
+        )
+        env = _make_env_with_index(mocked_dir, tmp_path, index)
+
+        m = _manifest([
+            NamedDep(name="chronos", constraint=None),
+            _url_dep("chronos-fork", "https://example.com/chronos-fork.git"),
+        ])
+        deps_dir = tmp_path / "_deps"
+        graph = resolve(m, deps_dir=deps_dir, env=env, params=ResolveParams())
+
+        assert len(graph.deps) == 1
+        dep = graph.deps[0]
+        urls = {p.url for p in dep.provenances if hasattr(p, "url")}
+        assert urls == {
+            "https://example.com/chronos.git",
+            "https://example.com/chronos-fork.git",
+        }, (
+            f"expected BOTH origins' observed provenance to survive the "
+            f"collapse, got: {dep.provenances!r}"
+        )
+        # Sanity: no provenance was silently dropped down to just one.
+        assert len(dep.provenances) == 2, (
+            f"expected exactly 2 provenance records (one per collapsed "
+            f"origin), got {len(dep.provenances)}: {dep.provenances!r}"
+        )
+
+    def test_lockfile_emits_both_provenances(self, tmp_path: Path) -> None:
+        """The lockfile text carries two 'observed' git provenance blocks —
+        one per collapsed origin — for the single surviving dep."""
+        mocked_dir = tmp_path / "mocked-fetches"
+        shared_kdl = 'name "shared"\nkind "library"\nsrc_dir "src"\n'
+        _write_mock_fetch_milpa_kdl(
+            mocked_dir, "https://example.com/chronos.git", "v1.0.0",
+            "chronos", shared_kdl, "sha-registry",
+        )
+        _write_mock_fetch_milpa_kdl(
+            mocked_dir, "https://example.com/chronos-fork.git", "main",
+            "chronos-fork", shared_kdl, "sha-fork",
+        )
+
+        index = _index_with_git_backed_named_dep(
+            name="chronos",
+            version="1.0.0",
+            url="https://example.com/chronos.git",
+            ref="v1.0.0",
+            content_hash="sha256:" + "a" * 64,
+        )
+        env = _make_env_with_index(mocked_dir, tmp_path, index)
+
+        m = _manifest([
+            NamedDep(name="chronos", constraint=None),
+            _url_dep("chronos-fork", "https://example.com/chronos-fork.git"),
+        ])
+        deps_dir = tmp_path / "_deps"
+        graph = resolve(m, deps_dir=deps_dir, env=env, params=ResolveParams())
+
+        from milpa.lockfile import format_lockfile
+        lock = from_graph(graph)
+        text = format_lockfile(lock)
+        assert text.count('url "https://example.com/chronos.git"') == 1
+        assert text.count('url "https://example.com/chronos-fork.git"') == 1
+        assert 'aliases "chronos-fork"' in text
+
+
+class TestCrossOriginNoDedupForDifferentContent:
+    """(b) A named (registry) dep and a git= dep with DIFFERENT content must
+    NEVER be merged — merge-on-proof only fires on identical bytes."""
+
+    def test_registry_and_git_different_content_never_merged(
+        self, tmp_path: Path
+    ) -> None:
+        mocked_dir = tmp_path / "mocked-fetches"
+        kdl_registry = 'name "chronos"\nkind "library"\nsrc_dir "src"\n'
+        kdl_fork = 'name "chronos-fork"\nkind "library"\nsrc_dir "src"\n'
+        _write_mock_fetch_milpa_kdl(
+            mocked_dir, "https://example.com/chronos.git", "v1.0.0",
+            "chronos", kdl_registry, "sha-registry",
+        )
+        _write_mock_fetch_milpa_kdl(
+            mocked_dir, "https://example.com/chronos-fork.git", "main",
+            "chronos-fork", kdl_fork, "sha-fork",
+        )
+
+        index = _index_with_git_backed_named_dep(
+            name="chronos",
+            version="1.0.0",
+            url="https://example.com/chronos.git",
+            ref="v1.0.0",
+            content_hash="sha256:" + "b" * 64,
+        )
+        env = _make_env_with_index(mocked_dir, tmp_path, index)
+
+        m = _manifest([
+            NamedDep(name="chronos", constraint=None),
+            _url_dep("chronos-fork", "https://example.com/chronos-fork.git"),
+        ])
+        deps_dir = tmp_path / "_deps"
+        graph = resolve(m, deps_dir=deps_dir, env=env, params=ResolveParams())
+
+        names = {d.name for d in graph.deps}
+        assert "chronos" in names and "chronos-fork" in names, (
+            f"different-content cross-origin deps must not be merged; got: {names}"
+        )
+        assert len(graph.deps) == 2, f"expected 2 deps, got {len(graph.deps)}: {names}"
+        for dep in graph.deps:
+            assert dep.aliases == (), (
+                f"dep {dep.name!r} should have no aliases (never merged), "
+                f"got {dep.aliases!r}"
+            )

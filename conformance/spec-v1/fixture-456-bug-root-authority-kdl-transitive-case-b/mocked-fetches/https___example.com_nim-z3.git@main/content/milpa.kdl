@@ -1,0 +1,3 @@
+name "nim-z3"
+kind "library"
+src_dir "src"

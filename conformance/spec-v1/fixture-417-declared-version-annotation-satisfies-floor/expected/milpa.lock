@@ -3,6 +3,10 @@ version 1
 strategy "maxver"
 
 dep "bearssl" {
+    source {
+        kind "git"
+        url (url)"https://example.com/bearssl"
+    }
     identity "dag-sha256:545da43b72a5d48cb3b6e48bda53f4fc7af89c0c7c4da0b3f5467fb4673b85f6"
     version "0.5.0"
     declared_version_source "annotation"
@@ -18,6 +22,10 @@ dep "bearssl" {
 }
 
 dep "chronos" {
+    source {
+        kind "git"
+        url (url)"https://example.com/chronos"
+    }
     identity "dag-sha256:61148f9214c0c15a01362979f98fcd7e5d07c0eb6b19d3e3777082338646bf3d"
     version "0.0.0"
     src_dir ""

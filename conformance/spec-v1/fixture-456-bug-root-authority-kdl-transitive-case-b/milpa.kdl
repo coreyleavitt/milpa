@@ -1,0 +1,22 @@
+// fixture-456: BUG-root-authority-kdl-transitive.md case B.
+//
+// A root direct dep ("softlink") shares its exact source (URL+ref) with a
+// claim declared inside ANOTHER fetched dep's OWN milpa.kdl ("proptest",
+// which itself declares "nim-z3" and "softlink" as git deps). Pre RFC
+// origin-as-identity (docs/rfc-origin-as-identity.md), the old
+// provenance_gate/TIER_* side-table left the BFS holding requirement edges
+// whose candidate universe was never populated when the transitive kdl claim
+// was deduped against root's own claim — collapsing resolution for
+// "softlink", "proptest" itself, AND the UNRELATED sibling dep "nim-z3"
+// (SOLVE-CONFLICT reporting every root term as unsatisfiable, even root's
+// own softlink candidate).
+//
+// Expected (post RFC origin-as-identity S3a/S3b BindingResolver): resolves
+// cleanly — all three deps ("proptest", "softlink", "nim-z3") present, with
+// no collateral candidate loss.
+name "t"
+kind "application"
+deps {
+    "proptest" git=(url)"https://example.com/proptest.git" ref="main"
+    "softlink" git=(url)"https://example.com/softlink.git" ref="main"
+}

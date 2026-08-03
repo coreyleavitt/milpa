@@ -615,6 +615,20 @@ dep "pkg" {
 > unknown-node skip behavior) and continue. No lockfile schema version bump is
 > required because the field is purely additive.
 
+> NORMATIVE (RFC origin-as-identity.md §3.3/§4.5, S4b — cross-origin
+> reconciliation): Phase B's dedup pass runs on the resolver's SOLVED graph
+> (post-solve), so it is not limited to same-*kind* origins — a *named*
+> (registry-resolved) dep and a `git=`/`tarball=`/`local=` dep, or two
+> distinct `RegistrySourceId`/`GitSourceId` origins under different manifest
+> names, collapse identically whenever their fetched trees hash the same.
+> When a collapse occurs, the canonical dep's `provenance` block list MUST
+> include **every** collapsed origin's own observed provenance record (§4.0a)
+> — never only the survivor's. A collapse therefore preserves the FULL
+> cross-origin audit trail: given `identity` proves the bytes are the same,
+> the lockfile still records *how* each aliased name got there. See §4.0a's
+> corresponding NORMATIVE clause for the resulting provenance-block-count
+> relaxation.
+
 > NOTE: The conformance fixture `fixture-172-lock-aliases-field` exercises a
 > dep block with `aliases "alpha" "beta"` and pins the byte-exact canonical
 > form via a `lock-roundtrip` round-trip.
@@ -744,6 +758,95 @@ dep "widget" {
 > verified fact. The wording upgrade at that point changes presentation
 > only — this schema does not change.
 
+### 3.10  `source` block (S5, `rfc-origin-as-identity.md` §4.1/§7)
+
+Every dep block carries a `source { … }` node recording its version-
+independent **origin** (the `SourceId` — RFC origin-as-identity.md §4.1) —
+**structured**, with typed children, never a flat parsed string. Positioned
+right after the optional dep-arg `namespace` child (§2.3) and before
+`identity` (§3.1): "where this came from" before "what its content hash is".
+
+```kdl
+dep "nimz3" {
+    source {
+        kind "git"
+        url (url)"https://github.com/coreyleavitt/nim-z3"
+        subpath "pkg/foo"          // omitted when the repo root is used
+    }
+    identity "dag-sha256:<64hex>"
+    version "1.4.0"
+    src_dir ""
+    requires
+}
+
+dep "utils" {
+    namespace "acme"
+    source {
+        kind "registry"
+        registry "tianguis"        // configured alias, never a base URL
+        namespace "acme"           // omitted when unqualified; MAY contain '/'
+        name "utils"
+    }
+    ...
+}
+```
+
+> NORMATIVE: `kind` MUST be exactly one of `git`, `oci`, `tarball`, `local`,
+> `registry`, `member` — a closed set matching `SourceId`'s six-variant union
+> 1:1. Kind-specific children (NORMATIVE, exact field order both impls MUST
+> match byte-for-byte):
+>
+> | `kind` | children (order) |
+> |---|---|
+> | `git` | `url` (req, `(url)`-tagged) / `subpath` (opt) |
+> | `oci` | `registry` (req) / `repository` (req) / `subpath` (opt) |
+> | `tarball` | `url` (req, `(url)`-tagged) / `subpath` (opt) |
+> | `local` | `path` (req) |
+> | `registry` | `registry` (req) / `namespace` (opt) / `name` (req) |
+> | `member` | `name` (req) |
+>
+> A `/`-bearing `registry` namespace (e.g. `codeberg.org/eris`, a real
+> host-qualified tianguis namespace) stores losslessly as an ordinary KDL
+> string value — no splitting, no percent-escaping. `subpath`, when
+> present, is a POSIX-relative path from the fetched tree's root; both
+> impls reject a malformed one (`..`-traversal, absolute) at parse time
+> (`SRC-ID-MALFORMED`, same guard `normalize_source` applies to a fresh
+> resolve — RFC §4.1).
+
+> NORMATIVE: This is the **authoritative on-disk form of the origin** —
+> parsers deserialize it field-by-field directly into the frozen `SourceId`
+> struct (no `parse()`, no flat-string reconstruction of any kind exists in
+> either impl). The `registry` field of a `kind "registry"` block is a
+> **configured alias slug** (`[A-Za-z0-9_-]+`), never a base URL; a lockfile
+> naming an alias absent from this machine's configuration fails closed
+> with `FROZEN-REGISTRY-ALIAS-UNRESOLVED` (§7.1) rather than silently
+> guessing.
+
+> NORMATIVE (repeal-and-replace of the prior `::`-not-on-disk rule,
+> `spec/resolver-semantics.md` §6b): that rule forbade the solver-internal
+> `"ns::name"` qualified-name string from leaking onto disk. It is now
+> trivially satisfied by construction — the on-disk origin is always this
+> structured, typed `source` block, never the solver's own in-memory key
+> (a one-way `canonical(source_id)` string used only as the PubGrub package
+> variable and in diagnostics; RFC §4.4).
+
+> NORMATIVE: A workspace member and a standalone project's own root-self
+> reference (§4.4/§4.5's `member`-kind provenance and `root`-kind provenance
+> respectively) both use `kind "member"` here — from an *origin* perspective
+> a standalone package is a workspace-of-one (RFC §3/§6 "Kept"), conflict-
+> free by construction; the `provenance` block distinguishes the two roles,
+> not `source`.
+
+> NORMATIVE: This block's addition does NOT bump `LOCKFILE_SCHEMA_VERSION`
+> (currently `1`) — same additive-optional-field precedent as `aliases`
+> (§3.8) and `attestation` (§3.9). A pre-S5 lockfile (no `source` block) is
+> forward-compat parseable; the `source_id` field on the in-memory
+> `LockedDep`/`ResolvedDep` is simply `None` for such an entry, and the two
+> new `FROZEN-*` preconditions (§7.1) silently skip a dep with no recorded
+> `source_id` rather than raising. A conformant S5-or-later emitter always
+> writes this block for every dep it produces — omission is a read-
+> compatibility allowance, never a valid write.
+
 ---
 
 ## 4  Provenance block
@@ -803,6 +906,22 @@ prior lockfile appended). It tries candidates in order until one succeeds.
 > NORMATIVE: A dep with no mirrors and no prior declared provenances MUST have
 > exactly one provenance block (`origin "observed"`). A dep with N mirrors MUST
 > have at most N+1 provenance blocks (observed + up to N declared).
+
+> NORMATIVE (interaction with Phase B / §3.8, RFC origin-as-identity.md
+> §3.3/§4.5 — cross-origin content-hash collapse): the "exactly one observed"
+> rule above is scoped to ONE origin's own D-lifecycle assembly (a single
+> `git=`/`named`/`tarball`/`local` dep declaration and its own mirror list).
+> It does NOT bound the total provenance count on a dep that Phase B's
+> content-hash dedup pass collapsed from two or more *distinct* manifest
+> origins (e.g. a `RegistrySourceId` coordinate and a `GitSourceId` URL that
+> both fetch to the same `identity`) — see §3.8. In that case the canonical
+> dep's provenance list is the **union** of each collapsed origin's own
+> (already "exactly one observed" + up to N declared) provenance set, so
+> **more than one** `origin "observed"` block MAY legitimately appear on a
+> single dep. A parser/validator MUST NOT reject a dep block on the grounds
+> that it carries multiple `origin "observed"` blocks; the per-origin
+> "exactly one observed" invariant is enforced at write time per collapsed
+> member, not as a whole-dep-block cap.
 
 ### 4.0  Provenance sort key (canonical order)
 

@@ -260,6 +260,7 @@ fn format_workspace_manifest_url_annotation_on_git_override() {
             target: milpa_manifest::OverrideTarget::Git {
                 url: "https://github.com/example/dep-x.git".into(),
                 git_ref: "main".into(),
+                subpath: None,
             },
             version: None,
         }],
@@ -281,6 +282,7 @@ fn format_workspace_manifest_idempotent() {
             target: milpa_manifest::OverrideTarget::Git {
                 url: "https://github.com/example/dep-x.git".into(),
                 git_ref: "main".into(),
+                subpath: None,
             },
             version: None,
         }],

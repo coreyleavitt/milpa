@@ -3,11 +3,22 @@ version 1
 strategy "maxver"
 
 dep "foo" {
+    source {
+        kind "git"
+        url (url)"https://example.com/foo"
+    }
     identity "dag-sha256:bf96b8218ab368e242f81123dd8de4d52bfc53a100f755737a08196d86f15b64"
     version "0.0.0"
     src_dir "src"
     requires
     aliases "bar"
+    provenance {
+        origin "observed"
+        kind "git"
+        url "https://example.com/bar.git"
+        ref "main"
+        commit_sha "deadbeef02"
+    }
     provenance {
         origin "observed"
         kind "git"

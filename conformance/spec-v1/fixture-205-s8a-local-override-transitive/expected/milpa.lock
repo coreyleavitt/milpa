@@ -3,6 +3,10 @@ version 1
 strategy "maxver"
 
 dep "mylib" {
+    source {
+        kind "local"
+        path "./mylib-fork"
+    }
     version "0.2.0"
     declared_version_source "nimble"
     src_dir ""
@@ -15,6 +19,10 @@ dep "mylib" {
 }
 
 dep "translib" {
+    source {
+        kind "git"
+        url (url)"https://example.com/translib"
+    }
     identity "dag-sha256:51224ffa03f35b2f5987c8654c5fcd8942f9400d9bdb9c8f501fa32b7471ad9b"
     version "0.0.0"
     src_dir "src"

@@ -224,14 +224,19 @@ class TestFrozenCarriesAttestation:
     def test_attestation_namespace_carried_through_frozen_reconstruction(
         self, tmp_path: Path
     ) -> None:
-        # CR13/4: LockAttestation.namespace is populated precisely so the
-        # subject coordinate can be rebuilt offline (milpa verify, RFC §7) —
-        # the frozen reconstruction must carry it back onto
-        # ResolvedDep.registry_namespace, not silently default it to None.
+        # CR13/4 (updated for S5's field-duplication audit,
+        # rfc-origin-as-identity.md §4.4 B2/G10): ``ResolvedDep.
+        # registry_namespace`` is DELETED — the offline subject-
+        # reconstruction namespace now lives on ``source_id.namespace``
+        # (a RegistrySourceId), carried straight through frozen
+        # reconstruction via the lockfile's own structured ``source { … }``
+        # node, never a separate parallel field.
         import dataclasses
 
         from milpa.lockfile import LockAttestation
+        from milpa.manifest import NamedDep
         from milpa.registry import AuthorSigned
+        from milpa.source_id import RegistrySourceId
 
         env, identity = _make_env_with_tree(tmp_path)
         deps_dir = tmp_path / "_deps"
@@ -240,14 +245,22 @@ class TestFrozenCarriesAttestation:
             kind=AuthorSigned(signer="https://example.com/wf.yaml"),
             namespace="ns1",
         )
-        locked = dataclasses.replace(_locked_dep("foo", identity=identity), attestation=att)
+        locked = dataclasses.replace(
+            _locked_dep("foo", identity=identity),
+            attestation=att,
+            source_id=RegistrySourceId(registry="tianguis", namespace="ns1", name="foo"),
+        )
         lockfile = Lockfile(deps=(locked,), strategy="maxver")
-        manifest = _manifest_with_dep("foo")
+        manifest = dataclasses.replace(
+            _manifest_empty(),
+            deps=[NamedDep(name="foo", constraint=None, predicates=[], flag_requests=[])],
+        )
 
         graph = resolve_frozen(manifest, lockfile, env, deps_dir)
 
         dep = graph.deps[0]
-        assert dep.registry_namespace == "ns1"
+        assert isinstance(dep.source_id, RegistrySourceId)
+        assert dep.source_id.namespace == "ns1"
 
     def test_no_attestation_stays_none(self, tmp_path: Path) -> None:
         env, identity = _make_env_with_tree(tmp_path)

@@ -3,6 +3,11 @@ version 1
 strategy "maxver"
 
 dep "anchor" {
+    source {
+        kind "registry"
+        registry "tianguis"
+        name "anchor"
+    }
     identity "dag-sha256:8a66af90364aac8d5aaa2de038af6097c2276c3f26e5df9ae45821b249667fe6"
     version "1.0.0"
     src_dir "src"

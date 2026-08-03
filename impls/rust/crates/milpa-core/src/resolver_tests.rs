@@ -5,20 +5,20 @@
 //! by the resolver from the materialized tree — the fake never reports it.
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use milpa_manifest::{
-    Dep, LocalDep, Manifest, NamedDep, Override, OverrideTarget, Predicate, Profile, TarballDep,
-    UrlDep,
+    Dep, LocalDep, Manifest, MemberDep, NamedDep, Override, OverrideTarget, Predicate, Profile,
+    TarballDep, UrlDep,
 };
 use milpa_solver::Strategy;
 use milpa_types::{
-    parse_iso8601_timestamp, LockedDep, Lockfile, Provenance, ProvenanceRecord, ResolvedDep,
-    ResolvedGraph, Version, LOCKFILE_SCHEMA_VERSION,
+    parse_iso8601_timestamp, FetchableOrigin, LockedDep, Lockfile, Provenance, ProvenanceRecord,
+    ResolvedDep, ResolvedGraph, SourceId, Version, LOCKFILE_SCHEMA_VERSION,
 };
 
-use crate::lockfile::{format_lockfile, from_graph, parse_lockfile};
+use crate::lockfile::{collapse_notes, format_lockfile, from_graph, parse_lockfile};
 
 use crate::error::MilpaError;
 use crate::fetch::{FetchError, FetcherRegistry, Receipt};
@@ -261,7 +261,7 @@ fn tarball_mock(archive_sha: &str, body: &str) -> Mock {
 }
 
 fn tarball_dep(name: &str, url: &str, sha256: Option<&str>) -> Dep {
-    Dep::Tarball(TarballDep {
+    Dep::Tarball(TarballDep { subpath: None,
         name: name.to_string(),
         url: url.to_string(),
         sha256: sha256.map(str::to_string),
@@ -286,7 +286,7 @@ fn tarball_reg(mocks: &[(&str, Mock)]) -> FakeReg {
 }
 
 fn url_dep(name: &str, git: &str, refp: &str) -> Dep {
-    Dep::Url(UrlDep {
+    Dep::Url(UrlDep { subpath: None,
         name: name.to_string(),
         git: git.to_string(),
         git_ref: refp.to_string(),
@@ -351,6 +351,7 @@ fn manifest_full(deps: Vec<Dep>, dev_deps: Vec<Dep>, overrides: Vec<Override>) -
         index_history_policy: milpa_manifest::TrustPolicy::Warn,
         index_history_policy_explicit: false,
         resolution: None,
+        provides: Vec::new(),
         optional_auto_flags: std::collections::BTreeSet::new(),
     }
 }
@@ -374,6 +375,45 @@ fn hash_of_nimble(name: &str, body: &str) -> String {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(tmp.path().join(format!("{name}.nimble")), body).unwrap();
     compute_content_hash(tmp.path()).unwrap()
+}
+
+/// Real content hash of a tree containing only `milpa.kdl = body` — used so a
+/// fake index entry's `content_hash` matches what the resolver computes (RFC
+/// origin-as-identity.md §3.3/§4.5, S4b cross-origin dedup tests: the index
+/// entry's declared value isn't itself trusted for merging — merge-on-proof
+/// uses the FETCHED tree's real identity — but a realistic fixture keeps them
+/// equal, mirroring how the Python conformance fixture is constructed).
+fn hash_of_milpa_kdl(body: &str) -> String {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("milpa.kdl"), body).unwrap();
+    compute_content_hash(tmp.path()).unwrap()
+}
+
+/// A one-version `Package` backed by a `Provenance::Git` entry — the
+/// registry-resolved side of a cross-origin dedup group (S4b tests below).
+fn git_backed_named_package(name: &str, version: &str, url: &str, refp: &str, content_hash: String) -> Package {
+    Package {
+        name: name.to_string(),
+        namespace: String::new(),
+        versions: vec![IndexVersion {
+            version: version.into(),
+            content_hash,
+            provenances: vec![Provenance::Git {
+                url: url.to_string(),
+                ref_spec: refp.to_string(),
+                commit_sha: None,
+            }],
+            dep_decl: None,
+            dep_decl_schema_version: None,
+            attestation: None,
+            namespace: String::new(),
+            published_at: None,
+            yanked: false,
+            yanked_at: None,
+            yanked_reason: None,
+            published_at_raw: None,
+        }],
+    }
 }
 
 fn v(major: u64, minor: u64, patch: u64) -> Version {
@@ -684,6 +724,7 @@ fn b2_registry() -> FakeReg {
 /// is what this synthetic (but non-null) placeholder value stands in for.
 fn b2_prior_named_dep(name: &str, version: &str) -> LockedDep {
     LockedDep {
+    source_id: None,
         name: name.to_string(),
         namespace: None,
         identity: Some(format!("sha256:{}", "0".repeat(64))),
@@ -1179,6 +1220,7 @@ fn is_root_direct_namespace_aware_direct_unit_coverage() {
             Strategy::Maxver,
             false,
             None,
+            crate::binding::BindingResolver::new(&[]),
         );
         p.root_direct_keys = keys.into_iter().collect();
         p
@@ -1220,6 +1262,7 @@ fn named_dep_ns(name: &str, namespace: &str, constraint: Option<&str>) -> Dep {
 
 fn locked_dep_ns(name: &str, namespace: &str, version: &str) -> LockedDep {
     LockedDep {
+    source_id: None,
         name: name.to_string(),
         namespace: Some(namespace.to_string()),
         identity: Some(format!("sha256:{}", "0".repeat(64))),
@@ -1929,6 +1972,7 @@ fn resolve_url_dep_with_override_fetches_override() {
             target: OverrideTarget::Git {
                 url: "https://fork.example.com/foo.git".into(),
                 git_ref: "patched".into(),
+                subpath: None,
             },
             version: None,
         }],
@@ -1962,6 +2006,56 @@ fn resolve_url_dep_with_override_fetches_override() {
         .all(|c| c.1 != "https://example.com/foo.git"));
 }
 
+/// R1 (code-review): a NAMESPACED named dep with an override on its bare name
+/// binds under the BARE key (reconcile_root_claims: "an override's grouping
+/// key is always bare"), but the root seed loop used to query `canonical_for`
+/// with the QUALIFIED key → `MILPA-INTERNAL` crash. The seed must query the
+/// bare key when an override applies (mirroring Python's override-first loop),
+/// so resolution succeeds and routes to the override target.
+#[test]
+fn resolve_namespaced_named_dep_with_override_does_not_crash() {
+    let reg = FakeReg::git(&[(
+        "https://fork.example.com/foo.git",
+        "patched",
+        nimble("ovr", "srcDir = \"src\"\n"),
+    )]);
+    let tmp = tempfile::tempdir().unwrap();
+    let m = manifest_full(
+        vec![named_dep_ns("foo", "ns1", None)],
+        Vec::new(),
+        vec![Override {
+            name: "foo".into(),
+            target: OverrideTarget::Git {
+                url: "https://fork.example.com/foo.git".into(),
+                git_ref: "patched".into(),
+                subpath: None,
+            },
+            version: None,
+        }],
+    );
+    let graph = resolve(
+        &m,
+        None,
+        &reg,
+        None,
+        None,
+        Strategy::Maxver,
+        true,
+        &deps_dir(&tmp),
+        None,
+        false,
+        &cas_store(&tmp),
+    )
+    .expect("namespaced named dep + override must resolve, not crash");
+    let foo = graph.deps.iter().find(|d| d.name == "foo").unwrap();
+    match foo.provenances.first().expect("provenance") {
+        ProvenanceRecord::Git { url, .. } => {
+            assert_eq!(url, "https://fork.example.com/foo.git");
+        }
+        other => panic!("expected git, got {other:?}"),
+    }
+}
+
 /// A3b/D-A3 (rfc-resolution-semantics.md §6): when an override redirects a
 /// dep, its own `version=` annotation is that target's step 4 — a
 /// `version=` left on the now-redirected ORIGINAL declaration is dead and
@@ -1975,7 +2069,7 @@ fn resolve_override_version_annotation_wins_over_original_dep_version() {
         nimble("ovr", "srcDir = \"src\"\n"), // no version field — steps 1-3 miss
     )]);
     let tmp = tempfile::tempdir().unwrap();
-    let original = Dep::Url(UrlDep {
+    let original = Dep::Url(UrlDep { subpath: None,
         name: "foo".to_string(),
         git: "https://example.com/foo.git".to_string(),
         git_ref: "main".to_string(),
@@ -1994,6 +2088,7 @@ fn resolve_override_version_annotation_wins_over_original_dep_version() {
             target: OverrideTarget::Git {
                 url: "https://fork.example.com/foo.git".into(),
                 git_ref: "patched".into(),
+                subpath: None,
             },
             // The override target's own annotation — this is what must win.
             version: Some(v(2, 0, 0)),
@@ -2175,6 +2270,7 @@ deps {
             target: OverrideTarget::Git {
                 url: fork_url.into(),
                 git_ref: "main".into(),
+                subpath: None,
             },
             version: None,
         }],
@@ -2196,8 +2292,11 @@ deps {
 
 #[test]
 fn resolve_non_root_provenance_disagreement_conflicts() {
-    // §10.3: two transitive deps declare `shared` from different URLs and the
-    // root has no authority over `shared` → RES-PROVENANCE-CONFLICT.
+    // RFC origin-as-identity §4.3 (S3a, re-homed from §10.3): two transitive
+    // deps declare `shared` from different URLs and the root has no
+    // authority over `shared` — two non-root claims disagreeing on
+    // `shared`'s source-id, no root claim to arbitrate → RES-BINDING-CONFLICT
+    // (mirrors Python `test_provenance_lattice.py`; conformance fixture-454).
     let reg = FakeReg::git(&[
         (
             "https://example.com/a.git",
@@ -2239,7 +2338,7 @@ fn resolve_non_root_provenance_disagreement_conflicts() {
         &cas_store(&tmp),
     )
     .unwrap_err();
-    assert_eq!(err.code(), "RES-PROVENANCE-CONFLICT");
+    assert_eq!(err.code(), "RES-BINDING-CONFLICT");
 }
 
 #[test]
@@ -2249,9 +2348,10 @@ fn resolve_non_root_provenance_disagreement_with_differing_real_versions_conflic
     // real version-level conflict. Here each URL's own `shared` carries a
     // DIFFERENT REAL declared version (1.0.0 vs 2.0.0) — the shape a naive
     // solver could plausibly resolve into a version-level SOLVE-CONFLICT on
-    // the shared name, rather than a provenance disagreement. The provenance
-    // gate must still win: RES-PROVENANCE-CONFLICT, before either candidate's
-    // version data is ever consulted by the solver.
+    // the shared name, rather than a provenance disagreement.
+    // RFC origin-as-identity §4.3 (S3a): `BindingResolver` must still win —
+    // RES-BINDING-CONFLICT — before either candidate's version data is ever
+    // consulted by the solver.
     let reg = FakeReg::git(&[
         (
             "https://example.com/a.git",
@@ -2299,7 +2399,7 @@ fn resolve_non_root_provenance_disagreement_with_differing_real_versions_conflic
         &cas_store(&tmp),
     )
     .unwrap_err();
-    assert_eq!(err.code(), "RES-PROVENANCE-CONFLICT");
+    assert_eq!(err.code(), "RES-BINDING-CONFLICT");
 }
 
 #[test]
@@ -2451,6 +2551,7 @@ fn resolve_prior_lockfile_pin_rejects_hostile_bytes() {
         strategy: "maxver".into(),
         exclude_newer: None,
         deps: vec![LockedDep {
+    source_id: None,
             declared_version_source: None,
             name: "foo".into(),
             namespace: None,
@@ -2504,6 +2605,7 @@ fn resolve_prior_lockfile_pin_accepts_matching_bytes() {
         strategy: "maxver".into(),
         exclude_newer: None,
         deps: vec![LockedDep {
+    source_id: None,
             declared_version_source: None,
             name: "foo".into(),
             namespace: None,
@@ -2548,7 +2650,7 @@ fn resolve_prior_lockfile_pin_accepts_matching_bytes() {
 // ---------------------------------------------------------------------------
 
 fn url_dep_with_mirrors(name: &str, git: &str, refp: &str, mirrors: Vec<&str>) -> Dep {
-    Dep::Url(UrlDep {
+    Dep::Url(UrlDep { subpath: None,
         name: name.to_string(),
         git: git.to_string(),
         git_ref: refp.to_string(),
@@ -2566,6 +2668,7 @@ fn prior_with_zero_identity(dep_name: &str, url: &str) -> Lockfile {
         strategy: "maxver".into(),
         exclude_newer: None,
         deps: vec![LockedDep {
+    source_id: None,
             declared_version_source: None,
             name: dep_name.into(),
             namespace: None,
@@ -2720,7 +2823,7 @@ fn resolve_mirror_fallback_uses_second_candidate() {
         nimble("m", "srcDir = \"src\"\n"),
     )]);
     let tmp = tempfile::tempdir().unwrap();
-    let m = manifest(vec![Dep::Url(UrlDep {
+    let m = manifest(vec![Dep::Url(UrlDep { subpath: None,
         name: "foo".into(),
         git: "https://primary.example.com/foo.git".into(),
         git_ref: "main".into(),
@@ -2874,6 +2977,51 @@ fn resolve_dedup_requires_rewritten_to_canonical() {
     );
 }
 
+/// S3a-req (RFC origin-as-identity.md §4.7/B3): after a dedup collapse, the
+/// resolved graph's `collapse_notes` names both labels and the shared origin
+/// — the exact data `resolve()`'s `emit_collapse_notes` prints to the resolve
+/// trace (stderr) and `milpa show` renders. Mirrors Python
+/// `TestAliasCollapseNoteIsVisible`.
+#[test]
+fn resolve_dedup_produces_visible_collapse_note() {
+    let shared = milpa_kdl("x", "name \"shared\"\nkind \"library\"\nsrc_dir \"src\"\n");
+    let reg = FakeReg::git(&[
+        ("https://example.com/foo.git", "main", shared.clone()),
+        ("https://example.com/bar.git", "main", shared),
+    ]);
+    let tmp = tempfile::tempdir().unwrap();
+    let m = manifest(vec![
+        url_dep("foo", "https://example.com/foo.git", "main"),
+        url_dep("bar", "https://example.com/bar.git", "main"),
+    ]);
+    let graph = resolve(
+        &m, None, &reg, None, None, Strategy::Maxver, true, &deps_dir(&tmp), None, false,
+        &cas_store(&tmp),
+    )
+    .unwrap();
+    let notes = collapse_notes(&graph.deps);
+    assert_eq!(
+        notes,
+        vec!["'bar' and 'foo' both name git+https://example.com/foo.git; used 'foo'".to_string()],
+        "collapse note must name both labels and the shared origin"
+    );
+}
+
+/// No collapse occurred → no note (regression guard: not chatty).
+#[test]
+fn resolve_no_dedup_no_collapse_note() {
+    let alpha = milpa_kdl("x", "name \"alpha\"\nkind \"library\"\nsrc_dir \"src\"\n");
+    let reg = FakeReg::git(&[("https://example.com/alpha.git", "main", alpha)]);
+    let tmp = tempfile::tempdir().unwrap();
+    let m = manifest(vec![url_dep("alpha", "https://example.com/alpha.git", "main")]);
+    let graph = resolve(
+        &m, None, &reg, None, None, Strategy::Maxver, true, &deps_dir(&tmp), None, false,
+        &cas_store(&tmp),
+    )
+    .unwrap();
+    assert!(collapse_notes(&graph.deps).is_empty());
+}
+
 /// Phase B: two deps with DIFFERENT content must NOT be merged.
 #[test]
 fn resolve_dedup_different_content_not_merged() {
@@ -2931,13 +3079,153 @@ fn resolve_dedup_three_way_one_canonical_two_aliases() {
     );
 }
 
+/// S4b (RFC origin-as-identity.md §3.3/§4.5 — cross-origin reconciliation of
+/// Phase B `finalize()`): a registry-resolved named dep ("chronos", a
+/// `RegistrySourceId`) and a `git=` dep ("chronos-fork", a `GitSourceId`)
+/// that fetch BYTE-IDENTICAL trees collapse to ONE canonical dep, carrying
+/// BOTH origins' observed provenance — never just the survivor's. Mirrors
+/// Python's `TestCrossOriginDedupRegistryAndGit` +
+/// `conformance/spec-v1/fixture-458-s4b-cross-origin-registry-git-identity`.
+#[test]
+fn resolve_cross_origin_dedup_registry_and_git_identical_content() {
+    let shared = "name \"shared\"\nkind \"library\"\nsrc_dir \"src\"\n";
+    let content_hash = hash_of_milpa_kdl(shared);
+    let index = Index {
+        packages: vec![git_backed_named_package(
+            "chronos",
+            "1.0.0",
+            "https://example.com/chronos.git",
+            "v1.0.0",
+            content_hash,
+        )],
+    };
+    let reg = FakeReg::git(&[
+        ("https://example.com/chronos.git", "v1.0.0", milpa_kdl("sha-registry", shared)),
+        ("https://example.com/chronos-fork.git", "main", milpa_kdl("sha-fork", shared)),
+    ]);
+    // Declared order: chronos (named) first, chronos-fork (git) second → BFS
+    // canonical = chronos (the REGISTRY dep, proving the collapse is
+    // symmetric — either kind can be canonical or alias).
+    let m = manifest(vec![
+        named_dep("chronos", None),
+        url_dep("chronos-fork", "https://example.com/chronos-fork.git", "main"),
+    ]);
+    let tmp = tempfile::tempdir().unwrap();
+    let graph = resolve(
+        &m,
+        Some(&index),
+        &reg,
+        None,
+        None,
+        Strategy::Maxver,
+        true,
+        &deps_dir(&tmp),
+        None,
+        false,
+        &cas_store(&tmp),
+    )
+    .unwrap();
+
+    assert_eq!(
+        graph.deps.len(),
+        1,
+        "expected cross-origin collapse to one dep, got: {:?}",
+        graph.deps.iter().map(|d| &d.name).collect::<Vec<_>>()
+    );
+    let dep = &graph.deps[0];
+    assert_eq!(dep.name, "chronos", "registry dep declared first → canonical");
+    assert_eq!(dep.aliases, vec!["chronos-fork".to_string()]);
+
+    let urls: BTreeSet<String> = dep
+        .provenances
+        .iter()
+        .filter_map(|p| match p {
+            ProvenanceRecord::Git { url, .. } => Some(url.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        urls,
+        BTreeSet::from([
+            "https://example.com/chronos.git".to_string(),
+            "https://example.com/chronos-fork.git".to_string(),
+        ]),
+        "both collapsed origins' observed provenance must survive; got {:?}",
+        dep.provenances
+    );
+    assert_eq!(
+        dep.provenances.len(),
+        2,
+        "expected exactly 2 provenance records (one per collapsed origin), got {:?}",
+        dep.provenances
+    );
+}
+
+/// S4b (b): a named (registry) dep and a git= dep with DIFFERENT content must
+/// NEVER be merged — merge-on-proof only fires on identical bytes, never on
+/// heuristic/kind matching. Mirrors Python's
+/// `TestCrossOriginNoDedupForDifferentContent`.
+#[test]
+fn resolve_cross_origin_no_dedup_for_different_content() {
+    let registry_body = "name \"chronos\"\nkind \"library\"\nsrc_dir \"src\"\n";
+    let fork_body = "name \"chronos-fork\"\nkind \"library\"\nsrc_dir \"src\"\n";
+    let content_hash = hash_of_milpa_kdl(registry_body);
+    let index = Index {
+        packages: vec![git_backed_named_package(
+            "chronos",
+            "1.0.0",
+            "https://example.com/chronos.git",
+            "v1.0.0",
+            content_hash,
+        )],
+    };
+    let reg = FakeReg::git(&[
+        ("https://example.com/chronos.git", "v1.0.0", milpa_kdl("sha-registry", registry_body)),
+        ("https://example.com/chronos-fork.git", "main", milpa_kdl("sha-fork", fork_body)),
+    ]);
+    let m = manifest(vec![
+        named_dep("chronos", None),
+        url_dep("chronos-fork", "https://example.com/chronos-fork.git", "main"),
+    ]);
+    let tmp = tempfile::tempdir().unwrap();
+    let graph = resolve(
+        &m,
+        Some(&index),
+        &reg,
+        None,
+        None,
+        Strategy::Maxver,
+        true,
+        &deps_dir(&tmp),
+        None,
+        false,
+        &cas_store(&tmp),
+    )
+    .unwrap();
+
+    assert_eq!(
+        graph.deps.len(),
+        2,
+        "different-content cross-origin deps must not be merged, got: {:?}",
+        graph.deps.iter().map(|d| &d.name).collect::<Vec<_>>()
+    );
+    let names: BTreeSet<&str> = graph.deps.iter().map(|d| d.name.as_str()).collect();
+    assert!(
+        names.contains("chronos") && names.contains("chronos-fork"),
+        "both must survive as separate deps: {names:?}"
+    );
+    for dep in &graph.deps {
+        assert!(dep.aliases.is_empty(), "dep {:?} should have no aliases (never merged)", dep.name);
+    }
+}
+
 /// Regression: fixture-115 — dep with `platform "windows"` child-node predicate
 /// is excluded when `MILPA_TARGET_PLATFORM=linux` (§6.2 + §6.6).
 #[test]
 fn resolve_profile_excludes_platform_mismatch() {
     let reg = FakeReg::default(); // no mocks needed — dep must not be fetched
     let tmp = tempfile::tempdir().unwrap();
-    let dep = Dep::Url(UrlDep {
+    let dep = Dep::Url(UrlDep { subpath: None,
         name: "winonly".into(),
         git: "https://github.com/example/winonly.git".into(),
         git_ref: "main".into(),
@@ -2985,7 +3273,7 @@ fn resolve_profile_includes_platform_match() {
         nimble("abc", "srcDir = \"src\"\n"),
     )]);
     let tmp = tempfile::tempdir().unwrap();
-    let dep = Dep::Url(UrlDep {
+    let dep = Dep::Url(UrlDep { subpath: None,
         name: "linuxonly".into(),
         git: "https://github.com/example/linuxonly.git".into(),
         git_ref: "main".into(),
@@ -3031,7 +3319,7 @@ fn resolve_profile_includes_platform_match() {
 fn resolve_partial_profile_negated_absent_axis_excludes() {
     let reg = FakeReg::default(); // dep must not be fetched
     let tmp = tempfile::tempdir().unwrap();
-    let dep = Dep::Url(UrlDep {
+    let dep = Dep::Url(UrlDep { subpath: None,
         name: "archlib".into(),
         git: "https://github.com/example/archlib.git".into(),
         git_ref: "main".into(),
@@ -3082,7 +3370,7 @@ fn resolve_partial_profile_negated_absent_axis_excludes() {
 fn resolve_partial_profile_positive_absent_axis_excludes() {
     let reg = FakeReg::default();
     let tmp = tempfile::tempdir().unwrap();
-    let dep = Dep::Url(UrlDep {
+    let dep = Dep::Url(UrlDep { subpath: None,
         name: "amdlib".into(),
         git: "https://github.com/example/amdlib.git".into(),
         git_ref: "main".into(),
@@ -3134,7 +3422,7 @@ fn resolve_absent_profile_includes_platform_gated_dep() {
         nimble("abc", "srcDir = \"src\"\n"),
     )]);
     let tmp = tempfile::tempdir().unwrap();
-    let dep = Dep::Url(UrlDep {
+    let dep = Dep::Url(UrlDep { subpath: None,
         name: "winonly".into(),
         git: "https://github.com/example/winonly.git".into(),
         git_ref: "main".into(),
@@ -3172,7 +3460,7 @@ fn resolve_profile_filters_conditional_dep() {
     // version does not satisfy it — and never fetched.
     let reg = FakeReg::default();
     let tmp = tempfile::tempdir().unwrap();
-    let dep = Dep::Url(UrlDep {
+    let dep = Dep::Url(UrlDep { subpath: None,
         name: "foo".into(),
         git: "https://example.com/foo.git".into(),
         git_ref: "main".into(),
@@ -3218,7 +3506,7 @@ fn resolve_absent_profile_includes_conditional_dep() {
         nimble("f", "srcDir = \"src\"\n"),
     )]);
     let tmp = tempfile::tempdir().unwrap();
-    let dep = Dep::Url(UrlDep {
+    let dep = Dep::Url(UrlDep { subpath: None,
         name: "foo".into(),
         git: "https://example.com/foo.git".into(),
         git_ref: "main".into(),
@@ -3273,7 +3561,7 @@ fn seed_root_flag_gate_default_flag_includes_dep() {
         nimble("optlib", "srcDir = \"src\"\n"),
     )]);
     let tmp = tempfile::tempdir().unwrap();
-    let dep = Dep::Url(UrlDep {
+    let dep = Dep::Url(UrlDep { subpath: None,
         name: "optlib".into(),
         git: "https://example.com/optlib.git".into(),
         git_ref: "main".into(),
@@ -3318,7 +3606,7 @@ fn seed_root_flag_gate_inactive_flag_excludes_dep() {
     // dep_passes_flag_predicates returns false → same exclusion.
     let reg = FakeReg::default(); // dep must never be fetched
     let tmp = tempfile::tempdir().unwrap();
-    let dep = Dep::Url(UrlDep {
+    let dep = Dep::Url(UrlDep { subpath: None,
         name: "optlib2".into(),
         git: "https://example.com/optlib2.git".into(),
         git_ref: "main".into(),
@@ -3387,6 +3675,7 @@ fn tarball_prior(name: &str, url: &str, identity: &str, sha256: &str) -> Lockfil
         strategy: "maxver".into(),
         exclude_newer: None,
         deps: vec![LockedDep {
+    source_id: None,
             declared_version_source: None,
             name: name.into(),
             namespace: None,
@@ -3508,7 +3797,7 @@ fn resolve_tarball_manifest_sha256_mismatch_rejected_on_first_fetch() {
 
 /// Build a UrlDep with flag requests for use in S4c tests.
 fn url_dep_with_flags(name: &str, git: &str, refp: &str, flag_reqs: Vec<milpa_manifest::FlagRequest>) -> Dep {
-    Dep::Url(UrlDep {
+    Dep::Url(UrlDep { subpath: None,
         name: name.to_string(),
         git: git.to_string(),
         git_ref: refp.to_string(),
@@ -3863,6 +4152,7 @@ fn manifest_with_flags(name: &str, flags: Vec<milpa_manifest::FlagDecl>) -> milp
         index_history_policy: milpa_manifest::TrustPolicy::Warn,
         index_history_policy_explicit: false,
         resolution: None,
+        provides: Vec::new(),
         optional_auto_flags: std::collections::BTreeSet::new(),
     }
 }
@@ -4127,6 +4417,7 @@ deps {
         exclude_newer: None,
         deps: vec![
             milpa_types::LockedDep {
+    source_id: None,
                 declared_version_source: None,
                 name: "optfoo".into(),
                 namespace: None,
@@ -4937,6 +5228,7 @@ fn d_d2_prior_lock(name: &str, url: &str, commit_sha: &str, identity: &str) -> L
         strategy: "maxver".into(),
         exclude_newer: None,
         deps: vec![LockedDep {
+    source_id: None,
             declared_version_source: None,
             name: name.into(),
             namespace: None,
@@ -5205,36 +5497,26 @@ fn resolve_a4_version_unknown_constrained_names_both_real_constrainers() {
 }
 
 // ---------------------------------------------------------------------------
-// #193 — the three-tier provenance authority lattice (resolver-semantics.md
-// §10.0), REVISED to validate-against-registry (§10.0/§10.3/§10.5). Mirrors
-// Python's `tests/test_provenance_lattice.py`: resolver-level scenarios +
+// #193 — origin/source-id keying (RFC origin-as-identity.md), superseding the
+// three-tier provenance authority lattice + validate-against-registry design
+// this comment block used to describe. Mirrors Python's
+// `tests/test_provenance_lattice.py` post S3a/S3b: resolver-level scenarios
+// now go through `BindingResolver` (`RES-BINDING-CONFLICT` for a genuine
+// transitive-vs-transitive disagreement with no root claim to arbitrate) and
+// the registry-shadow tripwire (`RES-REGISTRY-SHADOW`, §6.1/S3c) — PLUS
 // direct gate-unit tests of `ResolveProvider::gate`'s tier decision table,
-// plus direct unit tests of `normalize_git_source_url` /
-// `validate_transitive_url_against_registry`.
+// which STAYS LIVE (RFC §9 Rust PREREQ) as the sole admission mechanism for
+// `Item::Local`/`Item::Tarball` (both are root-only in practice — transitive
+// Local/Tarball deps are dropped by the same M2 security gate Python has —
+// so a real tier conflict there is structurally unreachable, but the
+// mechanism itself is preserved exactly, unmodified, and still worth direct
+// coverage). The direct unit tests of `normalize_git_source_url` /
+// `validate_transitive_url_against_registry` are DELETED along with those
+// functions (S3b — fully dead: defined, never called).
 //
 // Tier 1 (highest) Root      — root/member deps + dev-deps + overrides.
 // Tier 2           Registry  — a `Named`/index claim.
 // Tier 3 (lowest)  Self-URL  — a transitive url/local/tarball claim.
-//
-// **Design revision (validate-against-registry):** the registry is a TRUSTED
-// DEFAULT, not an explicit per-build choice. For a non-root name present in
-// the registry index, a transitive self-declared `git=` claim is VALIDATED
-// against the registry's recorded source for the name (`gate_only`, BEFORE
-// the tier-based `gate()` below is ever consulted):
-//   - AGREES (same git repository the registry records — a differing `ref`
-//     is still agreement) → ACCEPTED and resolves normally, exactly like an
-//     ordinary tier-3 url dep — this BYPASSES the tier gate entirely, so two
-//     agreeing pins of the same real repo (different refs, from different
-//     transitives) coexist rather than being arbitrated against each other.
-//     This SUPERSEDES the prior "membership-based redirect" design (a lone
-//     agreeing url pin is no longer silently redirected to the registry's
-//     own version — it is accepted AS ITSELF).
-//   - DISAGREES (a different source repository, or an incomparable
-//     transport) → raises `RES-PROVENANCE-CONFLICT` — even for a LONE
-//     disagreeing claim, with no competing claim anywhere else in the graph
-//     (the headline behavioral change from the prior disagreement-only
-//     design: a transitive can no longer silently substitute a registry
-//     name's source, nor can it silently be overridden by the registry).
 //
 // Ordering note: unlike Python's wave-based concurrent BFS, Rust's
 // `process_items` gates a batch then DISPATCHES each survivor depth-first —
@@ -5244,11 +5526,11 @@ fn resolve_a4_version_unknown_constrained_names_both_real_constrainers() {
 // by ROOT-DEP DECLARATION ORDER (which branch is listed first in the root
 // manifest), not by hop-count — the branch declared first has its entire
 // subtree fully resolved (fetched, gated, sub-dep processed) before the
-// next declared branch is ever dispatched. Under validate-against-registry
-// this ordering barely matters for a registry-known name's url claim: the
-// claim is validated at its OWN discovery, a static function of the name +
-// the (already-loaded) index record alone — never of which other claims
-// happen to exist or when they are discovered.
+// next declared branch is ever dispatched. Under `BindingResolver` this
+// ordering barely matters for any claim: each claim is arbitrated at its OWN
+// discovery (`gate_only`'s `submit()` call), a function of the claim itself
+// + whatever is already bound — never of which OTHER claims happen to exist
+// or when they are discovered.
 // ---------------------------------------------------------------------------
 
 /// Builds a single-package, single-version `Index` for `name`, backed by a
@@ -5302,13 +5584,18 @@ fn lattice_index_two(
 
 #[test]
 fn resolve_lattice_disagreeing_url_conflicts_url_branch_discovered_first() {
-    // §10.0/§10.3/§10.5: a tier-3 self-declared URL claim for `foo` (a
-    // registry-known name) DISAGREES with the registry's recorded source
-    // (`pin.example.com` vs `registry.example.com`). `wrapa` (the url
-    // branch) is declared FIRST, so its own subtree — including `foo`'s
-    // validation — runs before `wrapb` (the named branch) is ever visited.
-    // Under validate-against-registry this raises RES-PROVENANCE-CONFLICT
-    // at wrapa's own discovery, regardless of wrapb's competing claim.
+    // RFC origin-as-identity §4.3/§6.1 (S3a/S3c, re-homed from §10.0/§10.3/
+    // §10.5): a self-declared URL claim for `foo` (a registry-known name)
+    // DISAGREES with the registry's recorded source (`pin.example.com` vs
+    // `registry.example.com`). `wrapa` (the url branch) is declared FIRST,
+    // so its own subtree runs before `wrapb` (the named branch) is ever
+    // visited. Under `BindingResolver`, this is TWO EXPLICIT, competing
+    // non-root claims for one name — wrapa's git= claim (accepted — with a
+    // registry-shadow WARNING, S3c, since a fork of a registry package is
+    // legitimate and warn-only by default) and wrapb's bare `named` claim —
+    // so it raises `RES-BINDING-CONFLICT` once the second claim arrives,
+    // regardless of discovery order (mirrors Python
+    // `TestDisagreeingUrlConflictsUrlDiscoveredFirst`).
     let wrapa_url = "https://example.com/wrapa.git";
     let wrapb_url = "https://example.com/wrapb.git";
     let foo_pin_url = "https://pin.example.com/foo.git";
@@ -5332,23 +5619,53 @@ fn resolve_lattice_disagreeing_url_conflicts_url_branch_discovered_first() {
         &deps_dir(&tmp), None, false, &cas_store(&tmp),
     )
     .unwrap_err();
-    assert_eq!(err.code(), "RES-PROVENANCE-CONFLICT");
+    assert_eq!(err.code(), "RES-BINDING-CONFLICT");
     assert!(format!("{err:?}").contains("foo"));
 
-    // The disagreeing pin must genuinely never have been fetched — validated
-    // and rejected BEFORE any fetch is dispatched (§10.5).
+    // wrapa's pin WAS fetched (warn, not hard-fail, under the default
+    // policy) — the conflict is with wrapb's LATER named claim, not a
+    // static pre-fetch rejection of wrapa's own claim.
     assert!(
-        reg.calls().iter().all(|c| c.1 != foo_pin_url),
-        "the disagreeing pin must never be fetched"
+        reg.calls().iter().any(|c| c.1 == foo_pin_url),
+        "wrapa's pin must have been fetched before the later named claim conflicts"
     );
+}
+
+#[test]
+fn resolve_member_dep_in_single_package_manifest_fails_with_coded_error() {
+    // D3 (rfc-origin-as-identity.md §4.4.1, code review): a `member "<name>"`
+    // dep is workspace-only topology. In a single-package (non-workspace)
+    // manifest it has no candidate to bind to. Pre-fix the Rust root-seed arm
+    // pushed an unsatisfiable `eq_sentinel()` term, surfacing a cryptic
+    // SOLVE-CONFLICT that named an internal sentinel version instead of the
+    // real cause; the fix fails closed with a coded slug that matches the
+    // Python impl's `RES-MEMBER-OUTSIDE-WORKSPACE`.
+    let tmp = tempfile::tempdir().unwrap();
+    let reg = FakeReg::git(&[]);
+    let m = manifest(vec![Dep::Member(MemberDep {
+        name: "sibling".to_string(),
+        predicates: Vec::new(),
+    })]);
+    let err = resolve(
+        &m, None, &reg, None, None, Strategy::Maxver, true,
+        &deps_dir(&tmp), None, false, &cas_store(&tmp),
+    )
+    .unwrap_err();
+    assert_eq!(err.code(), "RES-MEMBER-OUTSIDE-WORKSPACE");
+    assert!(format!("{err:?}").contains("sibling"));
+    // Nothing was ever fetched — the coded error fires at seed time.
+    assert!(reg.calls().is_empty());
 }
 
 #[test]
 fn resolve_lattice_disagreeing_url_conflicts_named_branch_discovered_first() {
     // Same shape, roles swapped: `wrapb` (the named branch) is declared
-    // FIRST. The outcome MUST be identical — `wrapa`'s disagreeing url claim
-    // still conflicts, at its own discovery, regardless of the registry
-    // claim already being on record (order-independence, §10.5).
+    // FIRST — its bare `named` claim binds `foo` to the registry
+    // coordinate before `wrapa`'s disagreeing git= claim is ever submitted.
+    // The outcome MUST be identical — RES-BINDING-CONFLICT — but here the
+    // conflict is raised by `BindingResolver::submit` itself, BEFORE
+    // wrapa's disagreeing pin is ever dispatched to fetch (mirrors Python
+    // `TestDisagreeingUrlConflictsNamedDiscoveredFirst`).
     let wrapa_url = "https://example.com/wrapa-swap.git";
     let wrapb_url = "https://example.com/wrapb-swap.git";
     let foo_pin_url = "https://pin.example.com/foo.git";
@@ -5372,7 +5689,7 @@ fn resolve_lattice_disagreeing_url_conflicts_named_branch_discovered_first() {
         &deps_dir(&tmp), None, false, &cas_store(&tmp),
     )
     .unwrap_err();
-    assert_eq!(err.code(), "RES-PROVENANCE-CONFLICT");
+    assert_eq!(err.code(), "RES-BINDING-CONFLICT");
     assert!(format!("{err:?}").contains("foo"));
 
     assert!(
@@ -5383,17 +5700,25 @@ fn resolve_lattice_disagreeing_url_conflicts_named_branch_discovered_first() {
 
 #[test]
 fn resolve_lattice_mid_solve_residual_closed_by_immediate_validation() {
-    // THE old residual (would have needed a post-hoc sweep) — now closed by
-    // construction under validate-against-registry. `foo` is a registry-
-    // known name. An eager tier-3 URL transitive (`wrapa`, declared FIRST)
-    // claims `foo` via `git=` at a DIFFERENT repository than the registry's
-    // — this is discovered and validated during wrapa's own eager subtree,
-    // BEFORE `outer` (ALSO a registry package, declared second) is ever even
-    // dispatched. `outer`'s OWN bare-name claim on `foo` — discoverable only
-    // when the solver would materialize outer's selected candidate — is
-    // never even reached: the conflict fires from the registry index alone
-    // (a static, pre-loaded fact), without needing outer's claim to exist or
-    // be discovered.
+    // THE old residual (docs/rfc-provenance-lattice.handoff.md) — closed by
+    // `BindingResolver` (RFC origin-as-identity §4.3), the same way the
+    // prior membership-based redesign closed it, but via genuine multi-claim
+    // conflict detection rather than a discovery-order-sensitive gate.
+    // `foo` is a registry-known name. An eager `git=` transitive (`wrapa`,
+    // declared FIRST) claims `foo` at a DIFFERENT repository than the
+    // registry's — discovered during the EAGER BFS (before solve() ever
+    // starts); its bare name shadows a registry coordinate at a different
+    // URL, so the registry-shadow tripwire (S3c) WARNS (default policy, not
+    // a hard error — a fork is legitimate), and the claim is accepted and
+    // fetched. The ONLY competing claim for `foo` lives inside the manifest
+    // of ANOTHER registry package (`outer`), discoverable only mid-solve
+    // (when the solver materializes `outer`'s selected candidate, via
+    // `materialize_named`'s `process_items(ex.sub_items)`) — strictly AFTER
+    // wrapa's claim is already bound. When outer's own bare `foo` claim is
+    // submitted, it disagrees with wrapa's already-bound source-id and
+    // `RES-BINDING-CONFLICT` fires — regardless of how late the competing
+    // claim surfaces (mirrors Python
+    // `TestMidSolveResidualClosedByImmediateValidation`).
     let wrapa_url = "https://example.com/wrapa-mid.git";
     let outer_url = "https://registry.example.com/outer-mid.git";
     // The pin/registry URLs' basenames MUST be exactly "foo" — a nimble
@@ -5407,9 +5732,8 @@ fn resolve_lattice_mid_solve_residual_closed_by_immediate_validation() {
 
     let reg = FakeReg::git(&[
         (wrapa_url, "main", nimble("wrapa-mid", &format!("requires \"{foo_pin_url}#v9.9.9\"\n"))),
-        // outer's own manifest requires foo by bare name — never even
-        // fetched: wrapa's own claim already aborts resolution before outer
-        // is ever selected/materialized.
+        // outer's own manifest requires foo by bare name — materialized
+        // mid-solve (its own claim is what raises the conflict).
         (outer_url, "v1.0.0", nimble("outer-mid", outer_body)),
         (foo_pin_url, "v9.9.9", nimble("foo", "# url-pin\n")),
         (foo_registry_url, "v1.0.0", nimble("foo", foo_registry_body)),
@@ -5428,25 +5752,30 @@ fn resolve_lattice_mid_solve_residual_closed_by_immediate_validation() {
         &deps_dir(&tmp), None, false, &cas_store(&tmp),
     )
     .unwrap_err();
-    assert_eq!(err.code(), "RES-PROVENANCE-CONFLICT");
+    assert_eq!(err.code(), "RES-BINDING-CONFLICT");
     assert!(format!("{err:?}").contains("foo"));
 
+    // wrapa's claim was the FIRST (only) claim on record when it was
+    // discovered — accepted (with a shadow warning) and genuinely fetched;
+    // outer's later, competing claim (discovered by materializing outer
+    // itself) is what raises.
     assert!(
-        reg.calls().iter().all(|c| c.1 != foo_pin_url && c.1 != outer_url),
-        "neither the disagreeing pin nor outer (never selected) may be fetched"
+        reg.calls().iter().any(|c| c.1 == foo_pin_url),
+        "wrapa's disagreeing pin must have been fetched (accepted, warn-only)"
     );
 }
 
 #[test]
 fn resolve_lattice_two_disagreeing_urls_for_registry_name_both_conflict() {
-    // §10.0/§10.3: three transitives claim `shared` — `q` by bare name
-    // (registry), `r1`/`r2` via TWO DIFFERENT self-declared URLs (via nested
-    // `mid1`/`mid2` hops) — BOTH of which DISAGREE with the registry's
-    // recorded source. Under validate-against-registry, EACH disagreeing url
-    // is independently invalid: whichever the BFS reaches first raises
-    // RES-PROVENANCE-CONFLICT. (Under the prior membership-based redesign
-    // this fixture demonstrated "registry wins, no conflict" — the revision
-    // inverts that outcome.)
+    // RFC origin-as-identity §4.3/§6.1 (S3a/S3c, re-homed from §10.0/§10.3):
+    // three transitives claim `shared` — `q` by bare name (registry),
+    // `r1`/`r2` via TWO DIFFERENT self-declared URLs (via nested
+    // `mid1`/`mid2` hops) — neither of which matches the registry's
+    // recorded source (each independently WARNS via the registry-shadow
+    // tripwire, S3c, but is accepted). Under `BindingResolver`, these are
+    // THREE mutually-disagreeing non-root claims for one name — whichever
+    // pair `BindingResolver` compares second raises `RES-BINDING-CONFLICT`
+    // (mirrors Python `TestTwoDisagreeingUrlsForRegistryNameBothConflict`).
     let q_url = "https://example.com/q.git";
     let r1_url = "https://example.com/r1.git";
     let r2_url = "https://example.com/r2.git";
@@ -5479,7 +5808,7 @@ fn resolve_lattice_two_disagreeing_urls_for_registry_name_both_conflict() {
         &deps_dir(&tmp), None, false, &cas_store(&tmp),
     )
     .unwrap_err();
-    assert_eq!(err.code(), "RES-PROVENANCE-CONFLICT");
+    assert_eq!(err.code(), "RES-BINDING-CONFLICT");
     assert!(format!("{err:?}").contains("shared"));
 }
 
@@ -5578,15 +5907,17 @@ fn resolve_lattice_lone_url_pin_of_registry_name_agrees_is_accepted() {
     );
 }
 
-#[test]
-fn resolve_lattice_lone_url_pin_of_registry_name_disagrees_conflicts() {
-    // §10.0 NORMATIVE, validate-against-registry: a transitive url-pins
-    // `foo` — a name that ALSO exists in the registry — at a DIFFERENT
-    // repository than the registry records, with NO competing claim
-    // anywhere else in the graph. This is the headline behavioral change
-    // from the pure disagreement-only design: a LONE transitive claim can
-    // conflict with a KNOWN registry name, with no second claim needed to
-    // arbitrate against.
+/// RFC origin-as-identity §6.1/§11 D-Fork1 (S3c, re-homed from §10.0
+/// validate-against-registry): a transitive url-pins `foo` — a name that
+/// ALSO exists in the registry — at a DIFFERENT repository than the
+/// registry records, with NO competing claim anywhere else in the graph.
+/// Under the registry-shadow tripwire this is NAME-TRIGGERED (bare name
+/// shadows a registry coordinate) + URL-REFINED (the source doesn't
+/// match) — WARN by default (a fork is legitimate and common; the claim
+/// still resolves and is genuinely fetched), HARD-FAIL under
+/// `attestation-policy strict`. Mirrors Python
+/// `TestLoneUrlPinOfRegistryNameDisagreesConflicts`.
+fn lattice_lone_disagreeing_fixture() -> (&'static str, &'static str, &'static str, FakeReg, Index) {
     let t1_url = "https://example.com/t1lone.git";
     let foo_pin_url = "https://pin.example.com/foolone.git";
     let foo_registry_url = "https://registry.example.com/foolone.git";
@@ -5598,19 +5929,47 @@ fn resolve_lattice_lone_url_pin_of_registry_name_disagrees_conflicts() {
         (foo_registry_url, "v1.0.0", nimble("foolone", foo_registry_body)),
     ]);
     let index = lattice_index("foolone", foo_registry_url, "v1.0.0", foo_registry_body);
+    (t1_url, foo_pin_url, foo_registry_url, reg, index)
+}
+
+#[test]
+fn resolve_lattice_lone_url_pin_of_registry_name_disagrees_warns_and_resolves() {
+    let (t1_url, foo_pin_url, _foo_registry_url, reg, index) = lattice_lone_disagreeing_fixture();
     let tmp = tempfile::tempdir().unwrap();
     let m = manifest(vec![url_dep("t1lone", t1_url, "main")]);
+    let graph = resolve(
+        &m, Some(&index), &reg, None, None, Strategy::Maxver, true,
+        &deps_dir(&tmp), None, false, &cas_store(&tmp),
+    )
+    .expect("default (warn) policy must accept the shadowing claim, not hard-fail");
+
+    let foo = graph.deps.iter().find(|d| d.name == "foolone").expect("foolone in graph");
+    match foo.provenances.first().expect("provenance") {
+        ProvenanceRecord::Git { url, .. } => assert_eq!(url, foo_pin_url),
+        other => panic!("expected git provenance, got {other:?}"),
+    }
+    assert!(
+        reg.calls().iter().any(|c| c.1 == foo_pin_url),
+        "the shadowing pin must be genuinely fetched under the default (warn) policy"
+    );
+}
+
+#[test]
+fn resolve_lattice_lone_url_pin_of_registry_name_disagrees_hard_fails_under_strict() {
+    let (t1_url, foo_pin_url, _foo_registry_url, reg, index) = lattice_lone_disagreeing_fixture();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut m = manifest(vec![url_dep("t1lone", t1_url, "main")]);
+    m.attestation_policy = milpa_manifest::TrustPolicy::Strict;
     let err = resolve(
         &m, Some(&index), &reg, None, None, Strategy::Maxver, true,
         &deps_dir(&tmp), None, false, &cas_store(&tmp),
     )
     .unwrap_err();
-    assert_eq!(err.code(), "RES-PROVENANCE-CONFLICT");
+    assert_eq!(err.code(), "RES-REGISTRY-SHADOW");
     assert!(format!("{err:?}").contains("foolone"));
-
     assert!(
         reg.calls().iter().all(|c| c.1 != foo_pin_url),
-        "the disagreeing lone pin must never be fetched"
+        "the shadowing pin must never be fetched under strict policy"
     );
 }
 
@@ -5772,22 +6131,21 @@ fn resolve_lattice_oci_only_content_hash_matches_accepted() {
     );
 }
 
-#[test]
-fn resolve_lattice_oci_only_content_hash_mismatch_conflicts() {
-    // Same shape as above, except the transitive's git source fetches to
-    // DIFFERENT content than anything the registry has recorded (e.g. a
-    // fork or a substitution) — a genuinely different package — which MUST
-    // raise RES-PROVENANCE-CONFLICT, discovered only AFTER the fetch
-    // (identity is the only comparable fact for an OCI-only entry). The
-    // fetch itself is NOT a provenance conflict; the mismatch is.
+/// RFC origin-as-identity §6.1/§11 D-Fork1 (S3c, re-homed from §10.0/§10.3):
+/// same shape as `resolve_lattice_oci_only_content_hash_matches_accepted`,
+/// except the transitive's git source fetches to DIFFERENT content than
+/// anything the registry has recorded. There is NO post-fetch content-hash
+/// reconciliation anymore — an OCI-only entry has no comparable upstream
+/// URL regardless of content_hash, so a git= claim shadowing its bare name
+/// always WARNS by default (the claim still resolves and is genuinely
+/// fetched) and HARD-FAILS under `attestation-policy strict`, identical to
+/// the content-hash-MATCH case. Mirrors Python
+/// `TestOciOnlyRegistryEntryContentHashMismatchConflicts`.
+fn lattice_oci_mismatch_fixture() -> (&'static str, &'static str, FakeReg, Index) {
     let t1_url = "https://example.com/t1-ocimismatch.git";
     // The fork URL's basename MUST be exactly "foo-ocimismatch" (matching the
     // registry package name) — a nimble `requires "<url>#<ref>"` line derives
-    // the transitive dep's NAME from the URL's basename (mirrors the existing
-    // lattice tests' convention, e.g. `resolve_lattice_lone_url_pin_of_registry_name_disagrees_conflicts`'s
-    // `foolone` naming) — only the HOST differs from the registry's own
-    // originating source, so the dep name still resolves against the same
-    // registry entry.
+    // the transitive dep's NAME from the URL's basename.
     let foo_fork_url = "https://fork.example.com/foo-ocimismatch.git";
     let foo_registry_body = "# foo-ocimismatch registry original\n";
     let foo_fork_body = "# foo-ocimismatch fork\n";
@@ -5800,32 +6158,57 @@ fn resolve_lattice_oci_only_content_hash_mismatch_conflicts() {
     let foo_fork_hash = hash_of_nimble("foo-ocimismatch", foo_fork_body);
     assert_ne!(foo_registry_hash, foo_fork_hash);
     let index = lattice_index_oci("foo-ocimismatch", &foo_registry_hash);
+    (t1_url, foo_fork_url, reg, index)
+}
+
+#[test]
+fn resolve_lattice_oci_only_content_hash_mismatch_warns_and_resolves() {
+    let (t1_url, foo_fork_url, reg, index) = lattice_oci_mismatch_fixture();
     let tmp = tempfile::tempdir().unwrap();
     let m = manifest(vec![url_dep("t1-ocimismatch", t1_url, "main")]);
+    let graph = resolve(
+        &m, Some(&index), &reg, None, None, Strategy::Maxver, true,
+        &deps_dir(&tmp), None, false, &cas_store(&tmp),
+    )
+    .expect("default (warn) policy must accept the shadowing claim, not hard-fail");
+    let foo = graph.deps.iter().find(|d| d.name == "foo-ocimismatch").expect("foo-ocimismatch in graph");
+    match foo.provenances.first().expect("provenance") {
+        ProvenanceRecord::Git { url, .. } => assert_eq!(url, foo_fork_url),
+        other => panic!("expected git provenance, got {other:?}"),
+    }
+    assert!(
+        reg.calls().iter().any(|c| c.1 == foo_fork_url),
+        "the shadowing fork must be genuinely fetched under the default (warn) policy"
+    );
+}
+
+#[test]
+fn resolve_lattice_oci_only_content_hash_mismatch_hard_fails_under_strict() {
+    let (t1_url, foo_fork_url, reg, index) = lattice_oci_mismatch_fixture();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut m = manifest(vec![url_dep("t1-ocimismatch", t1_url, "main")]);
+    m.attestation_policy = milpa_manifest::TrustPolicy::Strict;
     let err = resolve(
         &m, Some(&index), &reg, None, None, Strategy::Maxver, true,
         &deps_dir(&tmp), None, false, &cas_store(&tmp),
     )
     .unwrap_err();
-    assert_eq!(err.code(), "RES-PROVENANCE-CONFLICT");
+    assert_eq!(err.code(), "RES-REGISTRY-SHADOW");
     assert!(format!("{err:?}").contains("foo-ocimismatch"));
-
-    // The mismatching pin genuinely WAS fetched — the deferred check only
-    // fires post-fetch, unlike the immediate (no-content-hash-to-check)
-    // conflict cases.
     assert!(
-        reg.calls().iter().any(|c| c.1 == foo_fork_url),
-        "the deferred check runs AFTER the fetch, so the fork must have been fetched"
+        reg.calls().iter().all(|c| c.1 != foo_fork_url),
+        "the shadowing fork must never be fetched under strict policy"
     );
 }
 
-#[test]
-fn resolve_lattice_oci_only_empty_content_hash_conflicts_before_fetch() {
-    // The registry entry is OCI-only AND carries no content_hash (legacy
-    // entry, predating the identity mandate) — there is nothing to validate
-    // against, even deferred. This MUST conflict immediately, at gate time,
-    // exactly like the "no comparable transport" behavior — the
-    // transitive's git source must NEVER be fetched.
+/// RFC origin-as-identity §6.1/§11 D-Fork1 (S3c, re-homed from §10.0/§10.3):
+/// the registry entry is OCI-only AND carries no content_hash (legacy
+/// entry, predating the identity mandate). Under the registry-shadow
+/// tripwire the outcome is identical to the other OCI-only shapes — an
+/// OCI-only entry has no comparable URL regardless of whether it carries a
+/// content_hash at all — WARN by default, HARD-FAIL under strict. Mirrors
+/// Python `TestOciOnlyRegistryEntryEmptyContentHashConflicts`.
+fn lattice_oci_empty_hash_fixture() -> (&'static str, &'static str, FakeReg, Index) {
     let t1_url = "https://example.com/t1-ociempty.git";
     let foo_source_url = "https://github.com/example/foo-ociempty.git";
     let foo_body = "# foo-ociempty source\n";
@@ -5835,28 +6218,55 @@ fn resolve_lattice_oci_only_empty_content_hash_conflicts_before_fetch() {
         (foo_source_url, "v1.0.0", nimble("foo-ociempty", foo_body)),
     ]);
     let index = lattice_index_oci("foo-ociempty", "");
+    (t1_url, foo_source_url, reg, index)
+}
+
+#[test]
+fn resolve_lattice_oci_only_empty_content_hash_warns_and_resolves() {
+    let (t1_url, foo_source_url, reg, index) = lattice_oci_empty_hash_fixture();
     let tmp = tempfile::tempdir().unwrap();
     let m = manifest(vec![url_dep("t1-ociempty", t1_url, "main")]);
+    let graph = resolve(
+        &m, Some(&index), &reg, None, None, Strategy::Maxver, true,
+        &deps_dir(&tmp), None, false, &cas_store(&tmp),
+    )
+    .expect("default (warn) policy must accept the shadowing claim, not hard-fail");
+    let foo = graph.deps.iter().find(|d| d.name == "foo-ociempty").expect("foo-ociempty in graph");
+    match foo.provenances.first().expect("provenance") {
+        ProvenanceRecord::Git { url, .. } => assert_eq!(url, foo_source_url),
+        other => panic!("expected git provenance, got {other:?}"),
+    }
+    assert!(
+        reg.calls().iter().any(|c| c.1 == foo_source_url),
+        "the shadowing pin must be genuinely fetched under the default (warn) policy"
+    );
+}
+
+#[test]
+fn resolve_lattice_oci_only_empty_content_hash_hard_fails_under_strict() {
+    let (t1_url, foo_source_url, reg, index) = lattice_oci_empty_hash_fixture();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut m = manifest(vec![url_dep("t1-ociempty", t1_url, "main")]);
+    m.attestation_policy = milpa_manifest::TrustPolicy::Strict;
     let err = resolve(
         &m, Some(&index), &reg, None, None, Strategy::Maxver, true,
         &deps_dir(&tmp), None, false, &cas_store(&tmp),
     )
     .unwrap_err();
-    assert_eq!(err.code(), "RES-PROVENANCE-CONFLICT");
+    assert_eq!(err.code(), "RES-REGISTRY-SHADOW");
     assert!(format!("{err:?}").contains("foo-ociempty"));
-
     assert!(
         reg.calls().iter().all(|c| c.1 != foo_source_url),
-        "the cannot-validate case must conflict BEFORE any fetch is dispatched"
+        "the shadowing pin must never be fetched under strict policy"
     );
 }
 
 /// Same shape as `lattice_index_oci`, but the OCI provenance ALSO records a
 /// `source_url` — the git repository the artifact was published FROM
 /// (registry-protocol §3.3's optional oci `source` field), which
-/// `validate_transitive_url_against_registry` URL-matches against BEFORE
-/// falling back to content-hash (resolver-semantics.md §10.0/§10.3 "OCI
-/// source_url" clause). Mirrors Python's `_index_kdl_one_pkg_oci_with_source`.
+/// `check_registry_shadow` (`binding.rs`, §6.1) URL-matches a shadowing
+/// claim against for a silent accept. Mirrors Python's
+/// `_index_kdl_one_pkg_oci_with_source`.
 fn lattice_index_oci_with_source(name: &str, content_hash: &str, source_url: &str) -> Index {
     Index {
         packages: vec![Package {
@@ -5929,20 +6339,15 @@ fn resolve_oci_source_url_agrees_across_version_drift_accepted() {
     }
 }
 
-#[test]
-fn resolve_oci_source_url_mismatch_conflicts_before_fetch() {
-    // Same OCI-with-`source_url` shape as above, except the transitive pins
-    // a DIFFERENT repository — a genuine disagreement, raised statically,
-    // before any fetch (no deferred content-hash check needed, since
-    // `source_url` is a directly comparable fact). Mirrors Python's
-    // `TestOciSourceUrlMismatchConflicts.test_different_repository_conflicts_before_fetch`.
-    // The fork URL's basename MUST be exactly "foo-ocisrcmismatch" (matching
-    // the registry package name) — a nimble `requires "<url>#<ref>"` line
-    // derives the transitive dep's NAME from the URL's basename (mirrors
-    // `resolve_lattice_oci_only_content_hash_mismatch_conflicts`'s
-    // `foo-ocimismatch` naming convention) — only the HOST differs from the
-    // registry's own originating source, so the dep name still resolves
-    // against the same registry entry.
+/// RFC origin-as-identity §6.1/§11 D-Fork1 (S3c, re-homed from §10.0/§10.3):
+/// same OCI-with-`source_url` shape as `resolve_oci_source_url_agrees_across_version_drift_accepted`,
+/// except the transitive pins a DIFFERENT repository. The registry-shadow
+/// tripwire compares the claim's normalized URL against the OCI entry's
+/// recorded `source_url` (a directly comparable fact, same as a git
+/// provenance URL) — a mismatch WARNS by default (the claim still resolves
+/// and is genuinely fetched) and HARD-FAILS under `attestation-policy
+/// strict` (never fetched). Mirrors Python `TestOciSourceUrlMismatchConflicts`.
+fn lattice_oci_source_url_mismatch_fixture() -> (&'static str, &'static str, FakeReg, Index) {
     let t1_url = "https://example.com/t1-ocisrcmismatch.git";
     let foo_fork_url = "https://fork.example.com/foo-ocisrcmismatch.git";
     let foo_registry_source_url = "https://github.com/example/foo-ocisrcmismatch.git";
@@ -5956,680 +6361,50 @@ fn resolve_oci_source_url_mismatch_conflicts_before_fetch() {
     let index = lattice_index_oci_with_source(
         "foo-ocisrcmismatch", &foo_registry_hash, foo_registry_source_url,
     );
+    (t1_url, foo_fork_url, reg, index)
+}
+
+#[test]
+fn resolve_oci_source_url_mismatch_warns_and_resolves() {
+    let (t1_url, foo_fork_url, reg, index) = lattice_oci_source_url_mismatch_fixture();
     let tmp = tempfile::tempdir().unwrap();
     let m = manifest(vec![url_dep("t1-ocisrcmismatch", t1_url, "main")]);
+    let graph = resolve(
+        &m, Some(&index), &reg, None, None, Strategy::Maxver, true,
+        &deps_dir(&tmp), None, false, &cas_store(&tmp),
+    )
+    .expect("default (warn) policy must accept the shadowing claim, not hard-fail");
+    let foo = graph.deps.iter().find(|d| d.name == "foo-ocisrcmismatch").expect("foo-ocisrcmismatch in graph");
+    match foo.provenances.first().expect("provenance") {
+        ProvenanceRecord::Git { url, .. } => assert_eq!(url, foo_fork_url),
+        other => panic!("expected git provenance, got {other:?}"),
+    }
+    assert!(
+        reg.calls().iter().any(|c| c.1 == foo_fork_url),
+        "the shadowing fork must be genuinely fetched under the default (warn) policy"
+    );
+}
+
+#[test]
+fn resolve_oci_source_url_mismatch_hard_fails_under_strict() {
+    let (t1_url, foo_fork_url, reg, index) = lattice_oci_source_url_mismatch_fixture();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut m = manifest(vec![url_dep("t1-ocisrcmismatch", t1_url, "main")]);
+    m.attestation_policy = milpa_manifest::TrustPolicy::Strict;
     let err = resolve(
         &m, Some(&index), &reg, None, None, Strategy::Maxver, true,
         &deps_dir(&tmp), None, false, &cas_store(&tmp),
     )
     .unwrap_err();
-    assert_eq!(err.code(), "RES-PROVENANCE-CONFLICT");
+    assert_eq!(err.code(), "RES-REGISTRY-SHADOW");
     assert!(format!("{err:?}").contains("foo-ocisrcmismatch"));
 
     // Rejected BEFORE any fetch — source_url comparison is static and
     // pre-fetch, same guarantee as the git-vs-git disagreement case.
     assert!(
         reg.calls().iter().all(|c| c.1 != foo_fork_url),
-        "the source_url disagreement must conflict BEFORE any fetch is dispatched"
+        "the source_url disagreement must never be fetched under strict policy"
     );
-}
-
-// --- direct unit tests: `normalize_git_source_url` / -----------------------
-// --- `validate_transitive_url_against_registry` -----------------------------
-
-#[test]
-fn normalize_git_source_url_trailing_git_suffix_stripped() {
-    assert_eq!(
-        super::normalize_git_source_url("https://example.com/foo.git"),
-        super::normalize_git_source_url("https://example.com/foo"),
-    );
-}
-
-#[test]
-fn normalize_git_source_url_trailing_slash_stripped() {
-    assert_eq!(
-        super::normalize_git_source_url("https://example.com/foo/"),
-        super::normalize_git_source_url("https://example.com/foo"),
-    );
-}
-
-#[test]
-fn normalize_git_source_url_scheme_and_host_case_insensitive() {
-    assert_eq!(
-        super::normalize_git_source_url("HTTPS://Example.COM/foo.git"),
-        super::normalize_git_source_url("https://example.com/foo.git"),
-    );
-}
-
-#[test]
-fn normalize_git_source_url_path_case_preserved() {
-    // Path casing is NOT normalized — many git hosts are path-case-sensitive.
-    assert_ne!(
-        super::normalize_git_source_url("https://example.com/Foo.git"),
-        super::normalize_git_source_url("https://example.com/foo.git"),
-    );
-}
-
-#[test]
-fn normalize_git_source_url_different_hosts_differ() {
-    assert_ne!(
-        super::normalize_git_source_url("https://a.example.com/foo.git"),
-        super::normalize_git_source_url("https://b.example.com/foo.git"),
-    );
-}
-
-/// Build a minimal single-version `Package` carrying one git provenance, for
-/// the `validate_transitive_url_against_registry` unit tests below.
-fn pkg_with_git(name: &str, url: &str, refp: &str) -> Package {
-    Package {
-        name: name.to_string(),
-        namespace: String::new(),
-        versions: vec![IndexVersion {
-            version: "1.0.0".into(),
-            content_hash: format!("sha256:{}", "0".repeat(64)),
-            provenances: vec![Provenance::Git {
-                url: url.to_string(),
-                ref_spec: refp.to_string(),
-                commit_sha: None,
-            }],
-            dep_decl: None,
-            dep_decl_schema_version: None,
-            attestation: None,
-            namespace: String::new(),
-            published_at: None,
-            yanked: false,
-            yanked_at: None,
-            yanked_reason: None,
-            published_at_raw: None,
-        }],
-    }
-}
-
-#[test]
-fn validate_transitive_url_agrees_same_url_same_ref() {
-    let pkg = pkg_with_git("foo", "https://registry.example.com/foo.git", "v1.0.0");
-    super::validate_transitive_url_against_registry(
-        "foo", "https://registry.example.com/foo.git", &pkg,
-    )
-    .expect("agreement must not error");
-}
-
-#[test]
-fn validate_transitive_url_agrees_same_repo_different_ref() {
-    // Different ref, same repo: still an agreement (ref only selects a version).
-    let pkg = pkg_with_git("foo", "https://registry.example.com/foo.git", "v1.0.0");
-    super::validate_transitive_url_against_registry(
-        "foo", "https://registry.example.com/foo.git", &pkg,
-    )
-    .expect("differing ref must still agree");
-}
-
-#[test]
-fn validate_transitive_url_agrees_matches_an_older_versions_provenance() {
-    // The claim matches version 1.0.0's recorded source, not the newest
-    // (2.0.0's) — agreement checks EVERY version's provenance, not just the
-    // latest.
-    let pkg = Package {
-        name: "foo".to_string(),
-        namespace: String::new(),
-        versions: vec![
-            IndexVersion {
-                version: "2.0.0".into(),
-                content_hash: format!("sha256:{}", "0".repeat(64)),
-                provenances: vec![Provenance::Git {
-                    url: "https://registry.example.com/foo-v2.git".to_string(),
-                    ref_spec: "v2.0.0".to_string(),
-                    commit_sha: None,
-                }],
-                dep_decl: None,
-                dep_decl_schema_version: None,
-                attestation: None,
-                namespace: String::new(),
-                published_at: None,
-                yanked: false,
-                yanked_at: None,
-                yanked_reason: None,
-                published_at_raw: None,
-            },
-            IndexVersion {
-                version: "1.0.0".into(),
-                content_hash: format!("sha256:{}", "0".repeat(64)),
-                provenances: vec![Provenance::Git {
-                    url: "https://registry.example.com/foo.git".to_string(),
-                    ref_spec: "v1.0.0".to_string(),
-                    commit_sha: None,
-                }],
-                dep_decl: None,
-                dep_decl_schema_version: None,
-                attestation: None,
-                namespace: String::new(),
-                published_at: None,
-                yanked: false,
-                yanked_at: None,
-                yanked_reason: None,
-                published_at_raw: None,
-            },
-        ],
-    };
-    super::validate_transitive_url_against_registry(
-        "foo", "https://registry.example.com/foo.git", &pkg,
-    )
-    .expect("must match the older version's recorded source");
-}
-
-#[test]
-fn validate_transitive_url_agrees_normalized_git_suffix_and_case() {
-    let pkg = pkg_with_git("foo", "https://Registry.example.com/foo.git", "v1.0.0");
-    // No ".git" suffix on the claim, different host casing: still agrees.
-    super::validate_transitive_url_against_registry(
-        "foo", "https://registry.example.com/foo", &pkg,
-    )
-    .expect("normalized comparison must agree");
-}
-
-#[test]
-fn validate_transitive_url_disagrees_different_repository() {
-    let pkg = pkg_with_git("foo", "https://registry.example.com/foo.git", "v1.0.0");
-    let err = super::validate_transitive_url_against_registry(
-        "foo", "https://pin.example.com/foo.git", &pkg,
-    )
-    .unwrap_err();
-    assert_eq!(err.code(), "RES-PROVENANCE-CONFLICT");
-    assert!(format!("{err:?}").contains("foo"));
-}
-
-#[test]
-fn validate_transitive_url_oci_only_entry_with_content_hash_defers() {
-    // The registry entry is OCI-only — a git= claim can never be
-    // URL-compared to it, so the decision is DEFERRED to content identity:
-    // the function returns the set of recorded content_hash values (never
-    // errors directly) so the caller can validate once the transitive's
-    // git source is fetched and hashed. This is the #193-gap fix: an OCI
-    // artifact published FROM a git repo and a transitive pinning that repo
-    // by URL are the SAME package.
-    let pkg = Package {
-        name: "foo".to_string(),
-        namespace: String::new(),
-        versions: vec![IndexVersion {
-            version: "1.0.0".into(),
-            content_hash: format!("sha256:{}", "a".repeat(64)),
-            provenances: vec![Provenance::Oci {
-                registry: "ghcr.io".to_string(),
-                repository: "example/foo".to_string(),
-                digest: format!("sha256:{}", "b".repeat(64)),
-                source_url: None,
-            }],
-            dep_decl: None,
-            dep_decl_schema_version: None,
-            attestation: None,
-            namespace: String::new(),
-            published_at: None,
-            yanked: false,
-            yanked_at: None,
-            yanked_reason: None,
-            published_at_raw: None,
-        }],
-    };
-    let result = super::validate_transitive_url_against_registry(
-        "foo", "https://example.com/foo.git", &pkg,
-    )
-    .expect("incomparable transport with content_hash must defer, not error");
-    assert_eq!(result, Some(vec![format!("sha256:{}", "a".repeat(64))]));
-}
-
-#[test]
-fn validate_transitive_url_oci_only_entry_multiple_versions_defers_union_of_hashes() {
-    // Content_hash is gathered across ALL versions, not just the newest —
-    // mirrors `registry_git_urls`'s "every version" convention for the
-    // git-comparison path.
-    let pkg = Package {
-        name: "foo".to_string(),
-        namespace: String::new(),
-        versions: vec![
-            IndexVersion {
-                version: "2.0.0".into(),
-                content_hash: format!("sha256:{}", "c".repeat(64)),
-                provenances: vec![Provenance::Oci {
-                    registry: "ghcr.io".to_string(),
-                    repository: "example/foo".to_string(),
-                    digest: format!("sha256:{}", "d".repeat(64)),
-                    source_url: None,
-                }],
-                dep_decl: None,
-                dep_decl_schema_version: None,
-                attestation: None,
-                namespace: String::new(),
-                published_at: None,
-                yanked: false,
-                yanked_at: None,
-                yanked_reason: None,
-                published_at_raw: None,
-            },
-            IndexVersion {
-                version: "1.0.0".into(),
-                content_hash: format!("sha256:{}", "a".repeat(64)),
-                provenances: vec![Provenance::Oci {
-                    registry: "ghcr.io".to_string(),
-                    repository: "example/foo".to_string(),
-                    digest: format!("sha256:{}", "b".repeat(64)),
-                    source_url: None,
-                }],
-                dep_decl: None,
-                dep_decl_schema_version: None,
-                attestation: None,
-                namespace: String::new(),
-                published_at: None,
-                yanked: false,
-                yanked_at: None,
-                yanked_reason: None,
-                published_at_raw: None,
-            },
-        ],
-    };
-    let mut result = super::validate_transitive_url_against_registry(
-        "foo", "https://example.com/foo.git", &pkg,
-    )
-    .expect("must defer")
-    .expect("must be Some");
-    result.sort();
-    assert_eq!(
-        result,
-        vec![format!("sha256:{}", "a".repeat(64)), format!("sha256:{}", "c".repeat(64))],
-    );
-}
-
-#[test]
-fn validate_transitive_url_disagrees_oci_only_entry_no_content_hash_recorded() {
-    // OCI-only AND no content_hash recorded either (legacy entry) — nothing
-    // to validate against even deferred — immediate conflict.
-    let pkg = Package {
-        name: "foo".to_string(),
-        namespace: String::new(),
-        versions: vec![IndexVersion {
-            version: "1.0.0".into(),
-            content_hash: String::new(),
-            provenances: vec![Provenance::Oci {
-                registry: "ghcr.io".to_string(),
-                repository: "example/foo".to_string(),
-                digest: format!("sha256:{}", "b".repeat(64)),
-                source_url: None,
-            }],
-            dep_decl: None,
-            dep_decl_schema_version: None,
-            attestation: None,
-            namespace: String::new(),
-            published_at: None,
-            yanked: false,
-            yanked_at: None,
-            yanked_reason: None,
-            published_at_raw: None,
-        }],
-    };
-    let err = super::validate_transitive_url_against_registry(
-        "foo", "https://example.com/foo.git", &pkg,
-    )
-    .unwrap_err();
-    assert_eq!(err.code(), "RES-PROVENANCE-CONFLICT");
-}
-
-#[test]
-fn validate_transitive_url_disagrees_no_provenance_at_all() {
-    // A package version with no provenance recorded whatsoever, and no
-    // content_hash either — also incomparable by source or identity —
-    // immediate conflict.
-    let pkg = Package {
-        name: "foo".to_string(),
-        namespace: String::new(),
-        versions: vec![IndexVersion {
-            version: "1.0.0".into(),
-            content_hash: String::new(),
-            provenances: vec![],
-            dep_decl: None,
-            dep_decl_schema_version: None,
-            attestation: None,
-            namespace: String::new(),
-            published_at: None,
-            yanked: false,
-            yanked_at: None,
-            yanked_reason: None,
-            published_at_raw: None,
-        }],
-    };
-    let err = super::validate_transitive_url_against_registry(
-        "foo", "https://example.com/foo.git", &pkg,
-    )
-    .unwrap_err();
-    assert_eq!(err.code(), "RES-PROVENANCE-CONFLICT");
-}
-
-#[test]
-fn validate_transitive_url_defers_no_provenance_at_all_but_content_hash_present() {
-    // No provenance recorded at all, but content_hash IS present — same
-    // deferred path as OCI-only (the "incomparable transport" branch is
-    // keyed on absence of a git provenance, not on OCI specifically).
-    let pkg = Package {
-        name: "foo".to_string(),
-        namespace: String::new(),
-        versions: vec![IndexVersion {
-            version: "1.0.0".into(),
-            content_hash: format!("sha256:{}", "e".repeat(64)),
-            provenances: vec![],
-            dep_decl: None,
-            dep_decl_schema_version: None,
-            attestation: None,
-            namespace: String::new(),
-            published_at: None,
-            yanked: false,
-            yanked_at: None,
-            yanked_reason: None,
-            published_at_raw: None,
-        }],
-    };
-    let result = super::validate_transitive_url_against_registry(
-        "foo", "https://example.com/foo.git", &pkg,
-    )
-    .expect("must defer");
-    assert_eq!(result, Some(vec![format!("sha256:{}", "e".repeat(64))]));
-}
-
-/// Build a minimal single-version `Package` carrying one OCI provenance
-/// with a recorded `source_url` (registry-protocol §3.3's optional oci
-/// `source` field), for the `validate_transitive_url_against_registry` OCI
-/// source_url unit tests below.
-fn pkg_with_oci_source(name: &str, source_url: &str) -> Package {
-    Package {
-        name: name.to_string(),
-        namespace: String::new(),
-        versions: vec![IndexVersion {
-            version: "1.0.0".into(),
-            content_hash: format!("sha256:{}", "a".repeat(64)),
-            provenances: vec![Provenance::Oci {
-                registry: "ghcr.io".to_string(),
-                repository: "example/foo".to_string(),
-                digest: format!("sha256:{}", "b".repeat(64)),
-                source_url: Some(source_url.to_string()),
-            }],
-            dep_decl: None,
-            dep_decl_schema_version: None,
-            attestation: None,
-            namespace: String::new(),
-            published_at: None,
-            yanked: false,
-            yanked_at: None,
-            yanked_reason: None,
-            published_at_raw: None,
-        }],
-    }
-}
-
-#[test]
-fn validate_transitive_url_agrees_oci_source_url_match_no_git_provenance() {
-    // An OCI-only entry that DOES carry a source_url: a git= claim matching
-    // that source_url is an outright AGREE (returns Ok(None), no deferred
-    // content-hash check needed) — even though NO Provenance::Git is
-    // recorded at all. This is the amoxtli/softlink@main case in miniature:
-    // the transitive pins a ref that was never published as a registry
-    // version. Mirrors Python's
-    // `test_agrees_oci_source_url_match_no_git_provenance`.
-    let pkg = pkg_with_oci_source("foo", "https://github.com/example/foo.git");
-    let result = super::validate_transitive_url_against_registry(
-        "foo", "https://github.com/example/foo.git", &pkg,
-    )
-    .expect("agreement must not error");
-    assert_eq!(result, None);
-}
-
-#[test]
-fn validate_transitive_url_agrees_oci_source_url_normalized_git_suffix_and_case() {
-    let pkg = pkg_with_oci_source("foo", "https://Github.com/example/foo.git");
-    let result = super::validate_transitive_url_against_registry(
-        "foo", "https://github.com/example/foo", &pkg,
-    )
-    .expect("normalized comparison must agree");
-    assert_eq!(result, None);
-}
-
-#[test]
-fn validate_transitive_url_disagrees_oci_source_url_different_repository() {
-    // A recorded source_url that does NOT match the claim is a genuine
-    // disagreement — resolved statically, pre-fetch, exactly like the
-    // git-vs-git disagreement case (no deferred content-hash fallback).
-    let pkg = pkg_with_oci_source("foo", "https://github.com/example/foo.git");
-    let err = super::validate_transitive_url_against_registry(
-        "foo", "https://github.com/example/foo-fork.git", &pkg,
-    )
-    .unwrap_err();
-    assert_eq!(err.code(), "RES-PROVENANCE-CONFLICT");
-    assert!(format!("{err:?}").contains("foo"));
-}
-
-#[test]
-fn validate_transitive_url_oci_no_source_url_still_defers_to_content_hash() {
-    // OCI provenance with source_url = None (unset) is indistinguishable
-    // from a legacy entry for THIS decision — falls through to the
-    // pre-existing content-hash fallback, unchanged.
-    let pkg = Package {
-        name: "foo".to_string(),
-        namespace: String::new(),
-        versions: vec![IndexVersion {
-            version: "1.0.0".into(),
-            content_hash: format!("sha256:{}", "a".repeat(64)),
-            provenances: vec![Provenance::Oci {
-                registry: "ghcr.io".to_string(),
-                repository: "example/foo".to_string(),
-                digest: format!("sha256:{}", "b".repeat(64)),
-                source_url: None,
-            }],
-            dep_decl: None,
-            dep_decl_schema_version: None,
-            attestation: None,
-            namespace: String::new(),
-            published_at: None,
-            yanked: false,
-            yanked_at: None,
-            yanked_reason: None,
-            published_at_raw: None,
-        }],
-    };
-    let result = super::validate_transitive_url_against_registry(
-        "foo", "https://example.com/foo.git", &pkg,
-    )
-    .expect("must defer");
-    assert_eq!(result, Some(vec![format!("sha256:{}", "a".repeat(64))]));
-}
-
-// --- direct gate-unit tests: `ResolveProvider::gate`'s tier decision table -
-
-/// A minimal `ResolveProvider` for direct `gate()` unit tests — no
-/// fetch/solve involved. Mirrors `is_root_direct_namespace_aware_direct_unit_coverage`'s
-/// construction pattern above.
-fn gate_provider<'a>(reg: &'a FakeReg, idx: &'a Index, tmp: &tempfile::TempDir) -> super::ResolveProvider<'a> {
-    super::ResolveProvider::new(
-        reg, idx, deps_dir(tmp), BTreeMap::new(), None, None, false, Strategy::Maxver, false, None,
-    )
-}
-
-fn url_item(name: &str, git: &str, refp: &str) -> super::Item {
-    super::Item::Url(UrlDep {
-        name: name.to_string(),
-        git: git.to_string(),
-        git_ref: refp.to_string(),
-        mirrors: Vec::new(),
-        predicates: Vec::new(),
-        flag_requests: Vec::new(),
-        optional: false,
-        version: None,
-    })
-}
-
-fn named_item(name: &str) -> super::Item {
-    super::Item::Named {
-        name: name.to_string(),
-        constraint: milpa_solver::VersionSet::full(),
-        namespace: None,
-    }
-}
-
-#[test]
-fn gate_first_claim_registers_and_proceeds() {
-    let empty_index = Index { packages: vec![] };
-    let empty_reg = FakeReg::git(&[]);
-    let tmp = tempfile::tempdir().unwrap();
-    let p = gate_provider(&empty_reg, &empty_index, &tmp);
-
-    assert!(matches!(p.gate(&url_item("foo", "u1", "main")), super::Gate::Proceed));
-    assert_eq!(
-        p.seen_by_name.borrow().get("foo"),
-        Some(&(super::PKey::Url("u1".into(), "main".into()), super::TIER_SELF_URL)),
-    );
-}
-
-#[test]
-fn gate_same_pkey_dedups() {
-    // Unlike Python's `_check_provenance_gate` (which fuses transport-level
-    // dedup into the gate and returns False/suppress for a repeat same-pkey
-    // claim), Rust's `gate()` returns Proceed for a same-pkey repeat and
-    // relies on the SEPARATE transport-level `seen_url`/`seen_named`/
-    // `seen_local`/`seen_tarball` sets (plus, for URL deps, the S4b
-    // multi-consumer flag-request-union logic in `process_url`) to avoid a
-    // real re-fetch. This is a pre-existing, unchanged architectural split —
-    // #193 only generalizes the TIER the gate arbitrates on, never this
-    // same-pkey branch. "Dedup" here means: the claim does not conflict or
-    // get suppressed by tier — the ACTUAL fetch-once guarantee lives one
-    // layer down, at dispatch.
-    let empty_index = Index { packages: vec![] };
-    let empty_reg = FakeReg::git(&[]);
-    let tmp = tempfile::tempdir().unwrap();
-    let p = gate_provider(&empty_reg, &empty_index, &tmp);
-
-    p.gate(&url_item("foo", "u1", "main"));
-    assert!(matches!(p.gate(&url_item("foo", "u1", "main")), super::Gate::Proceed));
-}
-
-#[test]
-fn gate_named_claims_always_dedup_same_sentinel() {
-    // Two `Named` claims for the same bare name always carry the same
-    // `PKey::Named(DepKey { name, namespace: None })` — the gate always takes
-    // the same-pkey branch (Proceed; see `gate_same_pkey_dedups`'s doc
-    // comment on why that's Proceed, not Suppress, in Rust's design), never
-    // the tier-compare/Conflict branch, regardless of which transitive
-    // introduces the claim or what constraint each carries (constraints
-    // aren't provenance). The real enumerate-once dedup for `Named` claims is
-    // `seen_named` (a `BTreeSet<DepKey>`) in `process_named`.
-    let empty_index = Index { packages: vec![] };
-    let empty_reg = FakeReg::git(&[]);
-    let tmp = tempfile::tempdir().unwrap();
-    let p = gate_provider(&empty_reg, &empty_index, &tmp);
-
-    p.gate(&named_item("foo"));
-    assert!(matches!(p.gate(&named_item("foo")), super::Gate::Proceed));
-}
-
-#[test]
-fn gate_root_wins_over_tier3_url() {
-    let empty_index = Index { packages: vec![] };
-    let empty_reg = FakeReg::git(&[]);
-    let tmp = tempfile::tempdir().unwrap();
-    let mut p = gate_provider(&empty_reg, &empty_index, &tmp);
-    p.root_authority = std::collections::BTreeSet::from(["foo".to_string()]);
-    // Mirrors what `seed_root` would have already written before any BFS item
-    // is ever gated: the root's own claim, recorded at TIER_ROOT.
-    p.seen_by_name.borrow_mut().insert(
-        "foo".to_string(),
-        (super::PKey::Url("root-u".into(), "main".into()), super::TIER_ROOT),
-    );
-
-    assert!(matches!(p.gate(&url_item("foo", "evil-u", "main")), super::Gate::Suppress));
-    assert_eq!(
-        p.seen_by_name.borrow().get("foo"),
-        Some(&(super::PKey::Url("root-u".into(), "main".into()), super::TIER_ROOT)),
-        "root's own entry must be untouched",
-    );
-}
-
-#[test]
-fn gate_root_wins_over_tier2_named() {
-    let empty_index = Index { packages: vec![] };
-    let empty_reg = FakeReg::git(&[]);
-    let tmp = tempfile::tempdir().unwrap();
-    let mut p = gate_provider(&empty_reg, &empty_index, &tmp);
-    p.root_authority = std::collections::BTreeSet::from(["foo".to_string()]);
-    p.seen_by_name.borrow_mut().insert(
-        "foo".to_string(),
-        (super::PKey::Url("root-u".into(), "main".into()), super::TIER_ROOT),
-    );
-
-    assert!(matches!(p.gate(&named_item("foo")), super::Gate::Suppress));
-    assert_eq!(
-        p.seen_by_name.borrow().get("foo"),
-        Some(&(super::PKey::Url("root-u".into(), "main".into()), super::TIER_ROOT)),
-    );
-}
-
-#[test]
-fn gate_tier2_beats_tier3_arriving_after() {
-    // Tier-3 registers first; a differently-keyed tier-2 claim arrives
-    // second — it wins (overwrites the gate entry), Proceed.
-    use milpa_types::DepKey;
-
-    let empty_index = Index { packages: vec![] };
-    let empty_reg = FakeReg::git(&[]);
-    let tmp = tempfile::tempdir().unwrap();
-    let p = gate_provider(&empty_reg, &empty_index, &tmp);
-
-    p.gate(&url_item("foo", "u1", "main"));
-    assert!(matches!(p.gate(&named_item("foo")), super::Gate::Proceed));
-    assert_eq!(
-        p.seen_by_name.borrow().get("foo"),
-        Some(&(super::PKey::Named(DepKey::bare("foo")), super::TIER_REGISTRY)),
-    );
-}
-
-#[test]
-fn gate_tier3_suppressed_when_arriving_after_tier2() {
-    // Tier-2 registers first; a tier-3 claim arrives second — suppressed
-    // BEFORE any fetch would be dispatched.
-    use milpa_types::DepKey;
-
-    let empty_index = Index { packages: vec![] };
-    let empty_reg = FakeReg::git(&[]);
-    let tmp = tempfile::tempdir().unwrap();
-    let p = gate_provider(&empty_reg, &empty_index, &tmp);
-
-    p.gate(&named_item("foo"));
-    assert!(matches!(p.gate(&url_item("foo", "u1", "main")), super::Gate::Suppress));
-    assert_eq!(
-        p.seen_by_name.borrow().get("foo"),
-        Some(&(super::PKey::Named(DepKey::bare("foo")), super::TIER_REGISTRY)),
-        "the registry entry stays authoritative",
-    );
-}
-
-#[test]
-fn gate_tier3_vs_tier3_conflicts_when_no_tier2() {
-    let empty_index = Index { packages: vec![] };
-    let empty_reg = FakeReg::git(&[]);
-    let tmp = tempfile::tempdir().unwrap();
-    let p = gate_provider(&empty_reg, &empty_index, &tmp);
-
-    p.gate(&url_item("foo", "u1", "main"));
-    assert!(matches!(p.gate(&url_item("foo", "u2", "main")), super::Gate::Conflict(_, _)));
-}
-
-#[test]
-fn gate_tier3_vs_tier3_no_conflict_once_tier2_on_record() {
-    // Once a tier-2 claim is recorded for a name, a differing tier-3 claim is
-    // just suppressed (registry already won) — the tier-3-vs-tier-3 conflict
-    // branch is never reached, even for a SECOND differently-keyed tier-3
-    // claim.
-    let empty_index = Index { packages: vec![] };
-    let empty_reg = FakeReg::git(&[]);
-    let tmp = tempfile::tempdir().unwrap();
-    let p = gate_provider(&empty_reg, &empty_index, &tmp);
-
-    p.gate(&named_item("foo"));
-    p.gate(&url_item("foo", "u1", "main"));
-    assert!(matches!(p.gate(&url_item("foo", "u2", "main")), super::Gate::Suppress));
 }
 
 // ---------------------------------------------------------------------------
@@ -6898,6 +6673,7 @@ fn alias_name_override_unifies_with_mismatched_alias_name() {
             target: OverrideTarget::Git {
                 url: ALIAS_FOO_URL.into(),
                 git_ref: "main".into(),
+                subpath: None,
             },
             version: None,
         }],
@@ -6948,4 +6724,810 @@ fn alias_name_ordinary_matching_name_transitive_still_works() {
     let mut names: Vec<&str> = graph.deps.iter().map(|d| d.name.as_str()).collect();
     names.sort();
     assert_eq!(names, vec!["alias-wrapper-baz", "baz"]);
+}
+
+// ---------------------------------------------------------------------------
+// S5-rekey (RFC origin-as-identity.md §4.4, Stage B): the PubGrub solver
+// variable is `BindingResolver::canonical_for(dep_key)` — a function of the
+// BOUND source-id — not `DepKey::solver_var()` (a function of the consumer's
+// own label). Two DISTINCT consumer labels binding to the SAME source-id
+// must collapse to ONE PubGrub package variable pre-fetch. Ported from
+// Python's `tests/test_s5_rekey_solver_var.py` (RFC §9 cross-impl
+// discipline: same shape, same assertions).
+// ---------------------------------------------------------------------------
+
+/// Root declares the registry package bare `foo` (`< 1.3.0`, best
+/// independently = 1.2.0). A fetched transitive package (`wrapper`)
+/// declares, in its OWN `milpa.kdl`, a namespace-qualified requirement on
+/// the SAME origin: `foo namespace="acme" ">= 1.0.0"` (best independently =
+/// 1.3.0, MAXVER default). Solved as ONE PubGrub variable (bare and
+/// qualified both bind to the identical `RegistrySourceId`), the intersected
+/// constraint (`>= 1.0.0, < 1.3.0`) has exactly one MAXVER pick: 1.2.0 — a
+/// single resolved node. Solved as two INDEPENDENT variables (pre-rekey),
+/// each picks its own best version — two resolved nodes for what is, by
+/// origin, ONE package.
+#[test]
+fn resolve_s5_rekey_bare_root_and_qualified_transitive_collapse_to_one_node() {
+    const WRAPPER_URL: &str = "https://example.com/wrapper.git";
+    let versions: [(&str, &str); 3] = [
+        ("1.0.0", "https://example.com/foo-v1.0.0.git"),
+        ("1.2.0", "https://example.com/foo-v1.2.0.git"),
+        ("1.3.0", "https://example.com/foo-v1.3.0.git"),
+    ];
+    let idx_ver = |ver: &str, url: &str| IndexVersion {
+        version: ver.into(),
+        content_hash: hash_of_nimble("foo", &format!("# foo {ver}\n")),
+        provenances: vec![Provenance::Git {
+            url: url.to_string(),
+            ref_spec: "main".to_string(),
+            commit_sha: None,
+        }],
+        dep_decl: None,
+        dep_decl_schema_version: None,
+        attestation: None,
+        namespace: "acme".to_string(),
+        published_at: None,
+        yanked: false,
+        yanked_at: None,
+        yanked_reason: None,
+        published_at_raw: None,
+    };
+    let index = Index {
+        packages: vec![Package {
+            name: "foo".to_string(),
+            namespace: "acme".to_string(),
+            versions: versions.iter().map(|(ver, url)| idx_ver(ver, url)).collect(),
+        }],
+    };
+    let wrapper_kdl = "name \"wrapper\"\nkind \"library\"\ndeps {\n    foo namespace=\"acme\" \">= 1.0.0\"\n}\n";
+    let mut mocks: Vec<(&str, &str, Mock)> = versions
+        .iter()
+        .map(|(ver, url)| (*url, "main", nimble("foo", &format!("# foo {ver}\n"))))
+        .collect();
+    mocks.push((
+        WRAPPER_URL,
+        "main",
+        milpa_kdl("wrappersha0wrappersha0wrappersha0wrapper", wrapper_kdl),
+    ));
+    let reg = FakeReg::git(&mocks);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let m = manifest(vec![
+        named_dep("foo", Some("< 1.3.0")),
+        url_dep("wrapper", WRAPPER_URL, "main"),
+    ]);
+
+    let graph = resolve(
+        &m,
+        Some(&index),
+        &reg,
+        None,
+        None,
+        Strategy::Maxver,
+        true,
+        &deps_dir(&tmp),
+        None,
+        false,
+        &cas_store(&tmp),
+    )
+    .unwrap();
+
+    let foo_nodes: Vec<_> = graph.deps.iter().filter(|d| d.name == "foo").collect();
+    assert_eq!(
+        foo_nodes.len(),
+        1,
+        "expected ONE resolved node for the shared origin (constraints intersected \
+         by a single solver variable), got {}: {:?}",
+        foo_nodes.len(),
+        graph
+            .deps
+            .iter()
+            .map(|d| (d.name.clone(), d.namespace.clone(), d.version.clone()))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(foo_nodes[0].version, v(1, 2, 0));
+}
+
+const S5_REKEY_BEARSSL_URL: &str = "https://example.com/bearssl.git";
+const S5_REKEY_BEARSSL_REF: &str = "v1";
+const S5_REKEY_CHRONOS_URL: &str = "https://example.com/chronos.git";
+const S5_REKEY_CHRONOS_REF: &str = "main";
+
+/// RFC §4.4.1 (the normative two-phase design): root declares `bearssl
+/// git=<url>` directly (a phase-1 kind-default git claim, bound at
+/// `BindingResolver::new`). A transitive package (`chronos`, also
+/// root-declared via git) has its OWN `.nimble` with a BARE `requires
+/// "bearssl >= 0.2.8"` — an ordinary `NamedRequire`, which would naively
+/// guess a fictional registry coordinate for "bearssl" (no index is
+/// configured in this test at all).
+///
+/// Phase 1 step 1 (binding-aware) intercepts this: `bearssl`'s `DepKey` is
+/// ALREADY bound (root's own git claim), so the transitive's guess is never
+/// even computed — it resolves to the SAME `canonical(GitSourceId(url=…))`
+/// string root's own term uses. One PubGrub variable, unified PRE-fetch.
+/// Must resolve to ONE node whose source is the git URL — not two nodes,
+/// and not a spurious SOLVE-CONFLICT (the historical failure mode this
+/// exact shape hit before the binding-first check existed).
+#[test]
+fn resolve_s5_rekey_root_git_dep_and_transitive_bare_named_require_collapse_to_one_git_node() {
+    let reg = FakeReg::git(&[
+        (
+            S5_REKEY_BEARSSL_URL,
+            S5_REKEY_BEARSSL_REF,
+            nimble(
+                "bbb111",
+                "# Package\nversion = \"0.5.0\"\nauthor = \"example\"\n\
+                 description = \"bearssl\"\nlicense = \"MIT\"\n",
+            ),
+        ),
+        (
+            S5_REKEY_CHRONOS_URL,
+            S5_REKEY_CHRONOS_REF,
+            nimble(
+                "ccc111",
+                "# Package\nauthor = \"example\"\n\
+                 description = \"chronos (no version declared)\"\nlicense = \"MIT\"\n\
+                 requires \"bearssl >= 0.2.8\"\n",
+            ),
+        ),
+    ]);
+    let tmp = tempfile::tempdir().unwrap();
+    let m = manifest(vec![
+        url_dep("bearssl", S5_REKEY_BEARSSL_URL, S5_REKEY_BEARSSL_REF),
+        url_dep("chronos", S5_REKEY_CHRONOS_URL, S5_REKEY_CHRONOS_REF),
+    ]);
+
+    let graph = resolve(
+        &m,
+        None,
+        &reg,
+        None,
+        None,
+        Strategy::Maxver,
+        true,
+        &deps_dir(&tmp),
+        None,
+        false,
+        &cas_store(&tmp),
+    )
+    .unwrap();
+
+    let bearssl_nodes: Vec<_> = graph.deps.iter().filter(|d| d.name == "bearssl").collect();
+    assert_eq!(
+        bearssl_nodes.len(),
+        1,
+        "expected ONE resolved node for 'bearssl' (root git claim and transitive \
+         bare NamedRequire must unify PRE-fetch via phase-1 binding resolution), \
+         got {}: {:?}",
+        bearssl_nodes.len(),
+        graph
+            .deps
+            .iter()
+            .map(|d| (d.name.clone(), d.version.clone(), d.provenances.clone()))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(bearssl_nodes[0].version, v(0, 5, 0));
+    match &bearssl_nodes[0].provenances[0] {
+        ProvenanceRecord::Git { url, .. } => assert_eq!(url, S5_REKEY_BEARSSL_URL),
+        other => panic!("expected git provenance, got {other:?}"),
+    }
+    assert!(graph.deps.iter().any(|d| d.name == "chronos"));
+}
+
+// ---------------------------------------------------------------------------
+// RES-DEAD-OVERRIDE (S5b — rfc-origin-as-identity.md §10 item 12 / B10, F7
+// Rust-half CLI-wide solver_var audit). Mirrors Python's
+// `tests/test_res_dead_override.py` (the DONE-GREEN reference): a root
+// `overrides {}` entry naming a dep absent from the FINAL resolved graph is
+// dead config (a typo, or an orphaned override left behind after the dep it
+// targeted was removed). Warn-only, non-fatal — same pattern as
+// `RES-REGISTRY-SHADOW`'s default (warn) policy, whose own tests
+// (`resolve_lattice_lone_url_pin_of_registry_name_disagrees_warns_and_resolves`
+// above) likewise assert on BEHAVIOR (non-fatal, correct graph), not on the
+// `eprintln!` warning text itself — there is no in-process stderr-capture
+// harness in this crate, so these tests follow the same established
+// convention rather than introducing one.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn resolve_dead_override_warns_and_resolution_still_succeeds() {
+    // (a)+(c): an override naming a dep no manifest dep uses must not be
+    // fatal — resolution still succeeds with the real dep present.
+    let reg = FakeReg::git(&[(
+        "https://example.com/lib-a.git",
+        "main",
+        nimble(&"aaaa".repeat(10), ""),
+    )]);
+    let tmp = tempfile::tempdir().unwrap();
+    let m = manifest_full(
+        vec![url_dep("lib-a", "https://example.com/lib-a.git", "main")],
+        Vec::new(),
+        vec![Override {
+            name: "ghost-dep".into(),
+            target: OverrideTarget::Git {
+                url: "https://example.com/fork.git".into(),
+                git_ref: "main".into(),
+                subpath: None,
+            },
+            version: None,
+        }],
+    );
+    let graph = resolve(
+        &m,
+        None,
+        &reg,
+        None,
+        None,
+        Strategy::Maxver,
+        true,
+        &deps_dir(&tmp),
+        None,
+        false,
+        &cas_store(&tmp),
+    )
+    .expect("a dead override must warn, never hard-fail resolution");
+    assert!(graph.deps.iter().any(|d| d.name == "lib-a"));
+    // The dead-override slug exists in the catalog (bijection lint) even
+    // though — mirroring RES-REGISTRY-SHADOW's warn-only path — no slug
+    // string is embedded in the diagnostic's message text itself.
+    assert!(crate::implemented_error_codes().contains(&"RES-DEAD-OVERRIDE"));
+}
+
+#[test]
+fn resolve_consumed_override_resolves_fine_no_dead_config() {
+    // (b): an override that redirects a dep ACTUALLY present in the graph is
+    // the ordinary (non-dead) case — must resolve exactly like any other
+    // override redirect (see `resolve_url_dep_with_override_fetches_override`
+    // above), never treated as dead config.
+    let reg = FakeReg::git(&[(
+        "https://example.com/lib-a-fork.git",
+        "main",
+        nimble(&"ffff".repeat(10), ""),
+    )]);
+    let tmp = tempfile::tempdir().unwrap();
+    let m = manifest_full(
+        vec![url_dep("lib-a", "https://example.com/lib-a.git", "main")],
+        Vec::new(),
+        vec![Override {
+            name: "lib-a".into(),
+            target: OverrideTarget::Git {
+                url: "https://example.com/lib-a-fork.git".into(),
+                git_ref: "main".into(),
+                subpath: None,
+            },
+            version: None,
+        }],
+    );
+    let graph = resolve(
+        &m,
+        None,
+        &reg,
+        None,
+        None,
+        Strategy::Maxver,
+        true,
+        &deps_dir(&tmp),
+        None,
+        false,
+        &cas_store(&tmp),
+    )
+    .expect("a consumed override must resolve fine");
+    assert!(graph.deps.iter().any(|d| d.name == "lib-a"));
+}
+
+#[test]
+fn resolve_workspace_dead_override_warns_and_resolution_still_succeeds() {
+    // (a)+(c) for the WORKSPACE path (`resolve_workspace`) — the real gap
+    // this slice closed: before S5b, only the standalone `resolve()` had
+    // this check; a workspace-root override naming no resolved dep silently
+    // no-op'd with zero diagnostic (`resolve_workspace_inner` had none).
+    let tmp = tempfile::tempdir().unwrap();
+    let ws_root = tmp.path().join("ws");
+    let member_dir = ws_root.join("member-a");
+    std::fs::create_dir_all(&member_dir).unwrap();
+    std::fs::write(
+        ws_root.join("milpa.kdl"),
+        "workspace {\n    member \"member-a\"\n}\noverrides {\n    pkg \"ghost-dep\" \
+         git=(url)\"https://example.com/fork.git\" ref=\"main\"\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        member_dir.join("milpa.kdl"),
+        "name \"member-a\"\nkind \"library\"\n",
+    )
+    .unwrap();
+
+    let workspace = crate::workspace::load_workspace(&ws_root).expect("load_workspace");
+    let reg = FakeReg::git(&[]);
+    let graph = crate::resolver::resolve_workspace(
+        &workspace,
+        None,
+        &reg,
+        None,
+        None,
+        Strategy::Maxver,
+        true,
+        &deps_dir(&tmp),
+        false,
+        &cas_store(&tmp),
+    )
+    .expect("a dead override at the workspace root must warn, never hard-fail resolution");
+    assert!(graph.deps.iter().any(|d| d.name == "member-a"));
+}
+
+// ---------------------------------------------------------------------------
+// S8 — subpath grammar end-to-end (rfc-origin-as-identity.md §4.1/§10 item
+// 14). Mirrors Python's test_subpath_grammar.py `TestSubpathEndToEnd`: a
+// traversing subpath on a REAL root dep raises SRC-ID-MALFORMED during
+// resolve() (binding.rs's `dep_declared_raw_origin` threads it into the
+// `SourceId`; `source_id::normalize_source` is the sole validation boundary).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn s8_traversing_subpath_on_root_dep_raises_during_resolve() {
+    let reg = FakeReg::git(&[(
+        "https://example.com/foo.git",
+        "main",
+        milpa_kdl("s1", "name \"foo\"\nkind \"library\"\n"),
+    )]);
+    let tmp = tempfile::tempdir().unwrap();
+    let mut m = manifest(vec![Dep::Url(UrlDep {
+        name: "foo".to_string(),
+        git: "https://example.com/foo.git".to_string(),
+        git_ref: "main".to_string(),
+        mirrors: Vec::new(),
+        predicates: Vec::new(),
+        flag_requests: Vec::new(),
+        optional: false,
+        version: None,
+        subpath: Some("../escape".to_string()),
+    })]);
+    m.name = Some("myapp".to_string());
+    let err = resolve(
+        &m,
+        None,
+        &reg,
+        None,
+        None,
+        Strategy::Maxver,
+        true,
+        &deps_dir(&tmp),
+        None,
+        false,
+        &cas_store(&tmp),
+    )
+    .unwrap_err();
+    assert_eq!(err.code(), "SRC-ID-MALFORMED");
+}
+
+// ---------------------------------------------------------------------------
+// S8 completeness — BFS candidate dedup (`seen_url`) must be keyed by
+// (url, ref, subpath), not (url, ref). Two root deps sharing the same git
+// url + ref but DIFFERENT subpaths are DIFFERENT source-ids (RFC §7 "same
+// repo + different subpath = different source-ids, correctly") — each MUST
+// get its own claim, candidate, and fetch. Before the fix, the second dep's
+// solver term had no backing candidate at all (the BFS `seen_url` gate in
+// `process_url` dropped it as an already-seen (url, ref) pair, subpath
+// un-consulted): PubGrub then reported the missing package as unsatisfiable
+// — a hard crash (`resolve()` returning `Err`), not a silent single-node
+// resolve. Mirrors Python's `test_subpath_grammar.py`
+// `TestSubpathSeenUrlDedup`.
+//
+// Note on the post-fix shape: subpath is (per fixture-463 and this RFC
+// slice) a pure IDENTITY discriminator, not a partial-checkout mechanism —
+// the fake fetcher (like the real one) still materializes the whole mocked
+// tree and `compute_content_hash` still hashes the whole tree, so two
+// same-url+ref deps that differ only in subpath fetch byte-IDENTICAL
+// content. The separate, pre-existing Phase-B merge-on-content-identity
+// pass therefore legitimately folds them into one canonical lockfile entry
+// — but VISIBLY (an alias + a collapse note), never silently, and only
+// AFTER both independently got their own claim/candidate/fetch. That's the
+// completeness bar this test enforces: no crash, both names physically
+// fetched, distinct source-ids up to the point of the (correct, unrelated)
+// content-identity merge.
+// ---------------------------------------------------------------------------
+
+fn url_dep_with_subpath(name: &str, git: &str, refp: &str, subpath: Option<&str>) -> Dep {
+    Dep::Url(UrlDep {
+        subpath: subpath.map(str::to_string),
+        name: name.to_string(),
+        git: git.to_string(),
+        git_ref: refp.to_string(),
+        mirrors: Vec::new(),
+        predicates: Vec::new(),
+        flag_requests: Vec::new(),
+        optional: false,
+        version: None,
+    })
+}
+
+#[test]
+fn s8_same_url_ref_different_subpath_resolves_without_conflict() {
+    // RED (pre-fix): resolve() returned Err (SOLVE-CONFLICT) — pkg-b's
+    // solver term had no candidate because `seen_url` (keyed by bare
+    // (url, ref)) silently absorbed it into pkg-a's already-seen entry.
+    let url = "https://example.com/monorepo.git";
+    let refp = "main";
+    let mocked = milpa_kdl("b".repeat(40).as_str(), "name \"monorepo\"\nkind \"library\"\n");
+    let reg = FakeReg::git(&[(url, refp, mocked)]);
+    let tmp = tempfile::tempdir().unwrap();
+    let m = manifest(vec![
+        url_dep_with_subpath("pkg-a", url, refp, Some("packages/a")),
+        url_dep_with_subpath("pkg-b", url, refp, Some("packages/b")),
+    ]);
+    let deps_dir = deps_dir(&tmp);
+
+    // Must not raise SOLVE-CONFLICT (pre-fix behavior).
+    let graph = resolve(
+        &m,
+        None,
+        &reg,
+        None,
+        None,
+        Strategy::Maxver,
+        true,
+        &deps_dir,
+        None,
+        false,
+        &cas_store(&tmp),
+    )
+    .unwrap();
+
+    // Both names were independently claimed, candidated, and fetched to
+    // disk — proof neither was dropped at the BFS seen_url gate itself
+    // (only later, visibly, folded by the unrelated content-identity pass).
+    assert!(deps_dir.join("pkg-a").exists());
+    assert!(deps_dir.join("pkg-b").exists());
+
+    // Byte-identical fetches (subpath is identity-only, not a partial
+    // checkout — see module note above) legitimately collapse to ONE
+    // canonical top-level entry; which name survives is BFS-declaration-
+    // order (pkg-a first), and the collapse is recorded as a VISIBLE
+    // alias, never a silent disappearance (RFC §4.7).
+    assert_eq!(graph.deps.len(), 1, "deduped to one node");
+    let survivor = &graph.deps[0];
+    assert_eq!(survivor.name, "pkg-a");
+    match &survivor.source_id {
+        Some(SourceId::Fetchable(FetchableOrigin::Git { subpath, .. })) => {
+            assert_eq!(subpath.as_deref(), Some("packages/a"));
+        }
+        other => panic!("expected Fetchable(Git) source_id, got {other:?}"),
+    }
+    assert_eq!(survivor.aliases, vec!["pkg-b".to_string()]);
+
+    let notes = collapse_notes(&graph.deps);
+    assert!(
+        notes.iter().any(|n| n.contains("pkg-b") && n.contains("pkg-a")),
+        "expected a collapse note naming both pkg-a and pkg-b, got {notes:?}"
+    );
+}
+
+#[test]
+fn s8_same_url_ref_same_subpath_same_name_still_dedups() {
+    // No regression: TRUE identity (same url+ref+subpath) for the SAME
+    // name still collapses to one candidate — a root dep re-arriving
+    // through the BFS arm (e.g. re-declared identically) is a harmless
+    // re-submission, not a second node.
+    let url = "https://example.com/monorepo.git";
+    let refp = "main";
+    let mocked = milpa_kdl("c".repeat(40).as_str(), "name \"monorepo\"\nkind \"library\"\n");
+    let reg = FakeReg::git(&[(url, refp, mocked)]);
+    let tmp = tempfile::tempdir().unwrap();
+    let m = manifest(vec![url_dep_with_subpath("pkg-a", url, refp, Some("packages/a"))]);
+    let graph = resolve(
+        &m,
+        None,
+        &reg,
+        None,
+        None,
+        Strategy::Maxver,
+        true,
+        &deps_dir(&tmp),
+        None,
+        false,
+        &cas_store(&tmp),
+    )
+    .unwrap();
+
+    let matches: Vec<_> = graph.deps.iter().filter(|d| d.name == "pkg-a").collect();
+    assert_eq!(matches.len(), 1);
+    match &matches[0].source_id {
+        Some(SourceId::Fetchable(FetchableOrigin::Git { subpath, .. })) => {
+            assert_eq!(subpath.as_deref(), Some("packages/a"));
+        }
+        other => panic!("expected Fetchable(Git) source_id, got {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// S8b — COMPLETE overrides grammar, resolution (rfc-origin-as-identity.md §7
+// B5 / §10 item 14). Mirrors Python's test_override_targets_extended.py
+// resolution classes: each target kind actually REBINDS a dep's source — the
+// dep resolves via the override target, not its original (git) declaration.
+// Proven by never providing a mocked git fixture for the original
+// declaration (so a fall-through-to-git bug would raise a fetch error, not
+// silently succeed).
+// ---------------------------------------------------------------------------
+
+/// R3 (code-review): a manifest OCI override with a malformed `digest=` is
+/// rejected with a clean coded error (TNG-BAD-OCI-DIGEST) at the fetch
+/// boundary, never reaching `oras pull` as a generic failure. The index path
+/// already validates OCI digests on parse; the manifest-override path did not.
+#[test]
+fn oci_override_malformed_digest_fails_with_coded_error_before_fetch() {
+    let reg = FakeReg::oci(&[]); // must never be reached
+    let m = manifest_full(
+        vec![url_dep("foo", "https://example.com/foo-DO-NOT-FETCH.git", "main")],
+        Vec::new(),
+        vec![Override {
+            name: "foo".into(),
+            target: OverrideTarget::Oci {
+                registry: "ghcr.io".into(),
+                repository: "acme/foo".into(),
+                digest: "not-a-valid-digest".into(),
+                subpath: None,
+            },
+            version: None,
+        }],
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    let err = resolve(
+        &m, None, &reg, None, None, Strategy::Maxver, true, &deps_dir(&tmp), None, false,
+        &cas_store(&tmp),
+    )
+    .expect_err("malformed OCI override digest must be rejected with a coded error");
+    assert_eq!(err.code(), "TNG-BAD-OCI-DIGEST");
+    // The malformed digest never reached the fetcher.
+    assert!(reg.calls().is_empty());
+}
+
+#[test]
+fn s8b_oci_target_rebinds_resolution() {
+    let digest = format!("sha256:{}", "c".repeat(64));
+    let reg = FakeReg::oci(&[(
+        "ghcr.io",
+        "acme/foo",
+        &digest,
+        nimble("s-oci", "version = \"1.0.0\"\nauthor = \"a\"\nlicense = \"MIT\"\n"),
+    )]);
+    let m = manifest_full(
+        vec![url_dep("foo", "https://example.com/foo-DO-NOT-FETCH.git", "main")],
+        Vec::new(),
+        vec![Override {
+            name: "foo".into(),
+            target: OverrideTarget::Oci {
+                registry: "ghcr.io".into(),
+                repository: "acme/foo".into(),
+                digest: digest.clone(),
+                subpath: None,
+            },
+            version: None,
+        }],
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    let graph = resolve(
+        &m, None, &reg, None, None, Strategy::Maxver, true, &deps_dir(&tmp), None, false,
+        &cas_store(&tmp),
+    )
+    .unwrap();
+
+    // The original git URL was NEVER fetched — only the OCI reference.
+    assert_eq!(
+        reg.calls(),
+        vec![("foo".to_string(), format!("ghcr.io/acme/foo@{digest}"), String::new())]
+    );
+    let dep = graph.deps.iter().find(|d| d.name == "foo").unwrap();
+    assert_eq!(dep.provenances.len(), 1);
+    match &dep.provenances[0] {
+        ProvenanceRecord::Oci { registry, repository, digest: d, .. } => {
+            assert_eq!(registry, "ghcr.io");
+            assert_eq!(repository, "acme/foo");
+            assert_eq!(d, &digest);
+        }
+        other => panic!("expected Oci provenance, got {other:?}"),
+    }
+}
+
+#[test]
+fn s8b_tarball_target_rebinds_resolution() {
+    let reg = tarball_reg(&[(
+        "https://example.com/foo-real.tar.gz",
+        nimble("s-tb", "version = \"2.0.0\"\n"),
+    )]);
+    let m = manifest_full(
+        vec![url_dep("foo", "https://example.com/foo-DO-NOT-FETCH.git", "main")],
+        Vec::new(),
+        vec![Override {
+            name: "foo".into(),
+            target: OverrideTarget::Tarball {
+                url: "https://example.com/foo-real.tar.gz".into(),
+                sha256: None,
+                strip_components: 0,
+                subpath: None,
+            },
+            version: None,
+        }],
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    let graph = resolve(
+        &m, None, &reg, None, None, Strategy::Maxver, true, &deps_dir(&tmp), None, false,
+        &cas_store(&tmp),
+    )
+    .unwrap();
+
+    assert_eq!(
+        reg.calls(),
+        vec![("foo".to_string(), "https://example.com/foo-real.tar.gz".to_string(), String::new())]
+    );
+    let dep = graph.deps.iter().find(|d| d.name == "foo").unwrap();
+    assert_eq!(dep.provenances.len(), 1);
+    match &dep.provenances[0] {
+        ProvenanceRecord::Tarball { url, .. } => {
+            assert_eq!(url, "https://example.com/foo-real.tar.gz");
+        }
+        other => panic!("expected Tarball provenance, got {other:?}"),
+    }
+    assert_eq!(dep.version.to_string(), "2.0.0");
+}
+
+/// A two-version `widget` index — version 1.0.0 and 2.0.0, each with its own
+/// distinct OCI provenance/digest — used by the `RegistryTarget`
+/// version-scoped override tests below. Mirrors Python's
+/// `TestRegistryTargetRebindsResolution._index`.
+fn widget_index_two_versions(hash_v1: &str, hash_v2: &str) -> Index {
+    Index {
+        packages: vec![Package {
+            name: "widget".to_string(),
+            namespace: "acme".to_string(),
+            versions: vec![
+                IndexVersion {
+                    version: "1.0.0".to_string(),
+                    content_hash: hash_v1.to_string(),
+                    provenances: vec![Provenance::Oci {
+                        registry: "ghcr.io".to_string(),
+                        repository: "acme/widget".to_string(),
+                        digest: format!("sha256:{}", "1".repeat(64)),
+                        source_url: None,
+                    }],
+                    dep_decl: None,
+                    dep_decl_schema_version: None,
+                    attestation: None,
+                    namespace: "acme".to_string(),
+                    published_at: None,
+                    yanked: false,
+                    yanked_at: None,
+                    yanked_reason: None,
+                    published_at_raw: None,
+                },
+                IndexVersion {
+                    version: "2.0.0".to_string(),
+                    content_hash: hash_v2.to_string(),
+                    provenances: vec![Provenance::Oci {
+                        registry: "ghcr.io".to_string(),
+                        repository: "acme/widget".to_string(),
+                        digest: format!("sha256:{}", "2".repeat(64)),
+                        source_url: None,
+                    }],
+                    dep_decl: None,
+                    dep_decl_schema_version: None,
+                    attestation: None,
+                    namespace: "acme".to_string(),
+                    published_at: None,
+                    yanked: false,
+                    yanked_at: None,
+                    yanked_reason: None,
+                    published_at_raw: None,
+                },
+            ],
+        }],
+    }
+}
+
+#[test]
+fn s8b_registry_target_rebinds_maxver_default() {
+    // No version= on the override -> ordinary maxver precedence picks the
+    // newest (2.0.0), proving the redirect is live (not a no-op) and
+    // establishing the baseline the version-scoped test below overrides.
+    let hash_v1 = hash_of_nimble("old-fork", "version = \"1.0.0\"\n");
+    let hash_v2 = hash_of_nimble("old-fork", "version = \"2.0.0\"\n");
+    let index = widget_index_two_versions(&hash_v1, &hash_v2);
+    let reg = FakeReg::oci(&[
+        ("ghcr.io", "acme/widget", &format!("sha256:{}", "1".repeat(64)), nimble("s1", "version = \"1.0.0\"\n")),
+        ("ghcr.io", "acme/widget", &format!("sha256:{}", "2".repeat(64)), nimble("s2", "version = \"2.0.0\"\n")),
+    ]);
+    let m = manifest_full(
+        vec![url_dep("old-fork", "https://example.com/old-fork-DO-NOT-FETCH.git", "main")],
+        Vec::new(),
+        vec![Override {
+            name: "old-fork".into(),
+            target: OverrideTarget::Registry { name: "widget".into(), namespace: Some("acme".into()) },
+            version: None,
+        }],
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    let graph = resolve(
+        &m, Some(&index), &reg, None, None, Strategy::Maxver, true, &deps_dir(&tmp), None, false,
+        &cas_store(&tmp),
+    )
+    .unwrap();
+    let dep = graph.deps.iter().find(|d| d.name == "old-fork").unwrap();
+    assert_eq!(dep.version.to_string(), "2.0.0");
+    match &dep.provenances[0] {
+        ProvenanceRecord::Oci { digest, .. } => assert_eq!(digest, &format!("sha256:{}", "2".repeat(64))),
+        other => panic!("expected Oci provenance, got {other:?}"),
+    }
+}
+
+#[test]
+fn s8b_registry_target_version_scoped_pins_exact_version() {
+    // version= on the RegistryTarget override pins the solver to EXACTLY
+    // that version, even though a newer one (2.0.0) exists in the index and
+    // would otherwise win under maxver.
+    let hash_v1 = hash_of_nimble("old-fork", "version = \"1.0.0\"\n");
+    let hash_v2 = hash_of_nimble("old-fork", "version = \"2.0.0\"\n");
+    let index = widget_index_two_versions(&hash_v1, &hash_v2);
+    let reg = FakeReg::oci(&[
+        ("ghcr.io", "acme/widget", &format!("sha256:{}", "1".repeat(64)), nimble("s1", "version = \"1.0.0\"\n")),
+        ("ghcr.io", "acme/widget", &format!("sha256:{}", "2".repeat(64)), nimble("s2", "version = \"2.0.0\"\n")),
+    ]);
+    let m = manifest_full(
+        vec![url_dep("old-fork", "https://example.com/old-fork-DO-NOT-FETCH.git", "main")],
+        Vec::new(),
+        vec![Override {
+            name: "old-fork".into(),
+            target: OverrideTarget::Registry { name: "widget".into(), namespace: Some("acme".into()) },
+            version: Some(Version::release(1, 0, 0)),
+        }],
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    let graph = resolve(
+        &m, Some(&index), &reg, None, None, Strategy::Maxver, true, &deps_dir(&tmp), None, false,
+        &cas_store(&tmp),
+    )
+    .unwrap();
+    let dep = graph.deps.iter().find(|d| d.name == "old-fork").unwrap();
+    assert_eq!(dep.version.to_string(), "1.0.0");
+    match &dep.provenances[0] {
+        ProvenanceRecord::Oci { digest, .. } => assert_eq!(digest, &format!("sha256:{}", "1".repeat(64))),
+        other => panic!("expected Oci provenance, got {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Composition with phase-1 binding (S5-rekey): the dead-override diagnostic
+// still fires (non-fatal) for the new target kinds when the name is unused —
+// mirrors the existing `resolve_dead_override_warns_and_resolution_still_
+// succeeds` convention (behavior-only assertion; no in-process stderr
+// capture harness in this crate).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn s8b_oci_target_dead_override_on_unused_name_warns_non_fatal() {
+    let reg = FakeReg::git(&[(
+        "https://example.com/lib-a.git",
+        "main",
+        nimble(&"aaaa".repeat(10), ""),
+    )]);
+    let tmp = tempfile::tempdir().unwrap();
+    let m = manifest_full(
+        vec![url_dep("lib-a", "https://example.com/lib-a.git", "main")],
+        Vec::new(),
+        vec![Override {
+            name: "ghost-dep".into(),
+            target: OverrideTarget::Oci {
+                registry: "ghcr.io".into(),
+                repository: "acme/ghost".into(),
+                digest: format!("sha256:{}", "a".repeat(64)),
+                subpath: None,
+            },
+            version: None,
+        }],
+    );
+    let graph = resolve(
+        &m, None, &reg, None, None, Strategy::Maxver, true, &deps_dir(&tmp), None, false,
+        &cas_store(&tmp),
+    )
+    .expect("a dead override must warn, never hard-fail resolution");
+    assert!(graph.deps.iter().any(|d| d.name == "lib-a"));
+    assert!(crate::implemented_error_codes().contains(&"RES-DEAD-OVERRIDE"));
 }

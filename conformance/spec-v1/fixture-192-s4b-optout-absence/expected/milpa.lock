@@ -3,6 +3,10 @@ version 1
 strategy "maxver"
 
 dep "lib-a" {
+    source {
+        kind "git"
+        url (url)"https://example.com/lib-a"
+    }
     identity "dag-sha256:4f7de9ff82cc932903c71fe8ceac84d7ac3248fbc1a64680a74e82e5cd7ec36b"
     version "0.0.0"
     src_dir ""
@@ -17,6 +21,10 @@ dep "lib-a" {
 }
 
 dep "lib-b" {
+    source {
+        kind "git"
+        url (url)"https://example.com/lib-b"
+    }
     identity "dag-sha256:8a5a0c2c7a96530f29d1fab65a961f1608f9a76e2af3b7432bdd28c50fa22b2a"
     version "0.0.0"
     src_dir ""
@@ -31,6 +39,10 @@ dep "lib-b" {
 }
 
 dep "lib-e" {
+    source {
+        kind "git"
+        url (url)"https://example.com/lib-e"
+    }
     identity "dag-sha256:8c14d41e31f658eacb5df35ea703b30bf19ceb27873e79c1f0c0d3c4abd1a1e3"
     version "0.0.0"
     src_dir ""
@@ -45,6 +57,10 @@ dep "lib-e" {
 }
 
 dep "lib-shared" {
+    source {
+        kind "git"
+        url (url)"https://example.com/lib-shared"
+    }
     identity "dag-sha256:3527dd86fa897be0c8ec62a925da47877da5d987e8c06b7416ad3a9da1961ea4"
     version "0.0.0"
     src_dir ""

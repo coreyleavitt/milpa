@@ -3,6 +3,11 @@ version 1
 strategy "maxver"
 
 dep "X" {
+    source {
+        kind "registry"
+        registry "tianguis"
+        name "X"
+    }
     identity "dag-sha256:8d252d84a960d1812fde4c229fe9dc9381e1187a71208d4ef2ebdd851b3185e1"
     version "2.0.0"
     src_dir "src"
@@ -17,6 +22,11 @@ dep "X" {
 }
 
 dep "Y" {
+    source {
+        kind "registry"
+        registry "tianguis"
+        name "Y"
+    }
     identity "dag-sha256:2097dd27cec38e7c63814f415508c620288e28a264bac7876a1c6e16d90c7bbd"
     version "1.0.0"
     src_dir "src"
@@ -31,6 +41,11 @@ dep "Y" {
 }
 
 dep "Z" {
+    source {
+        kind "registry"
+        registry "tianguis"
+        name "Z"
+    }
     identity "dag-sha256:50a71b15b122363141c7974b2716c11e1d1bd9cf83c0e771b955334e1788dd94"
     version "1.0.0"
     src_dir "src"

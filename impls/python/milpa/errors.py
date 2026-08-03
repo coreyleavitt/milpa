@@ -92,6 +92,16 @@ FROZEN_MEMBER_IDENTITY_DRIFT = "FROZEN-MEMBER-IDENTITY-DRIFT"
 FROZEN_MEMBER_NOT_IN_WORKSPACE = "FROZEN-MEMBER-NOT-IN-WORKSPACE"
 FROZEN_NO_CAS = "FROZEN-NO-CAS"           # CLI-level guard (raised before resolve path)
 FROZEN_NO_LOCKFILE = "FROZEN-NO-LOCKFILE"  # CLI-level guard (raised before resolve path)
+# rfc-origin-as-identity.md §7.1 D3 (S5): checked FIRST, short-circuits before
+# FROZEN-SOURCE-ID-MISMATCH — a pkg+<alias>/… lockfile record whose alias this
+# machine's config doesn't recognize must never be misreported as a coordinate
+# mismatch (the comparison is not even attempted).
+FROZEN_REGISTRY_ALIAS_UNRESOLVED = "FROZEN-REGISTRY-ALIAS-UNRESOLVED"
+# rfc-origin-as-identity.md §7.1 D2 (S5): normalize_source(declared-AFTER-
+# override) must equal the lockfile record's source_id, or frozen/verify
+# fails closed — editing a git=/local=/tarball= origin without re-fetching is
+# a hole otherwise.
+FROZEN_SOURCE_ID_MISMATCH = "FROZEN-SOURCE-ID-MISMATCH"
 FROZEN_STRATEGY_MISMATCH = "FROZEN-STRATEGY-MISMATCH"
 
 # ---------------------------------------------------------------------------
@@ -121,6 +131,11 @@ MILPA_INTERNAL = "MILPA-INTERNAL"    # catch-all sentinel; guarantees milpa-erro
 # LOCK — lockfile parse / verification
 # ---------------------------------------------------------------------------
 
+# P4 (namespace-conflation audit): `milpa update <dep>` / `--upgrade <dep>`
+# given a BARE name that matches locked deps in 2+ distinct namespaces —
+# raised instead of silently stripping/deleting one of the ambiguous
+# candidates (see `_strip_pins_for_upgrade` in cli.py).
+LOCK_DEP_AMBIGUOUS_NAME = "LOCK-DEP-AMBIGUOUS-NAME"
 LOCK_DEP_FIELD_ARITY = "LOCK-DEP-FIELD-ARITY"
 LOCK_DEP_IDENTITY_INVALID = "LOCK-DEP-IDENTITY-INVALID"
 LOCK_DEP_NAME_ARITY = "LOCK-DEP-NAME-ARITY"
@@ -138,6 +153,14 @@ LOCK_SUBMODULE_FIELD_INVALID = "LOCK-SUBMODULE-FIELD-INVALID"
 LOCK_PROV_KIND_MISSING = "LOCK-PROV-KIND-MISSING"
 LOCK_PROV_KIND_UNKNOWN = "LOCK-PROV-KIND-UNKNOWN"
 LOCK_SRC_DIR_UNSAFE = "LOCK-SRC-DIR-UNSAFE"
+# LOCK-SRC-* (rfc-origin-as-identity.md §7, S5): the structured `source { … }`
+# node's own parse errors — mirrors LOCK-PROV-* 1:1 but kept as distinct
+# slugs (a "source" block's kind/field errors are a different node kind than
+# a "provenance" block's, semantic-kebab discipline).
+LOCK_SRC_FIELD_ARITY = "LOCK-SRC-FIELD-ARITY"
+LOCK_SRC_FIELD_MISSING = "LOCK-SRC-FIELD-MISSING"
+LOCK_SRC_KIND_MISSING = "LOCK-SRC-KIND-MISSING"
+LOCK_SRC_KIND_UNKNOWN = "LOCK-SRC-KIND-UNKNOWN"
 LOCK_VERSION_MISSING = "LOCK-VERSION-MISSING"
 LOCK_VERSION_UNSUPPORTED = "LOCK-VERSION-UNSUPPORTED"
 LOCK_STRATEGY_MISSING = "LOCK-STRATEGY-MISSING"
@@ -205,9 +228,16 @@ MAN_NIMBLE_CONSTRAINT = "MAN-NIMBLE-CONSTRAINT"
 MAN_NIMBLE_PARSE = "MAN-NIMBLE-PARSE"
 MAN_NO_MANIFEST = "MAN-NO-MANIFEST"
 MAN_OVERRIDE_ARITY = "MAN-OVERRIDE-ARITY"
+# S8b (rfc-origin-as-identity.md §7 B5): oci-form override missing digest=.
+MAN_OVERRIDE_DIGEST_MISSING = "MAN-OVERRIDE-DIGEST-MISSING"
 MAN_OVERRIDE_DUPLICATE = "MAN-OVERRIDE-DUPLICATE"
 MAN_OVERRIDE_GIT_MISSING = "MAN-OVERRIDE-GIT-MISSING"
 MAN_OVERRIDE_KIND = "MAN-OVERRIDE-KIND"
+# S8b: registry-form override (named=) missing or empty.
+MAN_OVERRIDE_NAMED_MISSING = "MAN-OVERRIDE-NAMED-MISSING"
+# S8b: oci-form override's oci= coordinate is missing/empty/malformed
+# (not a non-empty "<registry>/<repository>" string).
+MAN_OVERRIDE_OCI_MALFORMED = "MAN-OVERRIDE-OCI-MALFORMED"
 MAN_OVERRIDE_REF_MISSING = "MAN-OVERRIDE-REF-MISSING"
 MAN_OVERRIDE_TARGET_AMBIGUOUS = "MAN-OVERRIDE-TARGET-AMBIGUOUS"
 MAN_OVERRIDE_UNKNOWN_PROPS = "MAN-OVERRIDE-UNKNOWN-PROPS"
@@ -219,6 +249,11 @@ MAN_PREDICATE_MIXED_NEGATION = "MAN-PREDICATE-MIXED-NEGATION"
 MAN_PREDICATE_UNKNOWN = "MAN-PREDICATE-UNKNOWN"
 MAN_PREDICATE_UNSUPPORTED_ANNOTATION = "MAN-PREDICATE-UNSUPPORTED-ANNOTATION"
 MAN_PREDICATE_VALUE_TYPE = "MAN-PREDICATE-VALUE-TYPE"
+# MAN-PROVIDES-* (rfc-origin-as-identity.md §4.6, S7): the `provides { module
+# "x" }` manifest block — a package's own declared Nim import symbols, the
+# manifest_declared fidelity tier consumed by ManifestDeclaredSymbolProvider.
+MAN_PROVIDES_MODULE_ARITY = "MAN-PROVIDES-MODULE-ARITY"
+MAN_PROVIDES_UNKNOWN_NODE = "MAN-PROVIDES-UNKNOWN-NODE"
 MAN_REMOVE_DEP_ABSENT = "MAN-REMOVE-DEP-ABSENT"
 MAN_RESOLUTION_BLOCK_INVALID = "MAN-RESOLUTION-BLOCK-INVALID"
 MAN_RESOLUTION_EXCLUDE_NEWER_INVALID = "MAN-RESOLUTION-EXCLUDE-NEWER-INVALID"
@@ -270,11 +305,37 @@ PUBLISH_VERSION_TAG_MISMATCH = "PUBLISH-VERSION-TAG-MISMATCH"
 # RES — resolver
 # ---------------------------------------------------------------------------
 
+RES_BINDING_CONFLICT = "RES-BINDING-CONFLICT"
+# RES-DEAD-OVERRIDE (rfc-origin-as-identity.md §10 item 12 / B10, S5b): a
+# root `overrides {}` entry that names a dep absent from the resolved graph
+# — dead config that silently does nothing. Non-fatal WARN, same pattern as
+# RES-REGISTRY-SHADOW's warn-only path (no slug embedded in the message text
+# itself; the constant exists here + spec/errors.md for the bijection lint).
+RES_DEAD_OVERRIDE = "RES-DEAD-OVERRIDE"
 RES_EXCLUDE_NEWER_EMPTY = "RES-EXCLUDE-NEWER-EMPTY"
 RES_EXCLUDE_NEWER_PIN = "RES-EXCLUDE-NEWER-PIN"
+# RES-IMPORT-COLLISION (rfc-origin-as-identity.md §4.6): two distinct
+# source-ids that would occupy the same Nim import symbol. S6
+# (lockfile.check_directory_slot_collisions) is the retained directory-slot
+# fast-path pre-filter; S7 (import_slot.check_import_slot_collisions) is the
+# complete symbol-level check behind SymbolProviderPort. COVERAGE (durable,
+# §4.6/G9, updated S7): a non-firing run means "no import-symbol collision
+# among manifest_declared or tree_scanned modules the composed provider could
+# see" — it does NOT cover a dep whose materialized tree could not be
+# resolved at check time (no CAS identity yet, e.g. local/member deps), and
+# tree_scanned fidelity is a filename-derived heuristic, not a real Nim
+# import-path resolver. See spec/errors.md for the full precision statement.
+RES_IMPORT_COLLISION = "RES-IMPORT-COLLISION"
 RES_LOCKED_DRIFT = "RES-LOCKED-DRIFT"
+# RES-MEMBER-OUTSIDE-WORKSPACE (rfc-origin-as-identity.md §4.4.1, D3): a
+# `member "<name>"` dep declared in a single-package (non-workspace)
+# manifest. A member reference is workspace-only topology; outside a
+# workspace it has no candidate to resolve to. Both impls raise this coded
+# error at root-seed time rather than silently dropping it (Python) or
+# surfacing a cryptic unsatisfiable SOLVE-CONFLICT (Rust).
+RES_MEMBER_OUTSIDE_WORKSPACE = "RES-MEMBER-OUTSIDE-WORKSPACE"
 RES_NO_INDEX = "RES-NO-INDEX"
-RES_PROVENANCE_CONFLICT = "RES-PROVENANCE-CONFLICT"
+RES_REGISTRY_SHADOW = "RES-REGISTRY-SHADOW"
 RES_ROOT_SELF_VERSION_CONSTRAINT = "RES-ROOT-SELF-VERSION-CONSTRAINT"
 RESOLVE_FLAG_CONFLICT = "RESOLVE-FLAG-CONFLICT"
 RES_UNATTESTED_METADATA = "RES-UNATTESTED-METADATA"
@@ -289,6 +350,12 @@ RES_WS_OVERRIDE_MEMBER_COLLISION = "RES-WS-OVERRIDE-MEMBER-COLLISION"
 # ---------------------------------------------------------------------------
 
 SOLVE_CONFLICT = "SOLVE-CONFLICT"
+
+# ---------------------------------------------------------------------------
+# SRC — SourceId (origin-as-identity, rfc-origin-as-identity.md §4.1)
+# ---------------------------------------------------------------------------
+
+SRC_ID_MALFORMED = "SRC-ID-MALFORMED"
 
 # ---------------------------------------------------------------------------
 # TNG — tianguis index client

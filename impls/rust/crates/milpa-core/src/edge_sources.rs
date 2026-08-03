@@ -12,7 +12,9 @@
 //!   (see `resolver.rs` L1200+ and `milpa-cli/src/main.rs` `maybe_dep_decl_store`).
 //!
 //! `resolve_edges` is the coordinator: it implements the §4.2.1 normative
-//! priority structure with an `edge_cache` memo keyed on `(name, version)`.
+//! priority structure with an `edge_cache` memo keyed on `(source_id, version)`
+//! (RFC origin-as-identity §4.5, S4 — re-keyed from `(name, version)` so two
+//! consumer labels for one origin coalesce to one sealed EdgeSet).
 //! Clause (a): sealed once per key — parent-independent (diamond deps get
 //! identical `EdgeSet`). Clause (b): `is_overridden` suppresses DepDecl.
 //! Clause (c): `dep_decl + dep_decl_source` → DepDecl [S3b]. Clause (d):
@@ -24,13 +26,13 @@
 //!
 //! Mirrors `milpa/edge_sources.py` in `impls/python`.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
 use milpa_manifest::nimble::{parse_nimble, NimbleRequirement};
 use milpa_manifest::{contains_unsafe_char, Dep, Manifest, ManifestError, Override};
 use milpa_solver::{Dep as SolverDep, VersionSet, VersionSource};
-use milpa_types::{EdgeSet, EdgeSource, NamedRequire, RequireEntry, UrlRequire, Version};
+use milpa_types::{EdgeSet, EdgeSource, NamedRequire, RequireEntry, SourceId, UrlRequire, Version};
 
 
 // Re-export Item from resolver scope — we import locally within the functions
@@ -468,21 +470,30 @@ pub fn manifest_to_edgeset(manifest: &Manifest) -> EdgeSet {
 /// - Clause (c): `dep_decl + dep_decl_source` → DepDecl [S3b].
 /// - Clause (d): `has_milpa_kdl` → MilpaKdl; else → NimbleFallback.
 ///
-/// The `edge_cache` is a `BTreeMap<(String, Version), EdgeSet>` owned by the
+/// The `edge_cache` is a `HashMap<(SourceId, Version), EdgeSet>` owned by the
 /// caller's `ResolveProvider`; this function receives a mutable reference so
 /// the caller remains the sealing authority.
+///
+/// RFC origin-as-identity §4.5 (S4): keyed by `(source_id, version)`, not
+/// `(name, version)` — two BFS parents reaching the SAME origin under TWO
+/// different labels (e.g. `z3` vs `nimz3` for one repo) must coalesce to ONE
+/// sealed EdgeSet, not two (the pre-S4 latent "missed unification" bug,
+/// RFC §2.1). `name`/`version` still drive clauses (b)(c)(d) — filesystem
+/// lookups, `EdgeSourceCtx.dep_name`, etc. — only the CACHE dimension moved
+/// to `source_id`, which the caller obtains from `BindingResolver::source_id_for`.
 pub fn resolve_edges<'cache>(
     name: &str,
     version: &Version,
     ctx: &EdgeSourceCtx,
-    edge_cache: &'cache mut BTreeMap<(String, Version), EdgeSet>,
+    edge_cache: &'cache mut HashMap<(SourceId, Version), EdgeSet>,
+    source_id: &SourceId,
     nimble_source: Option<&NimbleEdgeSource>,
     milpakdl_source: Option<&MilpaKdlEdgeSource>,
     // dep_decl_source: S3b injection point (wired from DepDeclStore in resolver.rs L1200+).
     dep_decl_source: Option<&dyn DepDeclSource>,
 ) -> Result<&'cache EdgeSet, crate::MilpaError> {
-    let cache_key = (name.to_string(), version.clone());
-    // Clause (a): sealed once per (name, version) — parent-independent
+    let cache_key = (source_id.clone(), version.clone());
+    // Clause (a): sealed once per (source_id, version) — parent-independent
     if edge_cache.contains_key(&cache_key) {
         return Ok(&edge_cache[&cache_key]);
     }
@@ -794,6 +805,9 @@ mod tests {
     use std::collections::BTreeMap;
     use std::path::PathBuf;
 
+    use crate::source_id::normalize_source;
+    use milpa_types::FetchableOrigin;
+
     fn make_dep_tree(base: &Path, name: &str, kdl_content: &str) -> PathBuf {
         let dir = base.join(name);
         std::fs::create_dir_all(&dir).unwrap();
@@ -814,6 +828,21 @@ mod tests {
 
     fn url_ver() -> Version {
         Version::release(0, 0, 1)
+    }
+
+    /// A well-formed, distinct `SourceId` for test package `label` — the
+    /// `resolve_edges` cache key dimension since RFC origin-as-identity §4.5
+    /// (S4) re-keyed `edge_cache` from `(name, version)` to
+    /// `(source_id, version)`. Two DIFFERENT labels only coalesce in
+    /// `edge_cache` when the CALLER passes the SAME `source_id` — this
+    /// helper makes each test's intent (same origin vs different origin)
+    /// explicit at the call site rather than accidental.
+    fn sid(label: &str) -> SourceId {
+        normalize_source(&SourceId::Fetchable(FetchableOrigin::Git {
+            url: format!("https://example.com/{label}.git"),
+            subpath: None,
+        }))
+        .unwrap()
     }
 
     // -----------------------------------------------------------------------
@@ -842,12 +871,13 @@ mod tests {
             version: None,
         };
         let version = url_ver();
-        let mut cache: BTreeMap<(String, Version), EdgeSet> = BTreeMap::new();
+        let mut cache: HashMap<(SourceId, Version), EdgeSet> = HashMap::new();
+        let pkg_sid = sid("pkg");
 
         // First call populates cache
-        let es1_src = resolve_edges("pkg", &version, &ctx, &mut cache, None, None, None).unwrap().source.clone();
+        let es1_src = resolve_edges("pkg", &version, &ctx, &mut cache, &pkg_sid, None, None, None).unwrap().source.clone();
         // Second call returns cached value
-        let es2_src = resolve_edges("pkg", &version, &ctx, &mut cache, None, None, None).unwrap().source.clone();
+        let es2_src = resolve_edges("pkg", &version, &ctx, &mut cache, &pkg_sid, None, None, None).unwrap().source.clone();
         assert_eq!(es1_src, EdgeSource::MilpaKdl);
         assert_eq!(es2_src, EdgeSource::MilpaKdl);
         assert_eq!(cache.len(), 1);
@@ -862,10 +892,11 @@ mod tests {
         std::fs::create_dir_all(&dep_path).unwrap();
         let overrides = no_overrides();
         let version = url_ver();
-        let mut cache: BTreeMap<(String, Version), EdgeSet> = BTreeMap::new();
+        let pkg_sid = sid("pkg");
+        let mut cache: HashMap<(SourceId, Version), EdgeSet> = HashMap::new();
         // Pre-populate with a NimbleFallback-tagged EdgeSet
         cache.insert(
-            ("pkg".to_string(), version.clone()),
+            (pkg_sid.clone(), version.clone()),
             EdgeSet {
                 requires: Vec::new(),
                 src_dir: "pre-cached".to_string(),
@@ -885,9 +916,130 @@ mod tests {
             version: None,
         };
         // Even though has_milpa_kdl=false → nimble path, cache returns pre-populated value.
-        let es = resolve_edges("pkg", &version, &ctx, &mut cache, None, None, None).unwrap();
+        let es = resolve_edges("pkg", &version, &ctx, &mut cache, &pkg_sid, None, None, None).unwrap();
         assert_eq!(es.source, EdgeSource::NimbleFallback);
         assert_eq!(es.src_dir, "pre-cached");
+    }
+
+    #[test]
+    fn test_two_parents_same_source_different_labels_coalesce_edge_cache() {
+        // RFC origin-as-identity §4.5 (S4): edge_cache re-keyed to
+        // (source_id, Version) — the "missed unification" / latent
+        // double-seal bug fix (RFC §2.1).
+        //
+        // Two BFS parents can reach the SAME upstream repo under TWO
+        // DIFFERENT consumer-facing labels (one writes `z3`, another writes
+        // `nimz3` for one repo — the exact §2.1 example). Before S4,
+        // edge_cache was keyed by (name, version), so this diamond sealed
+        // TWO separate EdgeSet entries for one tree — a latent correctness
+        // bug. Keyed by (source_id, version), the two labels must coalesce
+        // into ONE sealed entry, and the SECOND call must not even
+        // re-resolve.
+        //
+        // Parent B's ctx deliberately points at a NONEXISTENT dep_path: if
+        // the cache still keyed by name (the bug), "nimz3" would miss the
+        // cache and the pure dispatch would actually run against that
+        // (bogus) path, silently falling back to an EMPTY EdgeSet
+        // (MilpaKdlEdgeSource treats a missing milpa.kdl as non-fatal) — a
+        // DIFFERENT, wrong object from parent A's real, non-empty EdgeSet.
+        // So this test fails loudly (requires content) if the double-seal
+        // bug regresses, not just a shallow "same key type" check.
+        let tmp = tempfile::tempdir().unwrap();
+        let dep_path = make_dep_tree(
+            tmp.path(),
+            "z3",
+            "name \"z3\"\ndeps {\n  stew \">= 0.1.0\"\n}\n",
+        );
+        let overrides = no_overrides();
+        let version = url_ver();
+        // One real upstream repo, referenced under two different labels —
+        // the ALREADY-NORMALIZED, identical source_id both labels resolve
+        // to (BindingResolver, not resolve_edges, is what unifies them;
+        // resolve_edges just trusts the source_id it's handed).
+        let one_repo_sid = sid("nim-z3");
+
+        let mut cache: HashMap<(SourceId, Version), EdgeSet> = HashMap::new();
+
+        // Parent A: consumer wrote `z3` — real fetched tree.
+        let ctx_a = EdgeSourceCtx {
+            dep_path: Some(&dep_path),
+            dep_name: "z3",
+            dep_decl: None,
+            is_overridden: false,
+            has_milpa_kdl: true,
+            dep_decl_schema_version: None,
+            overrides_by_name: &overrides,
+            active_flags: BTreeSet::new(),
+            ref_: None,
+            version: None,
+        };
+        let es_a = resolve_edges("z3", &version, &ctx_a, &mut cache, &one_repo_sid, None, None, None)
+            .unwrap()
+            .clone();
+
+        // Parent B: consumer wrote `nimz3` for the SAME upstream repo (one
+        // BFS diamond reaching one repo under two labels) — nonexistent
+        // dep_path proves the second call never re-resolves.
+        let missing_path = tmp.path().join("does-not-exist");
+        let ctx_b = EdgeSourceCtx {
+            dep_path: Some(&missing_path),
+            dep_name: "nimz3",
+            dep_decl: None,
+            is_overridden: false,
+            has_milpa_kdl: true,
+            dep_decl_schema_version: None,
+            overrides_by_name: &overrides,
+            active_flags: BTreeSet::new(),
+            ref_: None,
+            version: None,
+        };
+        let es_b = resolve_edges("nimz3", &version, &ctx_b, &mut cache, &one_repo_sid, None, None, None)
+            .unwrap()
+            .clone();
+
+        assert_eq!(
+            es_a, es_b,
+            "two labels for the SAME source must coalesce to ONE sealed EdgeSet \
+             (pre-S4 bug: this sealed two separate entries)"
+        );
+        assert_eq!(cache.len(), 1, "one source, one version → exactly one edge_cache entry");
+        let names: Vec<&str> = es_b
+            .requires
+            .iter()
+            .filter_map(|r| match r {
+                RequireEntry::Named(n) => Some(n.name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            names.contains(&"stew"),
+            "the coalesced EdgeSet must be parent A's REAL result, not an empty \
+             fallback from re-resolving parent B's nonexistent path"
+        );
+
+        // Contrast: a genuinely DIFFERENT source at the same version must
+        // NOT coalesce — proves the key is actually source_id-driven, not a
+        // silent collapse-everything bug.
+        let other_dep_path = make_dep_tree(tmp.path(), "other", "name \"other\"\n");
+        let other_sid = sid("other");
+        let ctx_c = EdgeSourceCtx {
+            dep_path: Some(&other_dep_path),
+            dep_name: "other",
+            dep_decl: None,
+            is_overridden: false,
+            has_milpa_kdl: true,
+            dep_decl_schema_version: None,
+            overrides_by_name: &overrides,
+            active_flags: BTreeSet::new(),
+            ref_: None,
+            version: None,
+        };
+        let es_c = resolve_edges("other", &version, &ctx_c, &mut cache, &other_sid, None, None, None)
+            .unwrap()
+            .clone();
+
+        assert_ne!(es_c, es_a, "a genuinely different source must NOT coalesce");
+        assert_eq!(cache.len(), 2);
     }
 
     // -----------------------------------------------------------------------
@@ -916,8 +1068,9 @@ mod tests {
             version: None,
         };
         let version = url_ver();
-        let mut cache = BTreeMap::new();
-        let es = resolve_edges("pkg", &version, &ctx, &mut cache, None, None, None).unwrap();
+        let mut cache = HashMap::new();
+        let pkg_sid = sid("pkg");
+        let es = resolve_edges("pkg", &version, &ctx, &mut cache, &pkg_sid, None, None, None).unwrap();
         assert_eq!(es.source, EdgeSource::MilpaKdl, "overridden+milpa.kdl → MilpaKdl");
     }
 
@@ -943,8 +1096,9 @@ mod tests {
             version: None,
         };
         let version = url_ver();
-        let mut cache = BTreeMap::new();
-        let es = resolve_edges("pkg", &version, &ctx, &mut cache, None, None, None).unwrap();
+        let mut cache = HashMap::new();
+        let pkg_sid = sid("pkg");
+        let es = resolve_edges("pkg", &version, &ctx, &mut cache, &pkg_sid, None, None, None).unwrap();
         assert_eq!(es.source, EdgeSource::NimbleFallback, "overridden+no milpa.kdl → NimbleFallback");
     }
 
@@ -974,9 +1128,10 @@ mod tests {
             version: None,
         };
         let version = url_ver();
-        let mut cache = BTreeMap::new();
+        let mut cache = HashMap::new();
+        let pkg_sid = sid("pkg");
         // dep_decl_source=None → should fall through to milpa.kdl
-        let es = resolve_edges("pkg", &version, &ctx, &mut cache, None, None, None).unwrap();
+        let es = resolve_edges("pkg", &version, &ctx, &mut cache, &pkg_sid, None, None, None).unwrap();
         assert_eq!(es.source, EdgeSource::MilpaKdl);
     }
 
@@ -1014,8 +1169,9 @@ mod tests {
             version: None,
         };
         let version = url_ver();
-        let mut cache = BTreeMap::new();
-        let es = resolve_edges("pkg", &version, &ctx, &mut cache, None, None, None).unwrap();
+        let mut cache = HashMap::new();
+        let pkg_sid = sid("pkg");
+        let es = resolve_edges("pkg", &version, &ctx, &mut cache, &pkg_sid, None, None, None).unwrap();
         assert_eq!(es.source, EdgeSource::MilpaKdl);
         // Only foo should appear — devtool must be excluded
         let names: Vec<&str> = es.requires.iter().filter_map(|r| {
@@ -1051,8 +1207,9 @@ mod tests {
             version: None,
         };
         let version = url_ver();
-        let mut cache = BTreeMap::new();
-        let es = resolve_edges("pkg", &version, &ctx, &mut cache, None, None, None).unwrap();
+        let mut cache = HashMap::new();
+        let pkg_sid = sid("pkg");
+        let es = resolve_edges("pkg", &version, &ctx, &mut cache, &pkg_sid, None, None, None).unwrap();
         // overrides must not appear in requires
         let url_names: Vec<String> = es.requires.iter().filter_map(|r| {
             if let RequireEntry::Url(u) = r { url_tail_name(&u.url) } else { None }
@@ -1083,8 +1240,9 @@ mod tests {
             version: None,
         };
         let version = url_ver();
-        let mut cache = BTreeMap::new();
-        let es = resolve_edges("pkg", &version, &ctx, &mut cache, None, None, None).unwrap();
+        let mut cache = HashMap::new();
+        let pkg_sid = sid("pkg");
+        let es = resolve_edges("pkg", &version, &ctx, &mut cache, &pkg_sid, None, None, None).unwrap();
         assert_eq!(es.src_dir, "src");
     }
 
@@ -1291,8 +1449,9 @@ overrides {
             version: None,
         };
         let version = url_ver();
-        let mut cache = BTreeMap::new();
-        let es = resolve_edges("pkg", &version, &ctx, &mut cache, None, None, None).unwrap();
+        let mut cache = HashMap::new();
+        let pkg_sid = sid("pkg");
+        let es = resolve_edges("pkg", &version, &ctx, &mut cache, &pkg_sid, None, None, None).unwrap();
         assert_eq!(es.source, EdgeSource::NimbleFallback);
         assert_eq!(es.requires.len(), 1);
         match &es.requires[0] {
@@ -1327,8 +1486,9 @@ overrides {
             version: None,
         };
         let version = url_ver();
-        let mut cache = BTreeMap::new();
-        let es = resolve_edges("pkg", &version, &ctx, &mut cache, None, None, None).unwrap();
+        let mut cache = HashMap::new();
+        let pkg_sid = sid("pkg");
+        let es = resolve_edges("pkg", &version, &ctx, &mut cache, &pkg_sid, None, None, None).unwrap();
         match &es.requires[0] {
             RequireEntry::Url(u) => {
                 assert_eq!(u.ref_, "v1.2.3", "explicit #ref must be preserved");

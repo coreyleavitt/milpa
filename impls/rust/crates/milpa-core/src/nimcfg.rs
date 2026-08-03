@@ -17,7 +17,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
-use milpa_types::{ProvenanceRecord, ResolvedDep, ResolvedGraph};
+use milpa_types::{DepKey, ProvenanceRecord, ResolvedDep, ResolvedGraph};
 
 use crate::workspace::LoadedWorkspace;
 
@@ -304,14 +304,28 @@ fn dep_target(dep: &ResolvedDep, deps_dir: &Path, member_dir: &HashMap<&str, &Pa
 /// Transitive closure reachable from `member_name` (excluding the member itself),
 /// in topological order. Mirrors `nimcfg.py:member_dep_closure`.
 fn member_dep_closure<'a>(graph: &'a ResolvedGraph, member_name: &str) -> Vec<&'a ResolvedDep> {
-    let by_name: HashMap<&str, &ResolvedDep> =
-        graph.deps.iter().map(|d| (d.name.as_str(), d)).collect();
+    // KEY BY THE QUALIFIED SOLVER-VAR, not the bare name: `requires` entries
+    // are qualified solver-variable strings (`ns1::foo`), so a bare-name index
+    // silently drops a namespace-qualified transitive dep AND its whole subtree
+    // from the member's nim.cfg --path closure with no error (R2). A member's
+    // own solver_var == its bare name (namespace None), so the member lookup
+    // below is unaffected.
+    let by_name: HashMap<String, &ResolvedDep> = graph
+        .deps
+        .iter()
+        .map(|d| {
+            (
+                DepKey { name: d.name.clone(), namespace: d.namespace.clone() }.solver_var(),
+                d,
+            )
+        })
+        .collect();
     let mut visited: BTreeSet<String> = BTreeSet::new();
     let mut order: Vec<&ResolvedDep> = Vec::new();
 
     fn visit<'a>(
         name: &str,
-        by_name: &HashMap<&str, &'a ResolvedDep>,
+        by_name: &HashMap<String, &'a ResolvedDep>,
         visited: &mut BTreeSet<String>,
         order: &mut Vec<&'a ResolvedDep>,
     ) {
@@ -372,6 +386,7 @@ mod tests {
     fn dep(name: &str, src_dir: &str) -> ResolvedDep {
         ResolvedDep {
             declared_version_source: None,
+            source_id: None,
             name: name.into(),
             namespace: None,
             identity: "dag-sha256:00".into(),
@@ -390,7 +405,6 @@ mod tests {
             aliases: vec![],
             active_flags: vec![],
             attestation: None,
-            registry_namespace: None,
         }
     }
 
@@ -398,6 +412,7 @@ mod tests {
     fn root_self_dep(name: &str) -> ResolvedDep {
         ResolvedDep {
             declared_version_source: None,
+            source_id: None,
             name: name.into(),
             namespace: None,
             identity: String::new(),
@@ -413,7 +428,6 @@ mod tests {
             aliases: vec![],
             active_flags: vec![],
             attestation: None,
-            registry_namespace: None,
         }
     }
 
@@ -503,6 +517,7 @@ mod tests {
     fn dep_with_aliases(name: &str, src_dir: &str, aliases: Vec<String>) -> ResolvedDep {
         ResolvedDep {
             declared_version_source: None,
+            source_id: None,
             name: name.into(),
             namespace: None,
             identity: "dag-sha256:00".into(),
@@ -521,7 +536,6 @@ mod tests {
             aliases,
             active_flags: vec![],
             attestation: None,
-            registry_namespace: None,
         }
     }
 
@@ -598,6 +612,7 @@ mod tests {
     fn dep_with_flags(name: &str, active_flags: Vec<String>) -> ResolvedDep {
         ResolvedDep {
             declared_version_source: None,
+            source_id: None,
             name: name.into(),
             namespace: None,
             identity: "dag-sha256:00".into(),
@@ -616,7 +631,6 @@ mod tests {
             aliases: vec![],
             active_flags,
             attestation: None,
-            registry_namespace: None,
         }
     }
 

@@ -24,6 +24,8 @@ from milpa.edge_sources import (
     edgeset_to_terms,
     resolve_edges,
 )
+from milpa.registry import Index
+from milpa.source_id import GitSourceId, SourceId, normalize_source
 from milpa.version import Version, VersionSource
 
 
@@ -32,6 +34,17 @@ from milpa.version import Version, VersionSource
 # ---------------------------------------------------------------------------
 
 _V = Version(0, 0, 1)  # sentinel version used for URL/local deps
+
+
+def _sid(label: str) -> SourceId:
+    """A well-formed, distinct ``SourceId`` for test package *label* — the
+    ``resolve_edges`` cache key dimension since RFC origin-as-identity §4.5
+    (S4) re-keyed ``edge_cache`` from ``(name, version)`` to
+    ``(source_id, version)``. Two DIFFERENT labels only coalesce in
+    ``edge_cache`` when the CALLER passes the SAME ``source_id`` — this
+    helper makes each test's intent (same origin vs different origin)
+    explicit at the call site rather than accidental."""
+    return normalize_source(GitSourceId(url=f"https://example.com/{label}.git"))
 
 
 def _ctx(
@@ -88,9 +101,9 @@ def test_clause_a_memo_seal_returns_same_edgeset(tmp_path: Path) -> None:
     ctx2 = _ctx(dep_path=dep_path, dep_name="shared", has_milpa_kdl=True)
 
     edge_cache: dict = {}
-    es1 = resolve_edges("shared", _V, ctx1, edge_cache)
+    es1 = resolve_edges("shared", _V, ctx1, edge_cache, source_id=_sid("shared"))
     # Second call — simulates a second BFS parent reaching the same (name, ver).
-    es2 = resolve_edges("shared", _V, ctx2, edge_cache)
+    es2 = resolve_edges("shared", _V, ctx2, edge_cache, source_id=_sid("shared"))
 
     assert es1 is es2, "clause (a): same EdgeSet object must be returned from cache"
     assert len(edge_cache) == 1, "cache must have exactly one entry"
@@ -105,8 +118,8 @@ def test_clause_a_different_packages_not_merged(tmp_path: Path) -> None:
     ctx_a = _ctx(dep_path=dep_a, dep_name="pkg-a", has_milpa_kdl=True)
     ctx_b = _ctx(dep_path=dep_b, dep_name="pkg-b", has_milpa_kdl=True)
 
-    resolve_edges("pkg-a", _V, ctx_a, edge_cache)
-    resolve_edges("pkg-b", _V, ctx_b, edge_cache)
+    resolve_edges("pkg-a", _V, ctx_a, edge_cache, source_id=_sid("pkg-a"))
+    resolve_edges("pkg-b", _V, ctx_b, edge_cache, source_id=_sid("pkg-b"))
 
     assert len(edge_cache) == 2
 
@@ -119,7 +132,7 @@ def test_clause_a_sealed_value_not_overwritten(tmp_path: Path) -> None:
             raise AssertionError("source must not be called when cache is hit")
 
     sentinel_es = EdgeSet(requires=[], src_dir="sentinel", source=EdgeSource.DEP_DECL)
-    edge_cache: dict = {("pkg", _V): sentinel_es}
+    edge_cache: dict = {(_sid("pkg"), _V): sentinel_es}
 
     ctx = _ctx(has_milpa_kdl=True)  # would normally call MilpaKdlEdgeSource
     result = resolve_edges(
@@ -127,6 +140,7 @@ def test_clause_a_sealed_value_not_overwritten(tmp_path: Path) -> None:
         _V,
         ctx,
         edge_cache,
+        source_id=_sid("pkg"),
         milpakdl_source=_NeverCalled(),  # type: ignore[arg-type]
         nimble_source=_NeverCalled(),  # type: ignore[arg-type]
     )
@@ -155,7 +169,7 @@ def test_clause_b_overridden_with_dep_decl_falls_through_to_milpakdl(tmp_path: P
     )
 
     edge_cache: dict = {}
-    es = resolve_edges("pkg", _V, ctx, edge_cache)
+    es = resolve_edges("pkg", _V, ctx, edge_cache, source_id=_sid("pkg"))
 
     # Must have used MilpaKdl (not DepDecl) — fidelity tag confirms.
     assert es.source == EdgeSource.MILPA_KDL
@@ -176,7 +190,7 @@ def test_clause_b_overridden_no_milpakdl_falls_through_to_nimble(tmp_path: Path)
     )
 
     edge_cache: dict = {}
-    es = resolve_edges("pkg", _V, ctx, edge_cache)
+    es = resolve_edges("pkg", _V, ctx, edge_cache, source_id=_sid("pkg"))
 
     assert es.source == EdgeSource.NIMBLE_FALLBACK
     assert len(es.requires) == 1
@@ -200,7 +214,7 @@ def test_clause_c_dep_decl_source_none_skips_to_milpakdl(tmp_path: Path) -> None
         has_milpa_kdl=True,
     )
     edge_cache: dict = {}
-    es = resolve_edges("pkg", _V, ctx, edge_cache, dep_decl_source=None)
+    es = resolve_edges("pkg", _V, ctx, edge_cache, source_id=_sid("pkg"), dep_decl_source=None)
 
     # dep_decl_source is None → MilpaKdl path, not DepDecl.
     assert es.source == EdgeSource.MILPA_KDL
@@ -229,7 +243,7 @@ def test_clause_c_dep_decl_source_injected_fires(tmp_path: Path) -> None:
         has_milpa_kdl=False,   # doesn't matter — dep_decl branch fires first
     )
     edge_cache: dict = {}
-    es = resolve_edges("pkg", _V, ctx, edge_cache, dep_decl_source=src)
+    es = resolve_edges("pkg", _V, ctx, edge_cache, source_id=_sid("pkg"), dep_decl_source=src)
 
     assert src.called
     assert es.source == EdgeSource.DEP_DECL
@@ -482,18 +496,24 @@ def test_bridge_unrecognized_when_empty_predicates(tmp_path: Path) -> None:
 
 
 def test_edgeset_to_terms_named_require() -> None:
-    """Named requires become Term.require with parsed VersionSet."""
+    """Named requires become Term.require with parsed VersionSet.
+
+    S5-rekey (RFC origin-as-identity §4.4): the Term/require-name key is the
+    BOUND source-id's canonical form (``binding.canonical_key_for_requirement``),
+    not the bare name — ``"pkg+tianguis/stew"`` for an unqualified require
+    against an empty index (no namespace match), not ``"stew"``.
+    """
     es = EdgeSet(
         requires=[NamedRequire(name="stew", constraint_str=">= 0.1.0")],
         src_dir="",
         source=EdgeSource.MILPA_KDL,
     )
-    dep_terms, requires_names, requires_predicates = edgeset_to_terms(es, {})
+    dep_terms, requires_names, requires_predicates = edgeset_to_terms(es, {}, Index())
 
-    assert requires_names == ["stew"]
+    assert requires_names == ["pkg+tianguis/stew"]
     assert len(dep_terms) == 1
     t = dep_terms[0]
-    assert t.package == "stew"
+    assert t.package == "pkg+tianguis/stew"
     assert t.positive
     assert requires_predicates == {}
 
@@ -504,7 +524,14 @@ def test_edgeset_to_terms_overridden_named_becomes_full_self_term() -> None:
     is built pre-fetch; the real candidate label is assigned post-fetch by the
     resolver worker, ``_candidate_label``). Previously this asserted the OLD
     ``eq(sentinel)`` behavior the RFC identifies as the causal bug (a
-    versioned override target would spuriously SOLVE-CONFLICT against it)."""
+    versioned override target would spuriously SOLVE-CONFLICT against it).
+
+    RFC §4.4.1 (S5-rekey, the normative two-phase design): the solver key
+    is UNIFORMLY canonical(source_id) — no eager-kind bare-name carve-out,
+    including the override-target case. With no ``binding_resolver`` (this
+    unit test calls ``edgeset_to_terms`` standalone), phase-1 falls through
+    to the override-guess: ``canonical(GitSourceId(url=<override's git>))``.
+    """
     from milpa.manifest import Override
 
     from milpa.manifest import GitTarget
@@ -515,12 +542,12 @@ def test_edgeset_to_terms_overridden_named_becomes_full_self_term() -> None:
         src_dir="",
         source=EdgeSource.MILPA_KDL,
     )
-    dep_terms, requires_names, requires_predicates = edgeset_to_terms(es, {"stew": ov})
+    dep_terms, requires_names, requires_predicates = edgeset_to_terms(es, {"stew": ov}, Index())
 
-    assert requires_names == ["stew"]
+    assert requires_names == ["git+https://github.com/example/stew"]
     assert len(dep_terms) == 1
     t = dep_terms[0]
-    assert t.package == "stew"
+    assert t.package == "git+https://github.com/example/stew"
     # full() self-term: unconditionally satisfied by any real candidate version.
     assert t.versions == VersionSet.full()
     assert requires_predicates == {}
@@ -536,10 +563,11 @@ def test_edgeset_to_terms_nim_excluded() -> None:
         src_dir="",
         source=EdgeSource.NIMBLE_FALLBACK,
     )
-    dep_terms, requires_names, requires_predicates = edgeset_to_terms(es, {})
+    dep_terms, requires_names, requires_predicates = edgeset_to_terms(es, {}, Index())
 
     assert "nim" not in requires_names
-    assert "stew" in requires_names
+    # S5-rekey: the require-name key is the canonical source-id string.
+    assert "pkg+tianguis/stew" in requires_names
     assert requires_predicates == {}
 
 
@@ -547,7 +575,14 @@ def test_edgeset_to_terms_url_require() -> None:
     """Axis A (a)/D-A2: UrlRequire entries become Term.require at a ``full()``
     self-term (never ``eq(sentinel)``) with the derived name. Previously this
     asserted the OLD ``eq(sentinel)`` behavior — see
-    ``test_edgeset_to_terms_overridden_named_becomes_full_self_term`` above."""
+    ``test_edgeset_to_terms_overridden_named_becomes_full_self_term`` above.
+
+    RFC §4.4.1 (S5-rekey): the solver key is UNIFORMLY canonical(source_id)
+    — a UrlRequire's key is ``canonical(GitSourceId(url=...))``, not the
+    URL-tail-derived bare name (that derivation still selects WHICH name
+    the guess falls back to when ``entry.name`` is absent — DepDecl-sourced
+    entries — but the final key is always canonicalized).
+    """
     from milpa.version import VersionSet
     es = EdgeSet(
         requires=[
@@ -556,9 +591,9 @@ def test_edgeset_to_terms_url_require() -> None:
         src_dir="",
         source=EdgeSource.DEP_DECL,
     )
-    dep_terms, requires_names, requires_predicates = edgeset_to_terms(es, {})
+    dep_terms, requires_names, requires_predicates = edgeset_to_terms(es, {}, Index())
 
-    assert "nim-chronos" in requires_names
+    assert "git+https://github.com/status-im/nim-chronos" in requires_names
     assert len(dep_terms) == 1
     assert dep_terms[0].versions == VersionSet.full()
     assert requires_predicates == {}
@@ -597,7 +632,7 @@ def test_transitive_projection_dev_deps_and_overrides_isolation(tmp_path: Path) 
 
     ctx = _ctx(dep_path=dep_path, dep_name="transitive", has_milpa_kdl=True)
     edge_cache: dict = {}
-    es = resolve_edges("transitive", _V, ctx, edge_cache)
+    es = resolve_edges("transitive", _V, ctx, edge_cache, source_id=_sid("transitive"))
 
     # Verify the projection:
     assert es.source == EdgeSource.MILPA_KDL
@@ -632,19 +667,90 @@ def test_two_parents_same_package_get_identical_edgeset(tmp_path: Path) -> None:
     )
 
     edge_cache: dict = {}
+    shared_sid = _sid("shared")
 
     # Simulate parent A discovering "shared"
     ctx_from_a = _ctx(dep_path=dep_path, dep_name="shared", has_milpa_kdl=True)
-    es_a = resolve_edges("shared", _V, ctx_from_a, edge_cache)
+    es_a = resolve_edges("shared", _V, ctx_from_a, edge_cache, source_id=shared_sid)
 
     # Simulate parent B discovering the same "shared" (diamond dep)
     ctx_from_b = _ctx(dep_path=dep_path, dep_name="shared", has_milpa_kdl=True)
-    es_b = resolve_edges("shared", _V, ctx_from_b, edge_cache)
+    es_b = resolve_edges("shared", _V, ctx_from_b, edge_cache, source_id=shared_sid)
 
     # Must be the same object — sealed on first encounter.
     assert es_a is es_b, \
         "diamond dependency: both parents must see the same sealed EdgeSet (clause a)"
     assert len(edge_cache) == 1
+
+
+def test_two_parents_same_source_different_labels_coalesce_edge_cache(
+    tmp_path: Path,
+) -> None:
+    """RFC origin-as-identity §4.5 (S4): edge_cache re-keyed to (source_id, Version)
+    — the "missed unification" / latent double-seal bug fix (RFC §2.1).
+
+    Two BFS parents can reach the SAME upstream repo under TWO DIFFERENT
+    consumer-facing labels (one writes ``z3``, another writes ``nimz3`` for
+    one repo — the exact §2.1 example). Before S4, ``edge_cache`` was keyed
+    by ``(name, version)``, so this diamond sealed TWO separate EdgeSet
+    entries for one tree — a latent correctness bug. Keyed by
+    ``(source_id, version)``, the two labels must coalesce into ONE sealed
+    entry, and the SECOND call must not even re-resolve.
+
+    Parent B's ``ctx`` deliberately points at a NONEXISTENT dep_path: if the
+    cache still keyed by name (the bug), "nimz3" would miss the cache and
+    ``_resolve_edges_pure`` would actually run against that (bogus) path,
+    silently falling back to an EMPTY EdgeSet (MilpaKdlEdgeSource treats a
+    missing ``milpa.kdl`` as non-fatal) — a DIFFERENT, wrong object from
+    parent A's real, non-empty EdgeSet. So this test fails loudly (object
+    identity AND requires content) if the double-seal bug regresses, not
+    just a shallow "same key type" check.
+    """
+    dep_path = _make_dep_tree(
+        tmp_path,
+        "z3",
+        'name "z3"\ndeps {\n  stew ">= 0.1.0"\n}\n',
+    )
+    # One real upstream repo, referenced by two DIFFERENT source-id values
+    # that a real BindingResolver would bind separately per label — but here
+    # we simulate the ALREADY-NORMALIZED, identical source_id both labels
+    # resolve to (the binding phase, not resolve_edges, is what unifies
+    # them; resolve_edges just trusts the source_id it's handed).
+    one_repo_sid = normalize_source(GitSourceId(url="https://github.com/example/nim-z3.git"))
+
+    edge_cache: dict = {}
+
+    # Parent A: consumer wrote `z3` — real fetched tree.
+    ctx_a = _ctx(dep_path=dep_path, dep_name="z3", has_milpa_kdl=True)
+    es_a = resolve_edges("z3", _V, ctx_a, edge_cache, source_id=one_repo_sid)
+
+    # Parent B: consumer wrote `nimz3` for the SAME upstream repo (one BFS
+    # diamond reaching one repo under two labels) — nonexistent dep_path
+    # proves the second call never re-resolves.
+    ctx_b = _ctx(dep_path=tmp_path / "does-not-exist", dep_name="nimz3", has_milpa_kdl=True)
+    es_b = resolve_edges("nimz3", _V, ctx_b, edge_cache, source_id=one_repo_sid)
+
+    assert es_a is es_b, (
+        "two labels for the SAME source must coalesce to ONE sealed EdgeSet "
+        "(pre-S4 bug: this sealed two separate entries)"
+    )
+    assert len(edge_cache) == 1, "one source, one version → exactly one edge_cache entry"
+    names = [r.name for r in es_b.requires if isinstance(r, NamedRequire)]
+    assert "stew" in names, (
+        "the coalesced EdgeSet must be parent A's REAL result, not an empty "
+        "fallback from re-resolving parent B's nonexistent path"
+    )
+
+    # Contrast: a genuinely DIFFERENT source at the same version must NOT
+    # coalesce — proves the key is actually source_id-driven, not a silent
+    # collapse-everything bug.
+    other_dep_path = _make_dep_tree(tmp_path, "other", 'name "other"\n')
+    other_sid = normalize_source(GitSourceId(url="https://github.com/example/other.git"))
+    ctx_c = _ctx(dep_path=other_dep_path, dep_name="other", has_milpa_kdl=True)
+    es_c = resolve_edges("other", _V, ctx_c, edge_cache, source_id=other_sid)
+
+    assert es_c is not es_a, "a genuinely different source must NOT coalesce"
+    assert len(edge_cache) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -750,7 +856,7 @@ def test_s25_flag_gated_dep_excluded_when_flag_default_off(tmp_path: Path) -> No
     dep_path = _make_dep_tree(tmp_path, "mylib", kdl_content)
     ctx = _ctx(dep_path=dep_path, dep_name="mylib", has_milpa_kdl=True)
     edge_cache: dict = {}
-    es = resolve_edges("mylib", _V, ctx, edge_cache)
+    es = resolve_edges("mylib", _V, ctx, edge_cache, source_id=_sid("mylib"))
 
     all_names = [r.name for r in es.requires if isinstance(r, NamedRequire)]
     all_urls = [r.url for r in es.requires if isinstance(r, UrlRequire)]
@@ -783,7 +889,7 @@ def test_s25_flag_gated_dep_included_when_flag_default_on(tmp_path: Path) -> Non
     dep_path = _make_dep_tree(tmp_path, "mylib", kdl_content)
     ctx = _ctx(dep_path=dep_path, dep_name="mylib", has_milpa_kdl=True)
     edge_cache: dict = {}
-    es = resolve_edges("mylib", _V, ctx, edge_cache)
+    es = resolve_edges("mylib", _V, ctx, edge_cache, source_id=_sid("mylib"))
 
     all_urls = [r.url for r in es.requires if isinstance(r, UrlRequire)]
     assert any("chronos" in u for u in all_urls), (
@@ -820,7 +926,7 @@ def test_s25_negated_flag_predicate_url_dep_excluded_when_flag_default_on(
     dep_path = _make_dep_tree(tmp_path, "mylib", kdl_content)
     ctx = _ctx(dep_path=dep_path, dep_name="mylib", has_milpa_kdl=True)
     edge_cache: dict = {}
-    es = resolve_edges("mylib", _V, ctx, edge_cache)
+    es = resolve_edges("mylib", _V, ctx, edge_cache, source_id=_sid("mylib"))
 
     all_names = [r.name for r in es.requires if isinstance(r, NamedRequire)]
     all_urls = [r.url for r in es.requires if isinstance(r, UrlRequire)]

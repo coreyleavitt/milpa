@@ -229,6 +229,7 @@ class TestIsRootDirectNamespaceAware:
     """
 
     def _provider(self, root_direct_keys: set) -> object:
+        from milpa.binding import BindingResolver
         from milpa.resolver import _Provider
 
         return _Provider(
@@ -236,11 +237,10 @@ class TestIsRootDirectNamespaceAware:
             deps_dir=Path("/nonexistent"),
             params=ResolveParams(),
             overrides_by_name={},
-            root_authority=set(),
             root_direct_keys=root_direct_keys,
             seen_named=set(),
             seen_url=set(),
-            provenance_gate={},
+            binding_resolver=BindingResolver([]),
         )
 
     def test_matches_same_name_same_namespace(self) -> None:

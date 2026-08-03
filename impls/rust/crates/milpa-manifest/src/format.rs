@@ -35,6 +35,85 @@ fn trust_policy_str(p: &crate::TrustPolicy) -> &'static str {
     }
 }
 
+/// Render one `overrides {}` `pkg` rule (S8/S8b, rfc-origin-as-identity.md
+/// §7 B5) — single source of truth shared by `format_manifest` and
+/// `format_workspace_manifest` (both packages and a workspace root use the
+/// IDENTICAL override grammar; mirrors Python's `_format_override_line`,
+/// which unifies the same previously-duplicated logic). Returns the line(s)
+/// to push (more than one only for the `Member` block form).
+fn format_override_lines(ov: &crate::Override) -> Vec<String> {
+    let version_suffix = ov
+        .version
+        .as_ref()
+        .map(|v| format!(" version=\"{}\"", milpa_solver::format_version_str(v)))
+        .unwrap_or_default();
+    match &ov.target {
+        OverrideTarget::Git { url, git_ref, subpath } => {
+            let subpath_suffix = subpath
+                .as_ref()
+                .map(|s| format!(" subpath=\"{}\"", kdl_str(s)))
+                .unwrap_or_default();
+            vec![format!(
+                "    pkg \"{}\" git=(url)\"{}\" ref=\"{}\"{}{}",
+                kdl_str(&ov.name), kdl_str(url), kdl_str(git_ref), subpath_suffix, version_suffix
+            )]
+        }
+        OverrideTarget::Local { path } => {
+            vec![format!(
+                "    pkg \"{}\" local=\"{}\"{}",
+                kdl_str(&ov.name), kdl_str(path), version_suffix
+            )]
+        }
+        OverrideTarget::Oci { registry, repository, digest, subpath } => {
+            let subpath_suffix = subpath
+                .as_ref()
+                .map(|s| format!(" subpath=\"{}\"", kdl_str(s)))
+                .unwrap_or_default();
+            vec![format!(
+                "    pkg \"{}\" oci=\"{}/{}\" digest=\"{}\"{}{}",
+                kdl_str(&ov.name), kdl_str(registry), kdl_str(repository), kdl_str(digest),
+                subpath_suffix, version_suffix
+            )]
+        }
+        OverrideTarget::Tarball { url, sha256, strip_components, subpath } => {
+            let mut parts = vec![
+                format!("    pkg \"{}\"", kdl_str(&ov.name)),
+                format!("tarball=(url)\"{}\"", kdl_str(url)),
+            ];
+            if let Some(s) = sha256 {
+                parts.push(format!("sha256=\"{}\"", kdl_str(s)));
+            }
+            if *strip_components != 0 {
+                parts.push(format!("strip_components={strip_components}"));
+            }
+            if let Some(s) = subpath {
+                parts.push(format!("subpath=\"{}\"", kdl_str(s)));
+            }
+            if let Some(v) = &ov.version {
+                parts.push(format!("version=\"{}\"", milpa_solver::format_version_str(v)));
+            }
+            vec![parts.join(" ")]
+        }
+        OverrideTarget::Registry { name, namespace } => {
+            let ns_suffix = namespace
+                .as_ref()
+                .map(|ns| format!(" namespace=\"{}\"", kdl_str(ns)))
+                .unwrap_or_default();
+            vec![format!(
+                "    pkg \"{}\" named=\"{}\"{}{}",
+                kdl_str(&ov.name), kdl_str(name), ns_suffix, version_suffix
+            )]
+        }
+        OverrideTarget::Member { member_name } => {
+            vec![
+                format!("    pkg \"{}\"{} {{", kdl_str(&ov.name), version_suffix),
+                format!("        member \"{}\"", kdl_str(member_name)),
+                "    }".to_string(),
+            ]
+        }
+    }
+}
+
 /// Render a [`Manifest`] to `milpa.kdl` text (trailing newline included).
 pub fn format_manifest(m: &Manifest) -> String {
     let mut lines: Vec<String> = vec![HEADER.to_string(), String::new()];
@@ -136,32 +215,7 @@ pub fn format_manifest(m: &Manifest) -> String {
     if !m.overrides.is_empty() {
         lines.push("overrides {".to_string());
         for ov in &m.overrides {
-            // A3b: version= annotation on the override rule itself (§3 Axis A
-            // (b) step 4, D-A3) — valid regardless of target form.
-            let version_suffix = ov
-                .version
-                .as_ref()
-                .map(|v| format!(" version=\"{}\"", milpa_solver::format_version_str(v)))
-                .unwrap_or_default();
-            match &ov.target {
-                OverrideTarget::Git { url, git_ref } => {
-                    lines.push(format!(
-                        "    pkg \"{}\" git=(url)\"{}\" ref=\"{}\"{}",
-                        kdl_str(&ov.name), kdl_str(url), kdl_str(git_ref), version_suffix
-                    ));
-                }
-                OverrideTarget::Local { path } => {
-                    lines.push(format!(
-                        "    pkg \"{}\" local=\"{}\"{}",
-                        kdl_str(&ov.name), kdl_str(path), version_suffix
-                    ));
-                }
-                OverrideTarget::Member { member_name } => {
-                    lines.push(format!("    pkg \"{}\"{} {{", kdl_str(&ov.name), version_suffix));
-                    lines.push(format!("        member \"{}\"", kdl_str(member_name)));
-                    lines.push("    }".to_string());
-                }
-            }
+            lines.extend(format_override_lines(ov));
         }
         lines.push("}".to_string());
         lines.push(String::new());
@@ -170,6 +224,15 @@ pub fn format_manifest(m: &Manifest) -> String {
         lines.push("mirrors {".to_string());
         for url in &m.self_mirrors {
             lines.push(format!("    mirror (url)\"{}\"", kdl_str(url)));
+        }
+        lines.push("}".to_string());
+        lines.push(String::new());
+    }
+    // provides { module "..." ... } — S7 (rfc-origin-as-identity.md §4.6).
+    if !m.provides.is_empty() {
+        lines.push("provides {".to_string());
+        for module in &m.provides {
+            lines.push(format!("    module \"{}\"", kdl_str(module)));
         }
         lines.push("}".to_string());
         lines.push(String::new());
@@ -348,28 +411,7 @@ pub fn format_workspace_manifest(ws: &Workspace) -> String {
     if !ws.overrides.is_empty() {
         lines.push("overrides {".to_string());
         for ov in &ws.overrides {
-            // A3b: version= annotation on the override rule itself.
-            let version_suffix = ov
-                .version
-                .as_ref()
-                .map(|v| format!(" version=\"{}\"", milpa_solver::format_version_str(v)))
-                .unwrap_or_default();
-            match &ov.target {
-                OverrideTarget::Git { url, git_ref } => {
-                    lines.push(format!(
-                        "    pkg \"{}\" git=(url)\"{}\" ref=\"{}\"{}",
-                        kdl_str(&ov.name), kdl_str(url), kdl_str(git_ref), version_suffix
-                    ));
-                }
-                OverrideTarget::Local { path } => {
-                    lines.push(format!("    pkg \"{}\" local=\"{}\"{}", kdl_str(&ov.name), kdl_str(path), version_suffix));
-                }
-                OverrideTarget::Member { member_name } => {
-                    lines.push(format!("    pkg \"{}\"{} {{", kdl_str(&ov.name), version_suffix));
-                    lines.push(format!("        member \"{}\"", kdl_str(member_name)));
-                    lines.push("    }".to_string());
-                }
-            }
+            lines.extend(format_override_lines(ov));
         }
         lines.push("}".to_string());
         lines.push(String::new());
@@ -514,6 +556,10 @@ fn format_dep_line(dep: &Dep) -> String {
             if let Some(version) = &u.version {
                 head.push_str(&format!(" version=\"{}\"", milpa_solver::format_version_str(version)));
             }
+            // subpath= — rfc-origin-as-identity.md §4.1/S8. Present iff u.subpath is set.
+            if let Some(subpath) = &u.subpath {
+                head.push_str(&format!(" subpath=\"{}\"", kdl_str(subpath)));
+            }
             // S7: emit `optional=#true` and strip the auto-injected gate predicate.
             if u.optional {
                 head.push_str(" optional=#true");
@@ -621,6 +667,9 @@ fn format_dep_line(dep: &Dep) -> String {
             }
             if let Some(version) = &t.version {
                 parts.push(format!("version=\"{}\"", milpa_solver::format_version_str(version)));
+            }
+            if let Some(subpath) = &t.subpath {
+                parts.push(format!("subpath=\"{}\"", kdl_str(subpath)));
             }
             let node_body = parts.join(" ");
             if !t.predicates.is_empty() {
@@ -736,7 +785,8 @@ mod tests {
             entry_trust_policy_explicit: false,
             index_history_policy: crate::TrustPolicy::Warn,
             index_history_policy_explicit: false,
-        resolution: None,
+            resolution: None,
+            provides: Vec::new(),
             optional_auto_flags: std::collections::BTreeSet::new(),
         }
     }
@@ -758,7 +808,7 @@ mod tests {
     fn url_and_named_deps_round_trip_with_url_annotation() {
         let mut m = base();
         m.deps = vec![
-            Dep::Url(UrlDep {
+            Dep::Url(UrlDep { subpath: None,
                 name: "foo".into(),
                 git: "https://e/foo.git".into(),
                 git_ref: "main".into(),
@@ -939,7 +989,7 @@ mod tests {
     #[test]
     fn url_dep_version_annotation_round_trips() {
         let mut m = base();
-        m.deps = vec![Dep::Url(UrlDep {
+        m.deps = vec![Dep::Url(UrlDep { subpath: None,
             name: "foo".into(),
             git: "https://e/foo.git".into(),
             git_ref: "main".into(),
@@ -979,7 +1029,7 @@ mod tests {
     #[test]
     fn tarball_dep_version_annotation_round_trips() {
         let mut m = base();
-        m.deps = vec![Dep::Tarball(crate::TarballDep {
+        m.deps = vec![Dep::Tarball(crate::TarballDep { subpath: None,
             name: "foo".into(),
             url: "https://example.com/foo.tar.gz".into(),
             sha256: None,
@@ -1006,6 +1056,7 @@ mod tests {
             target: OverrideTarget::Git {
                 url: "https://github.com/fork/foo.git".into(),
                 git_ref: "dev".into(),
+                subpath: None,
             },
             version: Some(milpa_solver::parse_version("2.0.0").unwrap()),
         }];
@@ -1067,7 +1118,7 @@ mod tests {
     #[test]
     fn tarball_dep_with_predicate_round_trips() {
         let mut m = base();
-        m.deps = vec![Dep::Tarball(crate::TarballDep {
+        m.deps = vec![Dep::Tarball(crate::TarballDep { subpath: None,
             name: "tarlib".into(),
             url: "https://example.com/tarlib.tar.gz".into(),
             sha256: None,
@@ -1370,7 +1421,7 @@ mod tests {
             entry_trust_policy_explicit: false,
             index_history_policy: crate::TrustPolicy::Warn,
             index_history_policy_explicit: false,
-        resolution: None,
+            resolution: None,
         };
 
         let text = format_workspace_manifest(&ws);

@@ -3,6 +3,10 @@ version 1
 strategy "maxver"
 
 dep "member-a" {
+    source {
+        kind "member"
+        name "member-a"
+    }
     identity "dag-sha256:1ff103fe50c8bc79b6186c3ddddc0c7213e5bebf325b657ed10cc83436e5b90e"
     version "0.0.0"
     src_dir ""

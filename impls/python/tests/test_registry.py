@@ -1198,6 +1198,55 @@ package "../evil" {
             parse_index(text)
         assert exc_info.value.slug == TNG_UNSAFE_NAME
 
+    def test_slashed_namespace_accepted_real_world_convention(self) -> None:
+        """Regression pin (rfc-origin-as-identity.md §4.1 S1 investigation):
+        a host-qualified `namespace` (`"github.com/<user>"`,
+        `"bitbucket.org/<user>"`, ...) is the REAL, live tianguis
+        convention for vendored non-milpa-native nimble packages (a
+        deliberate global-uniqueness scheme — see the cached production
+        index) — NOT an injection attempt. A blanket `_validate_safe_name`
+        (which rejects any `/`) would reject essentially the entire index,
+        so it is deliberately NOT applied to `namespace` (unlike `name`,
+        which never legitimately contains `/`). Left as an S1-flagged
+        blocker: see the RFC S1 report for the human decision on a
+        narrower (`..`/absolute-only) guard vs. a `pkg+` grammar rework."""
+        text = """\
+schema_version 1
+package "foo" {
+    namespace "github.com/someuser"
+    version "1.0.0" {
+        content_hash "dag-sha256:0000000000000000000000000000000000000000000000000000000000000001"
+        provenance {
+            kind "git"
+            url "https://example.com/foo.git"
+            ref "main"
+        }
+    }
+}
+"""
+        idx = parse_index(text)  # must not raise
+        assert idx.packages[0].namespace == "github.com/someuser"
+
+    def test_empty_namespace_still_accepted(self) -> None:
+        """The common unqualified case (no `namespace` child at all, or
+        empty) is exempt from the safe-name check — it is the "no
+        namespace" sentinel, not a path component."""
+        text = """\
+schema_version 1
+package "foo" {
+    version "1.0.0" {
+        content_hash "dag-sha256:0000000000000000000000000000000000000000000000000000000000000001"
+        provenance {
+            kind "git"
+            url "https://example.com/foo.git"
+            ref "main"
+        }
+    }
+}
+"""
+        idx = parse_index(text)  # must not raise
+        assert idx.packages[0].namespace == ""
+
     def test_control_char_tab_in_yanked_reason_via_kdl_escape(self) -> None:
         """A `\\u{9}` escape in `yanked_reason` is rejected — `yanked_reason`
         is rendered RAW (not repr'd) into the `TNG-NO-SATISFYING-VERSION`

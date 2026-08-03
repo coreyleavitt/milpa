@@ -3,6 +3,10 @@ version 1
 strategy "maxver"
 
 dep "lib-a" {
+    source {
+        kind "git"
+        url (url)"https://example.com/lib-a"
+    }
     identity "dag-sha256:2d72f40bfe9c3d21ebb8143f82d7c41f564a9a5003bfe2c6a9310dd041644531"
     version "0.0.0"
     src_dir ""
@@ -17,6 +21,10 @@ dep "lib-a" {
 }
 
 dep "lib-b" {
+    source {
+        kind "git"
+        url (url)"https://example.com/lib-b"
+    }
     identity "dag-sha256:2c806bf47ff6d44bbdcbb41ec6048bbc0b07e2e14f6b4d0aff0da404a9150098"
     version "0.0.0"
     src_dir ""
@@ -31,6 +39,10 @@ dep "lib-b" {
 }
 
 dep "lib-e" {
+    source {
+        kind "git"
+        url (url)"https://example.com/lib-e"
+    }
     identity "dag-sha256:8c14d41e31f658eacb5df35ea703b30bf19ceb27873e79c1f0c0d3c4abd1a1e3"
     version "0.0.0"
     src_dir ""
@@ -45,6 +57,10 @@ dep "lib-e" {
 }
 
 dep "lib-f" {
+    source {
+        kind "git"
+        url (url)"https://example.com/lib-f"
+    }
     identity "dag-sha256:509553e31c99a46f4e50198dbe13fbad1a5d54660f99d694260811e015ae099b"
     version "0.0.0"
     src_dir ""
@@ -59,6 +75,10 @@ dep "lib-f" {
 }
 
 dep "lib-shared" {
+    source {
+        kind "git"
+        url (url)"https://example.com/lib-shared"
+    }
     identity "dag-sha256:751011d3f9312482aa15403cbe40dba9681d1b79d639c8daa0a2db26b7d0aa86"
     version "0.0.0"
     src_dir ""

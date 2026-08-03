@@ -55,6 +55,7 @@ from milpa.errors import (
     FETCH_REF_DISCOVERY_FAILED,
     FROZEN_ACTIVE_FLAGS_MISMATCH,
     FROZEN_NO_LOCKFILE,
+    LOCK_DEP_AMBIGUOUS_NAME,
     LOCK_DEP_NOT_FOUND,
     LOCK_DEPDECL_PIN_MISSING,
     LOCK_FILE_NOT_FOUND,
@@ -77,7 +78,12 @@ from milpa.errors import (
 )
 from milpa.fetchers import CasAdmittingFetcher, build_registry, mocked_registry
 from milpa.fetchers.types import Provenance
-from milpa.frozen import resolve_frozen, resolve_workspace_frozen
+from milpa.frozen import (
+    check_source_id_preconditions_standalone,
+    check_source_id_preconditions_workspace,
+    resolve_frozen,
+    resolve_workspace_frozen,
+)
 from milpa.index_cache import load_default_index
 from milpa.lockfile import (
     GitProvenanceRecord,
@@ -2432,6 +2438,12 @@ def cmd_show(project_dir: Path) -> int:
         # that a dep was deduped (e.g. "bar" → canonical "foo").
         if dep.aliases:
             print(f"  aliases     {', '.join(sorted(dep.aliases))}")
+            # RFC origin-as-identity.md §4.7/B3 (S3a-req): one human-readable
+            # note per dropped label naming the shared origin AND which label
+            # survived — the collapse must be VISIBLE, never just a bare list.
+            from milpa.lockfile import collapse_notes as _collapse_notes
+            for note in _collapse_notes([dep]):
+                print(f"  note        {note}")
         # RFC per-entry-attestation.md P2 (§7): render the lockfile's
         # attestation block as an UNVERIFIED claim — no crypto has ever been
         # run over it.  The wording upgrades to a verified fact only once the
@@ -2461,21 +2473,30 @@ def _format_provenance(p: object) -> str:
         TarballProvenanceRecord,
     )
 
+    # Defense-in-depth (code-review S2): url/path/registry/repository/ref are
+    # free-text fields sourced from a network-fetched `milpa.kdl` (or a
+    # hand-edited lockfile). The primary control-char guard lives at
+    # `source_id.normalize_source` (source_id.py); this is a belt-and-
+    # suspenders escape at the diagnostic-print sink so a value that somehow
+    # reaches this far (e.g. predates that guard) still cannot smuggle a
+    # terminal-escape sequence into the user's terminal. `repr()` is used
+    # rather than a bespoke escaper — it is total, always legible, and is
+    # exactly what `MilpaError`'s own `value=` diagnostics already use.
     if isinstance(p, GitProvenanceRecord):
-        parts = [f"git {p.url}"]
+        parts = [f"git {p.url!r}"]
         if p.ref:
-            parts.append(f"@ {p.ref}")
+            parts.append(f"@ {p.ref!r}")
         if p.commit_sha:
             parts.append(f"(sha {p.commit_sha[:8]})")
         return " ".join(parts)
     if isinstance(p, TarballProvenanceRecord):
-        return f"tarball {p.url}"
+        return f"tarball {p.url!r}"
     if isinstance(p, LocalProvenanceRecord):
-        return f"local {p.path}"
+        return f"local {p.path!r}"
     if isinstance(p, MemberProvenanceRecord):
         return f"member {p.name}"
     if isinstance(p, OciProvenanceRecord):
-        return f"oci {p.registry}/{p.repository}@{p.digest[:15]}"
+        return f"oci {p.registry!r}/{p.repository!r}@{p.digest[:15]}"
     if isinstance(p, RootProvenanceRecord):
         return f"root {p.name}"
     return str(p)
@@ -2694,6 +2715,13 @@ def cmd_verify(
                 no_default_features=False,
                 all_features=False,
             )
+            # RFC origin-as-identity.md §7.1 D2/D3 (S5): FROZEN-REGISTRY-
+            # ALIAS-UNRESOLVED (checked first) + FROZEN-SOURCE-ID-MISMATCH
+            # (declared-AFTER-override) — the SAME SSOT check resolve_frozen
+            # runs, wired into `milpa verify` too (not just --frozen), so
+            # editing a git=/local=/tarball= origin (or its override target)
+            # without re-fetching fails closed here as well.
+            check_source_id_preconditions_standalone(verify_manifest, lockfile.deps)
         except MilpaError as exc:
             print(f"milpa verify: {exc.message}", file=sys.stderr)
             _emit_slug(exc.slug)
@@ -2713,6 +2741,9 @@ def cmd_verify(
                 no_default_features=False,
                 all_features=False,
             )
+            # RFC origin-as-identity.md §7.1 D2/D3 (S5): same wiring as the
+            # standalone branch above, workspace form.
+            check_source_id_preconditions_workspace(ws, lockfile.deps)
         except MilpaError as exc:
             print(f"milpa verify: {exc.message}", file=sys.stderr)
             _emit_slug(exc.slug)
@@ -2835,8 +2866,19 @@ def _verify_dep_decl_pins(
         assert dep.dep_decl is not None  # narrowed above
         locked_pin = dep.dep_decl
 
-        # Find the version-node in the live index.
-        pkg = index.lookup_bare(dep.name)
+        # Find the version-node in the live index. A namespace-qualified
+        # locked dep MUST use the namespace-aware lookup (P5, namespace-
+        # conflation audit) — `lookup_bare` ignores `dep.namespace` entirely,
+        # so the moment a DIFFERENT namespace also publishes a package with
+        # the same bare name, `lookup_bare` returns `AmbiguousName` and the
+        # branch below would misreport a perfectly valid, unambiguous
+        # namespaced pin as LOCK-DEPDECL-PIN-MISSING. `lookup_qualified`
+        # never returns `AmbiguousName` (the namespace disambiguates by
+        # construction), so this is only ever taken for un-namespaced deps.
+        if dep.namespace is not None:
+            pkg = index.lookup_qualified(dep.namespace, dep.name)
+        else:
+            pkg = index.lookup_bare(dep.name)
         if pkg is None or hasattr(pkg, "namespaces"):
             # Not found / ambiguous: treat as LOCK-DEPDECL-PIN-MISSING
             # (the pin records a dep_decl but the index no longer has it).
@@ -4008,6 +4050,79 @@ def _cmd_add_mirror(
 
 
 # ---------------------------------------------------------------------------
+# Namespace-qualified dep-ref parsing + structured DepKey matching
+# (namespace-conflation audit P3/P4) — shared by cmd_remove,
+# _cmd_remove_from_member_dir, and (for the parse step) update's scoped path.
+# ---------------------------------------------------------------------------
+
+
+def _parse_ns_name_ref(ref: str) -> tuple[str | None, str]:
+    """Parse a CLI dep reference into ``(namespace, bare_name)``.
+
+    Recognizes the ``ns/name`` slash-shorthand (S5b) accepted by ``remove``
+    and ``update``'s scoped dep argument. A malformed reference (more than
+    one ``/``, or an empty namespace/name part) is left UNSPLIT —
+    ``(None, ref)`` — so the caller's own not-declared/not-found guard
+    reports the original string verbatim rather than a mangled bare name.
+    """
+    if "/" in ref:
+        parts = ref.split("/")
+        if len(parts) == 2 and parts[0] and parts[1]:
+            return parts[0], parts[1]
+    return None, ref
+
+
+def _dep_identity_key(d: object) -> DepKey:
+    """Return the structured ``(name, namespace)`` identity key for a dep
+    declaration, a ``LockedDep``, or a ``ResolvedDep`` alike.
+
+    Never a joined ``::`` solver-variable string (``DepKey.solver_var()`` is
+    SOLVER-INTERNAL ONLY). Shared by ``cmd_remove`` (standalone) and
+    ``_cmd_remove_from_member_dir`` (S11e member-dir delegate) so the two
+    ``remove`` entry points cannot structurally drift on namespace-qualified
+    matching (P3, namespace-conflation audit) — a member-dir ``milpa remove
+    foo`` must never match/delete `foo` in ANY namespace but the one asked
+    for, exactly like the standalone path.
+    """
+    return DepKey(name=getattr(d, "name", ""), namespace=getattr(d, "namespace", None))
+
+
+def _dep_key_display(key: DepKey) -> str:
+    """Render a ``DepKey`` as the CLI's ``ns/name`` (or bare) display form —
+    the same slash convention the lockfile uses for ``requires`` entries
+    (lockfile.py's ``_req_name_to_lockfile``) — never the ``::``-joined
+    solver-variable form, which is solver-internal only.
+    """
+    return key.name if key.namespace is None else f"{key.namespace}/{key.name}"
+
+
+def _resolve_remove_target(
+    dep_name: str,
+    prior_for_alias: "Lockfile | None",
+) -> tuple[DepKey, str]:
+    """Parse + alias-resolve a ``remove`` dep argument into a canonical
+    ``(DepKey, display)`` pair.
+
+    Shared by ``cmd_remove`` (standalone) and ``_cmd_remove_from_member_dir``
+    (S11e member-dir delegate) so namespace-qualified matching + alias→
+    canonical resolution cannot structurally drift between the two ``remove``
+    entry points (P3, namespace-conflation audit) — mirrors
+    ``_strip_pins_for_upgrade``'s shared role for ``update``.
+
+    Alias resolution operates on the BARE name only (aliases are a
+    content-dedup convenience, orthogonal to the namespace axis); the parsed
+    namespace is carried through unchanged alongside it.
+    """
+    namespace, bare = _parse_ns_name_ref(dep_name)
+    if prior_for_alias is not None:
+        canonical_bare = resolve_alias_to_canonical(bare, prior_for_alias)
+    else:
+        canonical_bare = bare
+    canonical_key = DepKey(name=canonical_bare, namespace=namespace)
+    return canonical_key, _dep_key_display(canonical_key)
+
+
+# ---------------------------------------------------------------------------
 # Alias→canonical resolution (D-update-remove, Phase D item 5)
 # ---------------------------------------------------------------------------
 
@@ -4051,10 +4166,21 @@ def _strip_pins_for_upgrade(
       so every other dep's pin is untouched and keeps B2's minimal-change
       preference.
 
+    Each entry of ``dep_names`` MAY use the ``ns/name`` slash-shorthand
+    (S5b) to disambiguate a bare name shared by locked deps in different
+    namespaces — parsed via ``_parse_ns_name_ref``, the same helper
+    ``cmd_remove``'s scoped-dep matching uses (namespace-conflation audit
+    P4). A BARE name that matches locked deps in 2+ DISTINCT namespaces is
+    ambiguous: before this guard, ``strip_dep_pin`` matched (and then
+    filtered/rebuilt ``new_deps``) on bare ``name`` alone, so stripping one
+    namespaced dep's pin silently DELETED the sibling's entire lockfile
+    entry. Raising instead of guessing is the safe behavior.
+
     Raises ``MilpaError(LOCK_FILE_NOT_FOUND)`` if ``dep_names`` is
     non-empty and ``prior`` is ``None`` (nothing to scope a named upgrade
-    against). Raises ``MilpaError(LOCK_DEP_NOT_FOUND)`` if a name isn't
-    present in ``prior``.
+    against). Raises ``MilpaError(LOCK_DEP_AMBIGUOUS_NAME)`` if a bare name
+    matches 2+ distinct namespaces. Raises ``MilpaError(LOCK_DEP_NOT_FOUND)``
+    if a (possibly namespace-qualified) name isn't present in ``prior``.
     """
     if not dep_names:
         return None
@@ -4066,13 +4192,39 @@ def _strip_pins_for_upgrade(
         )
     result = prior
     for dep_name in dep_names:
-        canonical_name = resolve_alias_to_canonical(dep_name, result)
-        if not any(d.name == canonical_name for d in result.deps):
+        namespace, bare = _parse_ns_name_ref(dep_name)
+        canonical_bare = resolve_alias_to_canonical(bare, result)
+
+        if namespace is None:
+            # Bare name given: must be unambiguous across namespaces.
+            matching_namespaces = sorted(
+                {d.namespace for d in result.deps if d.name == canonical_bare},
+                key=lambda ns: (ns is None, ns or ""),
+            )
+            if len(matching_namespaces) > 1:
+                displayed = ", ".join(
+                    canonical_bare if ns is None else f"{ns}/{canonical_bare}"
+                    for ns in matching_namespaces
+                )
+                raise MilpaError(
+                    LOCK_DEP_AMBIGUOUS_NAME,
+                    f"{dep_name!r} matches multiple namespaced deps in the "
+                    f"lockfile ({displayed}) — specify the namespace "
+                    f"(e.g. `ns/{canonical_bare}`) to disambiguate",
+                )
+            target_namespace = matching_namespaces[0] if matching_namespaces else None
+        else:
+            target_namespace = namespace
+
+        if not any(
+            d.name == canonical_bare and d.namespace == target_namespace
+            for d in result.deps
+        ):
             raise MilpaError(
                 LOCK_DEP_NOT_FOUND,
                 f"{dep_name!r} not found in lockfile",
             )
-        result = strip_dep_pin(result, canonical_name)
+        result = strip_dep_pin(result, canonical_bare, namespace=target_namespace)
     return result
 
 
@@ -4127,42 +4279,33 @@ def cmd_remove(
     manifest_text = manifest_path.read_text(encoding="utf-8")
     manifest = parse_manifest(manifest_text)
 
-    # S5b: parse slash-shorthand in dep_name ("ns1/bar" → namespace="ns1", bare="bar").
-    # The lockfile key (solver_var) for a qualified dep is "ns1::bar".
-    from milpa.manifest import NamedDep as _NamedDep
-    _remove_namespace: str | None = None
-    _remove_bare: str = dep_name
-    if "/" in dep_name:
-        _parts = dep_name.split("/")
-        if len(_parts) == 2 and _parts[0] and _parts[1]:
-            _remove_namespace, _remove_bare = _parts[0], _parts[1]
-        # Malformed (a/b/c or empty parts): leave dep_name as-is; the guard below
-        # will produce MAN-REMOVE-DEP-ABSENT with the original dep_name in the message.
-
-    # Compute the solver_var for lockfile lookups when namespace is set.
-    # Route through DepKey.solver_var() — the SOLE :: join site.
-    _remove_solver_var: str = DepKey(name=_remove_bare, namespace=_remove_namespace).solver_var()
-
-    # D-update-remove: alias→canonical resolution (Phase D item 5).
-    # If dep_name is an alias of a canonical lockfile dep, resolve to the
-    # canonical manifest name so the guard and manifest mutation operate correctly.
-    # For qualified deps, the lockfile dep name IS the solver_var ("ns1::bar").
+    # S5b audit (solver_var/from_solver_var CLI-wide audit): this whole
+    # function is a LOCKFILE/manifest mutation operation, never a solver-key
+    # lookup — it must NOT use `DepKey.solver_var()`/`from_solver_var()` to
+    # identify a dep. Both `LockedDep` and `ResolvedDep` store a qualified
+    # dep as two SEPARATE fields (`name` bare, `namespace` separate) — never
+    # joined with `::` (`DepKey.solver_var()`'s own docstring: "SOLVER-
+    # INTERNAL ONLY. This string MUST NOT be written to disk, the lockfile,
+    # or _deps/ paths."). The identity used throughout this function is a
+    # plain `DepKey(name, namespace)` tuple, compared structurally — never a
+    # joined string — against the manifest's own dep declarations, the prior
+    # lockfile's `LockedDep`, and the freshly resolved graph's `ResolvedDep`
+    # alike, so a qualified dep's namespace is never dropped nor conflated
+    # with a same-named dep in a different (or no) namespace.
+    #
+    # `_resolve_remove_target` (S5b/P3, namespace-conflation audit): parses
+    # the "ns1/bar" slash-shorthand + resolves alias→canonical — shared with
+    # `_cmd_remove_from_member_dir` so the two `remove` entry points cannot
+    # structurally drift.
     prior_for_alias = _maybe_load_prior_lockfile(lock_path)
-    if prior_for_alias is not None:
-        canonical_name = resolve_alias_to_canonical(_remove_solver_var, prior_for_alias)
-    else:
-        canonical_name = _remove_solver_var
+    canonical_key, canonical_display = _resolve_remove_target(
+        dep_name, prior_for_alias
+    )
 
-    # Guard: dep must be declared in milpa.kdl.
-    # For qualified deps, match by (namespace, bare_name); for bare deps, match by name.
-    def _dep_remove_key(d: object) -> str:
-        """Return the remove-key for a dep: solver_var for NamedDep, bare name for others."""
-        if isinstance(d, _NamedDep) and d.namespace:
-            return DepKey(name=d.name, namespace=d.namespace).solver_var()
-        return getattr(d, "name", "")
-
-    existing_keys = {_dep_remove_key(dep) for dep in manifest.deps}
-    if canonical_name not in existing_keys:
+    # Guard: dep must be declared in milpa.kdl. Match by the STRUCTURED
+    # (name, namespace) key — never a joined string.
+    existing_keys = {_dep_identity_key(dep) for dep in manifest.deps}
+    if canonical_key not in existing_keys:
         print(
             f"milpa remove: dep {dep_name!r} is not declared in milpa.kdl",
             file=sys.stderr,
@@ -4171,17 +4314,19 @@ def cmd_remove(
         return 1
 
     # Collect prior aliases for the dep being removed, so we can warn if any
-    # alias is still required by transitives after re-resolve.
+    # alias is still required by transitives after re-resolve. Matched by the
+    # structured key (name AND namespace), against LockedDep's own separate
+    # `name`/`namespace` fields — never a joined solver_var string.
     prior_aliases: tuple[str, ...] = ()
     if prior_for_alias is not None:
         for locked in prior_for_alias.deps:
-            if locked.name == canonical_name:
+            if DepKey(name=locked.name, namespace=locked.namespace) == canonical_key:
                 prior_aliases = locked.aliases
                 break
 
     # Build proposed manifest without the dep.
     from dataclasses import replace as _replace
-    new_deps = tuple(d for d in manifest.deps if _dep_remove_key(d) != canonical_name)
+    new_deps = tuple(d for d in manifest.deps if _dep_identity_key(d) != canonical_key)
     proposed_manifest = _replace(manifest, deps=new_deps)
 
     # Re-resolve.
@@ -4214,18 +4359,24 @@ def cmd_remove(
     # each one so the user knows that _deps/<alias> will be cleaned up.
     # This also covers the "alias still required by a transitive" case: if the
     # new graph still contains the canonical (pulled in transitively via another
-    # dep), the alias symlink remains live and the warning is especially important.
-    new_canonical_names = {d.name for d in graph.deps}
+    # dep), the alias symlink remains live and the warning is especially
+    # important. Matched by the structured key against ResolvedDep's own
+    # separate `name`/`namespace` fields — never a joined solver_var string.
+    new_canonical_keys = {DepKey(name=d.name, namespace=d.namespace) for d in graph.deps}
+    # `canonical_display` ("ns/name", or bare) was already computed by
+    # `_resolve_remove_target` above — the same slash convention the
+    # lockfile uses for `requires` entries (lockfile.py's
+    # `_req_name_to_lockfile`), never the `::`-joined solver-variable form.
     for alias in prior_aliases:
-        if canonical_name in new_canonical_names:
+        if canonical_key in new_canonical_keys:
             print(
-                f"warning: alias {alias!r} of removed dep {canonical_name!r} "
+                f"warning: alias {alias!r} of removed dep {canonical_display!r} "
                 f"is still required transitively; _deps/{alias} remains live",
                 file=sys.stderr,
             )
         else:
             print(
-                f"warning: removing dep {canonical_name!r} also removes alias "
+                f"warning: removing dep {canonical_display!r} also removes alias "
                 f"{alias!r} (_deps/{alias} will be cleaned up)",
                 file=sys.stderr,
             )
@@ -4234,7 +4385,7 @@ def cmd_remove(
     mutate_manifest_file(manifest_path, lambda _m: proposed_manifest)
     write_lockfile(lockfile_val, lock_path)
 
-    print(f"removed {canonical_name}", file=sys.stderr)
+    print(f"removed {canonical_display}", file=sys.stderr)
     return 0
 
 
@@ -4706,19 +4857,24 @@ def _cmd_remove_from_member_dir(
     ws_root = workspace.root_dir
     member_dir = member_dir.resolve()
 
-    # Alias→canonical resolution against the SHARED lockfile (not the member lock).
+    # Alias→canonical resolution against the SHARED lockfile (not the member
+    # lock). `_resolve_remove_target` (P3, namespace-conflation audit): parses
+    # the "ns1/bar" slash-shorthand + resolves alias→canonical into a
+    # structured DepKey — the SAME shared helper the standalone `cmd_remove`
+    # uses, so this member-dir path cannot drift onto bare-name matching
+    # (which would conflate two same-bare-name deps in different namespaces).
     shared_lock_path = ws_root / "milpa.lock"
     prior_for_alias = _maybe_load_prior_lockfile(shared_lock_path)
-    if prior_for_alias is not None:
-        canonical_name = resolve_alias_to_canonical(dep_name, prior_for_alias)
-    else:
-        canonical_name = dep_name
+    canonical_key, canonical_display = _resolve_remove_target(dep_name, prior_for_alias)
 
-    # Pre-flight: dep must be declared in the MEMBER's milpa.kdl.
+    # Pre-flight: dep must be declared in the MEMBER's milpa.kdl. Matched by
+    # the STRUCTURED (name, namespace) key — never bare name — so `milpa
+    # remove foo` from a member dir cannot match (and delete) BOTH `foo
+    # namespace="ns1"` and `foo namespace="ns2"` at once.
     member_manifest_path = member_dir / "milpa.kdl"
     preflight_manifest = parse_manifest(member_manifest_path.read_text(encoding="utf-8"))
-    existing_names = {dep.name for dep in preflight_manifest.deps}
-    if canonical_name not in existing_names:
+    existing_keys = {_dep_identity_key(dep) for dep in preflight_manifest.deps}
+    if canonical_key not in existing_keys:
         print(
             f"milpa remove: dep {dep_name!r} is not declared in milpa.kdl",
             file=sys.stderr,
@@ -4727,7 +4883,7 @@ def _cmd_remove_from_member_dir(
         return 1
 
     def _mutate_remove(m: _Manifest) -> _Manifest:
-        new_deps = tuple(d for d in m.deps if d.name != canonical_name)
+        new_deps = tuple(d for d in m.deps if _dep_identity_key(d) != canonical_key)
         return _replace(m, deps=new_deps)
 
     # Re-resolve the WHOLE workspace via the SSOT orchestration primitive.
@@ -4762,7 +4918,7 @@ def _cmd_remove_from_member_dir(
         _emit_slug(exc.slug)
         return 1
 
-    print(f"removed {canonical_name}", file=sys.stderr)
+    print(f"removed {canonical_display}", file=sys.stderr)
     return 0
 
 

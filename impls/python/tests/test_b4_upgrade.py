@@ -47,7 +47,12 @@ from milpa.cli import (
     cmd_update,
 )
 from milpa.context import MilpaEnv
-from milpa.errors import LOCK_DEP_NOT_FOUND, LOCK_FILE_NOT_FOUND, MilpaError
+from milpa.errors import (
+    LOCK_DEP_AMBIGUOUS_NAME,
+    LOCK_DEP_NOT_FOUND,
+    LOCK_FILE_NOT_FOUND,
+    MilpaError,
+)
 from milpa.fetchers.cas_admitting import CasAdmittingFetcher
 from milpa.fetchers.mocked import mocked_registry, url_key
 from milpa.identity import compute_content_hash
@@ -73,6 +78,25 @@ def _lock_with(names_versions: dict[str, str]) -> Lockfile:
             aliases=(f"{name}-alias",),
         )
         for i, (name, version) in enumerate(names_versions.items())
+    )
+    return Lockfile(version=1, strategy="maxver", deps=deps)
+
+
+def _lock_with_ns(entries: "list[tuple[str, str | None, str]]") -> Lockfile:
+    """Build a Lockfile from ``(name, namespace, version)`` triples — for
+    exercising namespace-qualified matching (P4, namespace-conflation audit)."""
+    deps = tuple(
+        LockedDep(
+            name=name,
+            namespace=namespace,
+            identity=f"sha256:{'0' * 63}{i}",
+            version=version,
+            src_dir="",
+            requires=(),
+            provenances=(),
+            active_flags=(),
+        )
+        for i, (name, namespace, version) in enumerate(entries)
     )
     return Lockfile(version=1, strategy="maxver", deps=deps)
 
@@ -123,6 +147,69 @@ class TestStripPinsForUpgrade:
         with pytest.raises(MilpaError) as exc_info:
             _strip_pins_for_upgrade(prior, ("nonexistent",))
         assert exc_info.value.slug == LOCK_DEP_NOT_FOUND
+
+    # -----------------------------------------------------------------
+    # P4 (namespace-conflation audit, SILENT DATA LOSS finding): a bare
+    # name matching locked deps in 2+ distinct namespaces used to resolve
+    # via `resolve_alias_to_canonical`/`strip_dep_pin` matching on bare
+    # `name` alone — `update foo` would strip ONE namespaced dep's pin
+    # and, because `strip_dep_pin` rebuilt `new_deps` with a
+    # `d.name != canonical_name` filter, SILENTLY DELETE the sibling's
+    # entire lockfile entry. These pin the fixed, namespace-aware
+    # behavior: a `ns/name` ref strips only that one entry and leaves
+    # every same-bare-name sibling in another namespace fully intact.
+    # -----------------------------------------------------------------
+
+    def test_qualified_ref_strips_only_that_namespace_preserves_sibling(self) -> None:
+        prior = _lock_with_ns(
+            [("foo", "ns1", "1.0.0"), ("foo", "ns2", "1.0.0")]
+        )
+        ns2_before = next(d for d in prior.deps if d.namespace == "ns2")
+
+        result = _strip_pins_for_upgrade(prior, ("ns1/foo",))
+
+        assert result is not None
+        assert len(result.deps) == 2, "the ns2 sibling must not be deleted"
+        ns1_after = next(d for d in result.deps if d.namespace == "ns1")
+        ns2_after = next(d for d in result.deps if d.namespace == "ns2")
+        assert ns1_after.identity is None, "ns1's pin was stripped"
+        assert ns2_after == ns2_before, "ns2's entry must be completely untouched"
+        assert ns2_after.identity is not None, "ns2 must keep its own pin"
+
+    def test_bare_name_ambiguous_across_namespaces_raises(self) -> None:
+        """A BARE name (no `ns/` prefix) that matches 2+ distinct
+        namespaces must raise LOCK_DEP_AMBIGUOUS_NAME rather than
+        silently picking one and deleting the other."""
+        prior = _lock_with_ns(
+            [("foo", "ns1", "1.0.0"), ("foo", "ns2", "1.0.0")]
+        )
+        with pytest.raises(MilpaError) as exc_info:
+            _strip_pins_for_upgrade(prior, ("foo",))
+        assert exc_info.value.slug == LOCK_DEP_AMBIGUOUS_NAME
+        # Neither entry may have been mutated — the function must raise
+        # BEFORE performing any strip.
+        assert prior.deps[0].identity is not None
+        assert prior.deps[1].identity is not None
+
+    def test_qualified_ref_not_found_raises_lock_dep_not_found(self) -> None:
+        prior = _lock_with_ns([("foo", "ns1", "1.0.0")])
+        with pytest.raises(MilpaError) as exc_info:
+            _strip_pins_for_upgrade(prior, ("ns2/foo",))
+        assert exc_info.value.slug == LOCK_DEP_NOT_FOUND
+
+    def test_bare_name_unambiguous_when_only_one_namespace_present(self) -> None:
+        """A bare name that matches exactly ONE locked dep (even if that
+        dep IS namespaced) is unambiguous — no error, exactly like an
+        un-namespaced dep."""
+        prior = _lock_with_ns(
+            [("foo", "ns1", "1.0.0"), ("bar", None, "2.0.0")]
+        )
+        result = _strip_pins_for_upgrade(prior, ("foo",))
+        assert result is not None
+        foo = next(d for d in result.deps if d.name == "foo")
+        bar = next(d for d in result.deps if d.name == "bar")
+        assert foo.identity is None
+        assert bar.identity is not None
 
 
 # ---------------------------------------------------------------------------

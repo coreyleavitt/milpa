@@ -37,6 +37,7 @@ from __future__ import annotations
 import warnings
 from dataclasses import dataclass, field
 from datetime import datetime
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -61,6 +62,10 @@ from milpa.errors import (
     LOCK_GRAPH_MISMATCH,
     LOCK_PROV_FIELD_ARITY,
     LOCK_PROV_FIELD_MISSING,
+    LOCK_SRC_FIELD_ARITY,
+    LOCK_SRC_FIELD_MISSING,
+    LOCK_SRC_KIND_MISSING,
+    LOCK_SRC_KIND_UNKNOWN,
     LOCK_SUBMODULE_FIELD_INVALID,
     LOCK_PROV_KIND_MISSING,
     LOCK_PROV_KIND_UNKNOWN,
@@ -68,6 +73,7 @@ from milpa.errors import (
     LOCK_STRATEGY_MISSING,
     LOCK_VERSION_MISSING,
     LOCK_VERSION_UNSUPPORTED,
+    RES_IMPORT_COLLISION,
     RES_LOCKED_DRIFT,
     VERIFY_ALIAS_SYMLINK_MISSING,
     VERIFY_EDGE_MISMATCH,
@@ -75,6 +81,17 @@ from milpa.errors import (
 )
 from milpa.identity import compute_content_hash, parse_identity
 from milpa.manifest import _format_resolution_timestamp, contains_unsafe_char, valid_dep_name
+from milpa.source_id import (
+    GitSourceId,
+    LocalSourceId,
+    MemberSourceId,
+    OciSourceId,
+    RegistrySourceId,
+    SourceId,
+    TarballSourceId,
+    format_source_id,
+    normalize_source,
+)
 from milpa.version import VersionSource
 from milpa.version import dep_dir_name  # noqa: F401 — re-exported (callers may import from here)
 from milpa.kdl_io import (
@@ -350,6 +367,15 @@ class LockedDep:
     # resolved deps (out of Axis A's scope — their version comes straight
     # from the index, never through the 4-step precedence).
     declared_version_source: str | None = None
+    # RFC origin-as-identity.md §4.1/§7 (S5): the version-independent origin,
+    # serialized STRUCTURED as a ``source { … }`` node with typed children
+    # (uv's model) — never a flat parsed string (no ``parse()`` exists).
+    # ``None`` only for a lockfile predating S5 (forward-compat: an absent
+    # ``source`` block is a P4-vintage-lock state, not an error) — a
+    # conformant S5+ emitter always writes this for every real dep. The
+    # FROZEN-SOURCE-ID-MISMATCH / FROZEN-REGISTRY-ALIAS-UNRESOLVED
+    # preconditions (frozen.py, §7.1) read this field.
+    source_id: SourceId | None = None
 
 
 @dataclass(frozen=True)
@@ -428,16 +454,26 @@ class ResolvedDep:
     # Converted to the narrower LockAttestation at the LockedDep construction
     # boundary — see _locked_from_resolved.
     attestation: EntryAttestation | None = None
-    # P3a addition: the entry's REAL index namespace (registry.IndexVersion.
-    # namespace), distinct from `namespace` above (manifest-qualification
-    # only). None for non-registry deps. Folded into LockAttestation.namespace
-    # at the LockedDep construction boundary (see _locked_from_resolved) —
-    # not a top-level LockedDep field, since it is only meaningful alongside
-    # an attestation block.
-    registry_namespace: str | None = None
+    # RFC origin-as-identity.md §4.4 (B2/G10 field-duplication audit, S5):
+    # ``registry_namespace`` (formerly a separate field here, mirroring
+    # ``_Candidate.registry_namespace``) is DELETED — it duplicated
+    # ``source_id.namespace`` for a ``RegistrySourceId`` (the SAME real
+    # index namespace, populated by the SAME ``resolved_registry_namespace``
+    # call at binding time). ``LockAttestation.namespace`` (needed for
+    # offline attestation-subject reconstruction, lockfile-schema.md §3.9)
+    # is now derived from ``source_id.namespace`` at the ``_locked_from_
+    # resolved`` construction boundary instead of from this field.
     # A5: sibling source for `version` — see LockedDep.declared_version_source
     # for the full contract; carried straight through in _locked_from_resolved.
     declared_version_source: str | None = None
+    # RFC origin-as-identity §4.4 (S3a): the version-independent origin the
+    # binding phase (BindingResolver) selected for this dep — IN-MEMORY ONLY.
+    # Deliberately NOT threaded into LockedDep/the on-disk lockfile schema
+    # yet (that is S5's structured `source { … }` node); `None` for the
+    # synthetic root dep and for any dep constructed outside the live
+    # resolve() / resolve_workspace() path (e.g. frozen.py reconstruction,
+    # until a later slice populates it there too).
+    source_id: SourceId | None = None
 
 
 @dataclass(frozen=True)
@@ -453,6 +489,183 @@ class ResolvedGraph:
 
     deps: tuple[ResolvedDep, ...]
     cert: Any = None  # SolveSuccess | None
+
+
+# ---------------------------------------------------------------------------
+# Alias-collapse notes — RFC origin-as-identity.md §4.7/B3 (S3a-req)
+#
+# When Phase B dedup (or the §4.7 slot projection generally) collapses two
+# declared labels reaching one origin into a single canonical dep, dropping
+# the non-canonical label MUST be visible, never silent (§4.7 normative:
+# "the collapse is visible, never a silent disappearance"). These two
+# functions are the single source of truth for that visibility — shared by
+# resolve()/resolve_workspace()'s post-build stderr trace and `milpa show`,
+# so the note text never drifts between the two call sites.
+# ---------------------------------------------------------------------------
+
+
+def format_dep_origin(dep: ResolvedDep | LockedDep) -> str:
+    """Human-readable origin string for *dep* — ``git+<url>``, ``tar+<url>``,
+    ``oci+<registry>/<repository>``, ``file+<path>``, ``member+<name>``, or
+    ``root+<name>``.
+
+    Deliberately mirrors ``source_id.canonical()``'s wire-format prefixes
+    (RFC origin-as-identity.md §4.1) WITHOUT importing ``source_id`` — it is
+    derived from the dep's own OBSERVED ``ProvenanceRecord`` (falling back to
+    the first record, or the dep's own name when there are none) so it reads
+    identically whether called on an in-memory ``ResolvedDep`` (which also
+    carries a ``source_id``, not yet threaded to disk — that is S5) or an
+    on-disk ``LockedDep`` reconstructed by ``milpa show``. Reusing one
+    provenance-derived formatter, rather than two divergent ones keyed on
+    which dep type is in hand, is the single-source-of-truth this module's
+    docstring commits to.
+    """
+    observed = next((p for p in dep.provenances if p.origin == "observed"), None)
+    if observed is None and dep.provenances:
+        observed = dep.provenances[0]
+    if observed is None:
+        return dep.name
+    if isinstance(observed, GitProvenanceRecord):
+        return f"git+{observed.url}"
+    if isinstance(observed, TarballProvenanceRecord):
+        return f"tar+{observed.url}"
+    if isinstance(observed, OciProvenanceRecord):
+        return f"oci+{observed.registry}/{observed.repository}"
+    if isinstance(observed, LocalProvenanceRecord):
+        return f"file+{observed.path}"
+    if isinstance(observed, MemberProvenanceRecord):
+        return f"member+{observed.name}"
+    if isinstance(observed, RootProvenanceRecord):
+        return f"root+{observed.name}"
+    return dep.name  # pragma: no cover — ProvenanceRecord is a closed union
+
+
+def collapse_notes(deps: "list[ResolvedDep] | tuple[LockedDep, ...]") -> list[str]:
+    """One low-severity note per alias the §4.7 slot projection dropped.
+
+    E.g. ``"'z3lib' and 'nimz3' both name git+https://…nim-z3; used 'nimz3'"``
+    — the exact shape RFC origin-as-identity.md §4.7 specifies. Empty for a
+    dep with no aliases. Notes are emitted in (canonical dep name, alias)
+    lexicographic order — deterministic regardless of dict/BFS ordering.
+    """
+    notes: list[str] = []
+    for dep in sorted(deps, key=lambda d: d.name):
+        if not dep.aliases:
+            continue
+        origin = format_dep_origin(dep)
+        for alias in sorted(dep.aliases):
+            notes.append(
+                f"{alias!r} and {dep.name!r} both name {origin}; used {dep.name!r}"
+            )
+    return notes
+
+
+def dep_origin_label(dep: ResolvedDep) -> str:
+    """The single diagnostic label for *dep*'s origin — used by
+    ``check_directory_slot_collisions`` (below) and, cross-module, by S7's
+    symbol-level ``import_slot.check_import_slot_collisions`` (the SAME
+    label for the SAME kind of diagnostic — no parallel formatter).
+
+    Prefers ``format_source_id`` (source_id.py B6, the SAME formatter
+    ``RES-BINDING-CONFLICT``/``FROZEN-SOURCE-ID-MISMATCH`` reuse) when
+    ``dep.source_id`` is populated (every fresh ``resolve()``/
+    ``resolve_workspace()`` dep, S3a+). Falls back to the provenance-derived
+    ``format_dep_origin`` (this module, above) when it is not — the frozen/
+    verify reconstruction path (``frozen.py``), whose ``ResolvedDep`` has no
+    ``source_id`` until a later slice threads the lockfile's ``source { … }``
+    node onto it. Both formatters describe the SAME origin identity (one
+    typed, one provenance-derived) so this fallback changes nothing about
+    *which* collisions are detected — see ``check_directory_slot_collisions``.
+    """
+    if dep.source_id is not None:
+        return format_source_id(dep.source_id)
+    return format_dep_origin(dep)
+
+
+def check_directory_slot_collisions(resolved: "ResolvedGraph | Sequence[ResolvedDep]") -> None:
+    """The v1 **directory-slot** floor of the import-slot check
+    (``rfc-origin-as-identity.md`` §4.6, S6) — ``RES-IMPORT-COLLISION``.
+
+    A plain function, no port: two distinct origins that would materialize
+    into the identical ``_deps/<slot>/`` directory (``dep_dir_name(name,
+    namespace)`` — the SAME SSOT ``rebuild_deps_view`` uses to lay out
+    ``_deps/``) cannot coexist, because the second write would silently
+    clobber the first. The complete, symbol-level check (comparing actual
+    exported Nim module paths behind a ``SymbolProviderPort``) has since
+    landed as ``import_slot.check_import_slot_collisions`` (S7) — this
+    function is retained as ITS cheap directory-level pre-filter (called
+    first, before any per-tree symbol work), never deleted (§4.6 round-2 fix
+    — G9). Call sites that used to call this function directly now call the
+    S7 sibling instead; this function stays exported and independently
+    tested (below) because the pre-filter property depends on it staying a
+    plain, no-I/O function of already-in-memory slot names.
+
+    **The ``content_hash`` short-circuit (§4.6, CRITICAL):** two origins
+    that project to the same slot but fetch **byte-identical** trees are the
+    exact same-bytes/different-origin case §3.3 celebrates as milpa's edge
+    over Cargo (already realized post-solve by S4b's ``_dedup_candidates``,
+    which folds any such pair into one canonical dep + alias before this
+    function ever runs) — they cannot produce a Nim symbol conflict and MUST
+    NOT raise. This function re-asserts that invariant directly, rather than
+    trusting the caller never to invoke it on data S4b hasn't deduped (e.g. a
+    hand-edited or future-corrupted lockfile reconstructed by the frozen
+    path, which runs no dedup pass at all): it raises ONLY when a shared slot
+    ALSO disagrees on ``identity`` (content_hash) — never on slot alone.
+
+    **Runs on fresh AND frozen graphs, no deferral (§10 S6 "F4"):** this
+    function's only inputs are ``ResolvedDep.name``/``.namespace`` (the slot)
+    and ``.identity`` (the raise/no-raise decision) — both already present on
+    a frozen-reconstructed ``ResolvedDep`` (``frozen.py``'s
+    ``_reconstruct_from_locked``) exactly as they are on a fresh one. Naming
+    the colliding origins in the diagnostic uses ``dep_origin_label`` (above),
+    which falls back to the provenance-derived ``format_dep_origin`` when
+    ``source_id`` is absent (frozen, pre-S5) — so no new ``SourceId``
+    reconstruction plumbing is needed in ``frozen.py`` to get full coverage
+    today: this floor is wired into ``resolve_frozen``/
+    ``resolve_workspace_frozen`` (``frozen.py``) exactly like
+    ``resolve()``/``resolve_workspace()`` (``resolver.py``), all four call
+    sites, from this slice onward.
+
+    **Durable caveat (§4.6/G9 — also in spec/errors.md):** this is a
+    *partial* proxy for "two packages export the same Nim symbol" — a slot
+    collision implies a symbol collision, but the converse does not hold (two
+    differently-named slots can still export the identical module, evading
+    this floor). A non-raising call means "no directory-slot collision,"
+    **never** "no import collision" in general.
+    """
+    deps: Sequence[ResolvedDep] = (
+        resolved.deps if isinstance(resolved, ResolvedGraph) else resolved
+    )
+    by_slot: dict[str, list[ResolvedDep]] = {}
+    for dep in deps:
+        slot = dep_dir_name(dep.name, dep.namespace)
+        by_slot.setdefault(slot, []).append(dep)
+
+    for slot, group in sorted(by_slot.items()):
+        if len(group) < 2:
+            continue
+        # The content_hash short-circuit: every member must share ONE
+        # non-None identity to be provably byte-identical. A missing
+        # identity (e.g. a never-hashed MemberSourceId dep) can never be
+        # proven equal, so it does NOT short-circuit.
+        identities = {dep.identity for dep in group}
+        if len(identities) == 1 and None not in identities:
+            continue
+        first, second = group[0], group[1]
+        raise MilpaError(
+            RES_IMPORT_COLLISION,
+            f"directory-slot collision at '_deps/{slot}/': "
+            f"{dep_origin_label(first)} and {dep_origin_label(second)} have "
+            f"different content and cannot both materialize into this slot — "
+            f"give one an explicit, distinct dep label (or reconcile via "
+            f"`overrides {{}}`) to separate them "
+            f"(note: this checks directory slots only, not full Nim-symbol "
+            f"import collisions — a clean run here does not rule out a "
+            f"symbol collision across two differently-named slots)",
+            slot=slot,
+            existing=dep_origin_label(first),
+            conflicting=dep_origin_label(second),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -685,6 +898,7 @@ def _parse_dep(node: KdlNode) -> LockedDep:
     namespace: str | None = None  # C1: qualified dep namespace (§3.9)
     attestation: LockAttestation | None = None  # per-entry attestation claim (§3.9)
     declared_version_source: str | None = None  # A5: sibling source for `version`
+    source_id: SourceId | None = None  # S5: structured on-disk source-id (§4.1/§7)
 
     for child in node_children(node):
         cname = node_name(child)
@@ -752,6 +966,11 @@ def _parse_dep(node: KdlNode) -> LockedDep:
             active_flags = _parse_dep_active_flags(child)
         elif cname == "attestation":
             attestation = _parse_lock_attestation(child, dep_name)
+        elif cname == "source":
+            # RFC origin-as-identity.md §4.1/§7 (S5): structured on-disk
+            # source-id — field-by-field into the frozen SourceId struct,
+            # never a flat-string parse.
+            source_id = _parse_source_block(child, dep_name)
         elif cname == "provenance":
             provenances.append(_parse_provenance_block(child, dep_name))
         elif cname == "dep_decl":
@@ -780,6 +999,7 @@ def _parse_dep(node: KdlNode) -> LockedDep:
         namespace=namespace,
         attestation=attestation,
         declared_version_source=declared_version_source,
+        source_id=source_id,
     )
 
 
@@ -1032,6 +1252,102 @@ def _parse_cond_require(node: KdlNode) -> "CondRequire | None":
     return CondRequire(name=name, predicates=tuple(predicates))
 
 
+# ---------------------------------------------------------------------------
+# source { … } — structured on-disk SourceId (RFC origin-as-identity.md
+# §4.1/§7, S5). Field-by-field into the frozen SourceId struct — NO
+# flat-string parse. A `/`-bearing namespace stores losslessly as an
+# ordinary KDL string value.
+# ---------------------------------------------------------------------------
+
+_SOURCE_KIND_LABELS = ("git", "oci", "tarball", "local", "registry", "member")
+
+
+def _parse_source_block(node: KdlNode, dep_name: str) -> SourceId:
+    """Parse a ``source { kind "…"; … }`` block into a typed ``SourceId``.
+
+    Structural (arity/missing-field) errors raise ``LOCK-SRC-*``; the parsed
+    RAW struct is then passed through ``normalize_source`` (SourceId's own
+    sole validation boundary — module docstring), which raises
+    ``SRC-ID-MALFORMED`` on a malformed subpath / namespace / registry
+    component so a poisoned lockfile cannot smuggle a `..`-traversal subpath
+    or a control-char namespace segment past the parse boundary.
+    """
+    fields: dict[str, str] = {}
+    for child in node_children(node):
+        cname = node_name(child)
+        child_args = node_args(child)
+        if len(child_args) != 1:
+            raise MilpaError(
+                LOCK_SRC_FIELD_ARITY,
+                f"dep {dep_name!r}: source field {cname!r} must have exactly "
+                f"one value, got {len(child_args)}",
+                dep=dep_name,
+                field=cname,
+            )
+        raw = child_args[0]
+        s = value_as_str(raw)
+        if s is None:
+            raise MilpaError(
+                LOCK_SRC_FIELD_ARITY,
+                f"dep {dep_name!r}: source field {cname!r} must be a string, "
+                f"got {raw!r}",
+                dep=dep_name,
+                field=cname,
+            )
+        fields[cname] = s
+
+    kind = fields.get("kind")
+    if kind is None:
+        raise MilpaError(
+            LOCK_SRC_KIND_MISSING,
+            f"dep {dep_name!r}: source block missing 'kind' discriminator",
+            dep=dep_name,
+        )
+
+    def _req(key: str) -> str:
+        val = fields.get(key)
+        if val is None:
+            raise MilpaError(
+                LOCK_SRC_FIELD_MISSING,
+                f"dep {dep_name!r}: source block (kind={kind!r}) missing "
+                f"required field {key!r}",
+                dep=dep_name,
+                field=key,
+            )
+        return val
+
+    if kind == "git":
+        raw_sid: SourceId = GitSourceId(url=_req("url"), subpath=fields.get("subpath"))
+    elif kind == "oci":
+        raw_sid = OciSourceId(
+            registry=_req("registry"),
+            repository=_req("repository"),
+            subpath=fields.get("subpath"),
+        )
+    elif kind == "tarball":
+        raw_sid = TarballSourceId(url=_req("url"), subpath=fields.get("subpath"))
+    elif kind == "local":
+        raw_sid = LocalSourceId(path=_req("path"))
+    elif kind == "registry":
+        raw_sid = RegistrySourceId(
+            registry=_req("registry"),
+            namespace=fields.get("namespace"),
+            name=_req("name"),
+        )
+    elif kind == "member":
+        raw_sid = MemberSourceId(member_name=_req("name"))
+    else:
+        raise MilpaError(
+            LOCK_SRC_KIND_UNKNOWN,
+            f"dep {dep_name!r}: unknown source kind {kind!r} "
+            f"(known: {', '.join(_SOURCE_KIND_LABELS)})",
+            dep=dep_name,
+            kind=kind,
+        )
+
+    return normalize_source(raw_sid)
+
+
 def _parse_provenance_block(node: KdlNode, dep_name: str) -> ProvenanceRecord:
     """Parse a ``provenance { ... }`` block into a ProvenanceRecord."""
     # Collect all scalar child fields into a dict; handle submodule nodes specially.
@@ -1248,7 +1564,14 @@ def _locked_from_resolved(d: ResolvedDep) -> LockedDep:
                 kind=d.attestation.kind,
                 rekor=d.attestation.rekor,
                 bundle_pin=d.attestation.bundle_pin,
-                namespace=d.registry_namespace or "",
+                # RFC origin-as-identity.md §4.4 (B2/G10): derive from
+                # source_id.namespace (the SAME real index namespace) rather
+                # than the deleted registry_namespace field.
+                namespace=(
+                    d.source_id.namespace or ""
+                    if isinstance(d.source_id, RegistrySourceId)
+                    else ""
+                ),
             )
             if d.attestation is not None
             else None
@@ -1256,6 +1579,9 @@ def _locked_from_resolved(d: ResolvedDep) -> LockedDep:
         # A5: sibling source for the declared version — carried straight
         # through, never recomputed at the lockfile boundary.
         declared_version_source=d.declared_version_source,
+        # RFC origin-as-identity.md §4.1/§7 (S5): carry the binding phase's
+        # accepted SourceId straight through to the on-disk structured form.
+        source_id=d.source_id,
     )
 
 
@@ -1441,6 +1767,16 @@ def format_lockfile(lockfile: Lockfile) -> str:
         # ``dep "bar" { namespace "ns1"; ... }`` — bare name as arg, ns as child.
         if dep.namespace is not None:
             lines.append(f"    namespace {_kdl_str(dep.namespace)}")
+        # source — RFC origin-as-identity.md §4.1/§7 (S5): the structured
+        # on-disk SourceId, typed children (uv's model). Positioned right
+        # after namespace, before identity: "where this came from" before
+        # "what its content hash is". Omitted only for a lockfile predating
+        # S5 (forward-compat; a conformant S5+ emitter always writes it).
+        if dep.source_id is not None:
+            lines.append("    source {")
+            for sline in _format_source_fields(dep.source_id):
+                lines.append(f"        {sline}")
+            lines.append("    }")
         # identity — emitted only when not None
         if dep.identity is not None:
             lines.append(f"    identity {_kdl_str(dep.identity)}")
@@ -1493,6 +1829,55 @@ def format_lockfile(lockfile: Lockfile) -> str:
         lines.append("}")
         lines.append("")
     return "\n".join(lines)
+
+
+def _format_source_fields(sid: SourceId) -> list[str]:
+    """Emit ``kind`` + kind-specific typed children for a ``source { … }``
+    block (RFC origin-as-identity.md §4.1/§7, S5 — NORMATIVE, both impls
+    MUST match byte-for-byte).
+
+    Field order per kind:
+      git:      kind / url / subpath?
+      oci:      kind / registry / repository / subpath?
+      tarball:  kind / url / subpath?
+      local:    kind / path
+      registry: kind / registry / namespace? / name
+      member:   kind / name
+
+    URL-bearing fields carry the ``(url)`` KDL type annotation
+    ([[kdl_url_convention]]); the parser reads the string content regardless
+    of tag.
+    """
+    if isinstance(sid, GitSourceId):
+        out = [f'kind {_kdl_str("git")}', f"url (url){_kdl_str(sid.url)}"]
+        if sid.subpath is not None:
+            out.append(f"subpath {_kdl_str(sid.subpath)}")
+        return out
+    if isinstance(sid, OciSourceId):
+        out = [
+            f'kind {_kdl_str("oci")}',
+            f"registry {_kdl_str(sid.registry)}",
+            f"repository {_kdl_str(sid.repository)}",
+        ]
+        if sid.subpath is not None:
+            out.append(f"subpath {_kdl_str(sid.subpath)}")
+        return out
+    if isinstance(sid, TarballSourceId):
+        out = [f'kind {_kdl_str("tarball")}', f"url (url){_kdl_str(sid.url)}"]
+        if sid.subpath is not None:
+            out.append(f"subpath {_kdl_str(sid.subpath)}")
+        return out
+    if isinstance(sid, LocalSourceId):
+        return [f'kind {_kdl_str("local")}', f"path {_kdl_str(sid.path)}"]
+    if isinstance(sid, RegistrySourceId):
+        out = [f'kind {_kdl_str("registry")}', f"registry {_kdl_str(sid.registry)}"]
+        if sid.namespace is not None:
+            out.append(f"namespace {_kdl_str(sid.namespace)}")
+        out.append(f"name {_kdl_str(sid.name)}")
+        return out
+    if isinstance(sid, MemberSourceId):
+        return [f'kind {_kdl_str("member")}', f"name {_kdl_str(sid.member_name)}"]
+    raise TypeError(f"unrecognized SourceId variant: {type(sid)!r}")  # pragma: no cover
 
 
 def _format_provenance_fields(p: ProvenanceRecord) -> list[str]:
@@ -1972,7 +2357,11 @@ def verify_lockfile_against_deps(
 # ---------------------------------------------------------------------------
 
 
-def strip_dep_pin(lockfile: Lockfile, canonical_name: str) -> Lockfile:
+def strip_dep_pin(
+    lockfile: Lockfile,
+    canonical_name: str,
+    namespace: str | None = None,
+) -> Lockfile:
     """Return a copy of *lockfile* with the named dep's pin stripped.
 
     The stripped entry retains only ``GitProvenanceRecord`` entries with
@@ -1981,18 +2370,27 @@ def strip_dep_pin(lockfile: Lockfile, canonical_name: str) -> Lockfile:
     fresh.  The declared provenances survive so ``_prior_declared_mirror_urls``
     can carry them forward (Phase D item 5).
 
-    The dep at *canonical_name* MUST already exist in *lockfile.deps*; the
-    caller is responsible for the alias→canonical resolution and the "not
-    found" guard (both call sites already perform these steps before invoking
-    this function).
+    The dep identified by ``(canonical_name, namespace)`` MUST already exist
+    in *lockfile.deps*; the caller is responsible for the alias→canonical
+    resolution and the "not found"/"ambiguous" guards (all call sites already
+    perform these steps before invoking this function).
 
     Parameters
     ----------
     lockfile:
         The prior lockfile to modify.
     canonical_name:
-        The canonical dep name (post-alias resolution) whose pin is to be
-        stripped.
+        The canonical BARE dep name (post-alias resolution) whose pin is to
+        be stripped.
+    namespace:
+        The dep's namespace, or ``None`` for an un-namespaced dep (default).
+        Namespace-conflation audit (P4): matching by ``name`` alone would
+        strip — and then DELETE, since the old filter dropped every
+        same-named entry — a sibling dep in a different namespace the
+        moment two locked deps share a bare name. Matching the full
+        ``(name, namespace)`` identity, exactly like ``DepKey``, keeps a
+        same-bare-name sibling in a different namespace completely
+        untouched.
 
     Returns
     -------
@@ -2002,13 +2400,16 @@ def strip_dep_pin(lockfile: Lockfile, canonical_name: str) -> Lockfile:
     """
     from dataclasses import replace as _replace
 
-    updated = next(d for d in lockfile.deps if d.name == canonical_name)
+    def _matches(d: LockedDep) -> bool:
+        return d.name == canonical_name and d.namespace == namespace
+
+    updated = next(d for d in lockfile.deps if _matches(d))
     declared_provs = tuple(
         p for p in updated.provenances
         if isinstance(p, GitProvenanceRecord) and p.origin == "declared"
     )
     pin_stripped = _replace(updated, identity=None, provenances=declared_provs)
     new_deps = tuple(
-        d for d in lockfile.deps if d.name != canonical_name
+        d for d in lockfile.deps if not _matches(d)
     ) + (pin_stripped,)
     return _replace(lockfile, deps=new_deps)

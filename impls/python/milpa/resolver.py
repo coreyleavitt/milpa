@@ -48,6 +48,7 @@ Spec authority: spec/resolver-semantics.md
 from __future__ import annotations
 
 import re
+import sys
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -55,6 +56,15 @@ from enum import Enum, auto
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from milpa.binding import (
+    DEFAULT_REGISTRY_ALIAS,
+    BindingResolver,
+    BindOutcome,
+    Claim,
+    check_registry_shadow,
+    reconcile_root_claims,
+    resolved_registry_namespace,
+)
 from milpa.context import MilpaEnv, ResolveParams
 from milpa.errors import (
     FETCH_ALL_FAILED,
@@ -62,8 +72,8 @@ from milpa.errors import (
     MILPA_INTERNAL,
     RES_EXCLUDE_NEWER_EMPTY,
     RES_EXCLUDE_NEWER_PIN,
+    RES_MEMBER_OUTSIDE_WORKSPACE,
     RES_NO_INDEX,
-    RES_PROVENANCE_CONFLICT,
     RES_ROOT_SELF_VERSION_CONSTRAINT,
     RES_VERSION_UNKNOWN_CONSTRAINED,
     RES_WS_MEMBER_REF_UNKNOWN,
@@ -102,9 +112,12 @@ from milpa.manifest import (
     MemberDep,
     MemberTarget,
     NamedDep,
+    OciTarget,
     Override,
     Predicate,
+    RegistryTarget,
     TarballDep,
+    TarballTarget,
     UrlDep,
     flag_enables_closure,
 )
@@ -120,20 +133,24 @@ from milpa.edge_sources import (
     edgeset_to_terms,
     resolve_edges,
 )
-from milpa.dep_decl import EdgeSet
-from milpa.nimble import parse_nimble
+from milpa.dep_decl import EdgeSet, NamedRequire
 from milpa.profile import Profile
 from milpa.registry import (
-    AmbiguousName,
     EntryAttestation,
     GitIndexProvenance,
     Index,
     IndexVersion,
     OciIndexProvenance,
-    Package,
     filter_by_exclude_newer,
 )
 from milpa.solver import SolverError, Term, VersionUnknownConstrained, solve_with_cert
+from milpa.source_id import (
+    GitSourceId,
+    MemberSourceId,
+    RegistrySourceId,
+    SourceId,
+    normalize_source,
+)
 from milpa.version import (
     DepKey,
     Strategy,
@@ -300,7 +317,9 @@ def _validate_root_self_constraint(
 
 
 def _version_unknown_constrained_err(
-    exc: VersionUnknownConstrained, root_authority: set[str]
+    exc: VersionUnknownConstrained,
+    root_authority: set[str],
+    binding_resolver: "BindingResolver | None" = None,
 ) -> MilpaError:
     """A4 (resolver-semantics RFC §3 Axis A (c) / §6 D-A1): wrap
     ``VersionUnknownConstrained``'s raw facts into
@@ -309,28 +328,48 @@ def _version_unknown_constrained_err(
     root-declared dep or an override rule) or is a purely transitive dep with
     no such site. ``exc.constrainers`` is enumerated in full (never just the
     first — the amoxtli incident floored two packages at once).
+
+    ``exc.package``/each constrainer's ``consumer`` are PubGrub solver-
+    variable strings — S5-rekey (RFC origin-as-identity §4.4): a named/
+    registry dep's is now a BOUND source-id's canonical form, never meant to
+    leak into a user-facing error message. Projected back to the legacy
+    "ns::name"/bare form via ``_depkey_for_solved_name`` before formatting
+    (mirrors the certificate projection, ``_project_solver_error``).
+    ``binding_resolver is None`` only for a caller with no live resolve() in
+    progress — falls back to the identity projection (``exc.package``/
+    ``consumer`` unchanged), matching pre-S5-rekey behavior.
     """
-    constrainer_strs = [
-        f"{consumer!r} requires {constraint!r}"
+    _pkg = _depkey_for_solved_name(exc.package, binding_resolver).solver_var() if binding_resolver is not None else exc.package
+    _constrainers = [
+        (
+            _depkey_for_solved_name(consumer, binding_resolver).solver_var()
+            if binding_resolver is not None
+            else consumer,
+            constraint,
+        )
         for consumer, constraint in exc.constrainers
     ]
-    if exc.package in root_authority:
+    constrainer_strs = [
+        f"{consumer!r} requires {constraint!r}"
+        for consumer, constraint in _constrainers
+    ]
+    if _pkg in root_authority:
         remedy = (
-            f"add a version= annotation to {exc.package!r}'s dep declaration "
+            f"add a version= annotation to {_pkg!r}'s dep declaration "
             f"(or the overrides rule redirecting it), or pin a versioned git tag"
         )
     else:
         remedy = (
-            f"add a root-level pin for {exc.package!r} or an "
-            f"overrides {{ {exc.package} … version= }} rule"
+            f"add a root-level pin for {_pkg!r} or an "
+            f"overrides {{ {_pkg} … version= }} rule"
         )
     return MilpaError(
         RES_VERSION_UNKNOWN_CONSTRAINED,
-        f"{exc.package!r} has no declared version (a git/url/local/tarball dep "
+        f"{_pkg!r} has no declared version (a git/url/local/tarball dep "
         f"with no milpa.kdl/.nimble/tag/version= source) but is constrained by: "
         f"{'; '.join(constrainer_strs)} — {remedy}",
-        name=exc.package,
-        constrainers=[{"by": c, "constraint": v} for c, v in exc.constrainers],
+        name=_pkg,
+        constrainers=[{"by": c, "constraint": v} for c, v in _constrainers],
     )
 
 
@@ -605,14 +644,21 @@ class _Provider:
         deps_dir: Path,
         params: ResolveParams,
         overrides_by_name: dict[str, Override],
-        root_authority: set[str],
         root_direct_keys: set[DepKey],
         seen_named: set[DepKey],
-        seen_url: set[tuple[str, str]],
-        provenance_gate: dict[str, tuple[tuple[object, ...], int]],
-        edge_cache: dict[tuple[str, Version], EdgeSet] | None = None,
+        seen_url: set[tuple[str, str, str | None]],
+        binding_resolver: "BindingResolver",
+        edge_cache: dict[tuple[SourceId, Version], EdgeSet] | None = None,
         strict_attestation: bool = False,
+        root_self_name: "str | None" = None,
     ) -> None:
+        # S5-rekey (RFC origin-as-identity §4.4) + §14 "root satisfies its
+        # own name": the resolving root's own manifest name, threaded to
+        # ``_materialize`` so a materialized named stub's OWN transitive
+        # requirement on the root's own name resolves correctly via
+        # ``binding.canonical_key_for_requirement``. ``None`` for
+        # ``resolve_workspace`` (§14 is a standalone-resolve-only concept).
+        self._root_self_name = root_self_name
         # name → {version → _Candidate}
         self._candidates: dict[str, dict[Version, _Candidate]] = {}
         # name → {version → _NamedStub}
@@ -623,6 +669,11 @@ class _Provider:
         self._deps_dir = deps_dir
         self._params = params
         self._overrides_by_name = overrides_by_name
+        # RFC origin-as-identity §4.5 (S4): the SAME BindingResolver instance
+        # resolve()/resolve_workspace() constructed — the single source of
+        # truth for "what source_id is this name bound to," reused by
+        # _materialize (edge_cache key) rather than re-derived.
+        self._binding_resolver = binding_resolver
 
         # S3 (RFC #23 §3.1.2 + §7 S3): consumer-side flag requests for named deps.
         # name → tuple[FlagRequest, ...]; populated from the root manifest's
@@ -631,20 +682,26 @@ class _Provider:
         self._flag_requests_by_name: dict[str, tuple[FlagRequest, ...]] = {}
 
         # Shared dedup sets (owned by resolve(), borrowed here for callbacks)
-        self._root_authority = root_authority
+        #
+        # NOTE: ``root_authority`` (a bare-name ``set[str]``) is deliberately
+        # NOT a constructor param here (RFC origin-as-identity §6 "Kept" —
+        # post-S3b cleanup): its sole surviving consumer is the module-level
+        # ``_version_unknown_constrained_err``, which ``resolve()``/
+        # ``resolve_workspace()`` call directly with their own copy of the
+        # set. The former second consumer — the deleted ``provenance_gate``/
+        # ``_check_provenance_gate`` side-table this class used to carry —
+        # is gone; ``BindingResolver`` (``binding.py``) is now the sole
+        # admission authority. Its bare-name (not ``DepKey``) scoping is the
+        # open #192/R6 namespace door, out of scope here.
         # R6: namespace-aware authority set, used ONLY by is_root_direct (the
-        # C2/C3 lowest-direct precompute + bypass scoping) — NEVER by the
-        # provenance gate, which stays on the bare-name `root_authority` set
-        # above (a separate concern; its namespace behavior is #193, out of
-        # scope here).
+        # C2/C3 lowest-direct precompute + bypass scoping).
         self._root_direct_keys = root_direct_keys
         self._seen_named = seen_named
         self._seen_url = seen_url
-        self._provenance_gate = provenance_gate
 
         # Resolver-scoped edge memo (§4.2.1 resolve_edges, clause a).
         # Owned by resolve() and shared here so _materialize can seal it.
-        self._edge_cache: dict[tuple[str, Version], EdgeSet] = (
+        self._edge_cache: dict[tuple[SourceId, Version], EdgeSet] = (
             edge_cache if edge_cache is not None else {}
         )
         # Shared edge source singletons (one per resolve() call).
@@ -673,11 +730,14 @@ class _Provider:
     def register_named_stubs(self, dep_key: DepKey, stubs: list[_NamedStub]) -> None:
         """Phase A: register all satisfying IndexVersion stubs for ``dep_key``.
 
-        The dict key is ``dep_key.solver_var()`` — the same string the PubGrub
-        solver uses as the package variable, so ``_stubs`` and ``_candidates``
-        are always in sync with the solver's view.
+        The dict key is ``binding_resolver.canonical_for(dep_key)`` (RFC
+        origin-as-identity §4.4, S5-rekey) — the BOUND source-id's canonical
+        string, the same key the PubGrub solver uses as the package variable,
+        so ``_stubs`` and ``_candidates`` are always in sync with the
+        solver's view. Two different consumer labels bound to the SAME
+        origin collapse to the SAME dict key here.
         """
-        solver_var = dep_key.solver_var()
+        solver_var = self._binding_resolver.canonical_for(dep_key)
         stub_map = self._stubs.setdefault(solver_var, {})
         for stub in stubs:
             ver = stub.version
@@ -689,12 +749,13 @@ class _Provider:
     def _materialize(self, stub: _NamedStub) -> _Candidate:
         """Phase B: fetch + parse the named dep for the selected version.
 
-        ``solver_var`` is the solver-package-variable string (dep_key.solver_var());
-        used as the dict key in _candidates/_stubs.  ``bare_name`` is the plain
+        ``solver_var`` is the solver-package-variable string
+        (``binding_resolver.canonical_for(stub.dep_key)``, S5-rekey); used as
+        the dict key in _candidates/_stubs.  ``bare_name`` is the plain
         package name used for file-system operations (dest path, EdgeSourceCtx.dep_name,
         nimble file lookup) — always stub.dep_key.name regardless of namespace.
         """
-        solver_var = stub.name  # dep_key.solver_var(); same as stub.name property
+        solver_var = stub.name  # stub.canonical; same as stub.name property
         bare_name = stub.dep_key.name  # plain name for filesystem / EdgeSourceCtx
         iv = stub.index_version
 
@@ -778,13 +839,18 @@ class _Provider:
             stub.version,
             ctx,
             self._edge_cache,
+            # RFC origin-as-identity §4.5 (S4): edge_cache keyed by (source_id,
+            # version) — the origin BindingResolver already bound this solver
+            # variable to, so two labels reaching the same registry coordinate
+            # coalesce to one sealed EdgeSet.
+            source_id=_source_id_for_edge_cache(self._binding_resolver, solver_var),
             nimble_source=self._nimble_source,
             milpakdl_source=self._milpakdl_source,
             dep_decl_source=self._dep_decl_source,  # S3b: wired from MilpaEnv.dep_decl_store
             strict_attestation=self._strict_attestation,  # S5: policy-gated FETCH-FAILED fallback
         )
         dep_terms, requires_names, requires_predicates = edgeset_to_terms(
-            es, self._overrides_by_name
+            es, self._overrides_by_name, self._env.index, self._root_self_name, self._binding_resolver
         )
         src_dir = es.src_dir
 
@@ -859,18 +925,22 @@ class _Provider:
         self._candidates.setdefault(solver_var, {})[stub.version] = candidate
         self._stubs.get(solver_var, {}).pop(stub.version, None)
 
-        # Enroll any newly-discovered transitive named deps.
+        # Enroll any newly-discovered transitive named deps. Extracted from
+        # the EdgeSet's own NamedRequire entries (not dep_terms/solver_var
+        # strings — S5-rekey, see _edgeset_named_requires) so the callback
+        # receives the original (name, namespace) pair, never a lossy
+        # reverse-decode of an already-canonicalized solver variable.
         if self._on_transitive_named is not None:
-            for req_name, _vs in _terms_to_named_reqs(dep_terms, solver_var):
-                self._on_transitive_named(req_name)
+            for _dk_req, _vs in _edgeset_named_requires(es, self._overrides_by_name):
+                self._on_transitive_named(_dk_req)
 
         return candidate
 
     # Callback wired by resolve() after initial BFS; fires during solve.
-    _on_transitive_named: None = None  # will be set to Callable[[str], None]
+    _on_transitive_named: None = None  # will be set to Callable[[DepKey], None]
 
     def set_transitive_callback(
-        self, on_named: object  # Callable[[str], None]
+        self, on_named: object  # Callable[[DepKey], None]
     ) -> None:
         self._on_transitive_named = on_named  # type: ignore[assignment]
 
@@ -912,20 +982,24 @@ class _Provider:
         """C2 (resolver-semantics RFC §3 Axis C, D-C2): True iff ``package``
         is a root-declared or override-named dep — used for the solver's
         ``LowestDirect`` effective-strategy precompute (and C3's bypass
-        scoping), never for provenance gating (which stays in
-        ``_check_provenance_gate`` against the bare-name ``root_authority``
-        set — a separate concern, #193).
+        scoping), never for source-admission arbitration (that is
+        ``BindingResolver``'s job, RFC origin-as-identity §4.3 — a separate
+        concern, #193/#192).
 
-        ``package`` is a solver_var string; decomposed via
-        ``DepKey.from_solver_var`` (the SOLE site for that) into a FULL
-        ``DepKey`` (name AND namespace) and checked against
-        ``root_direct_keys`` — a namespace-aware set (R6 fix). A bare-name-
-        only check would wrongly match a namespace-qualified TRANSITIVE dep
-        against an unrelated root dep that merely shares the same bare name
-        under a DIFFERENT namespace (e.g. root ``ns1::foo`` must NOT make a
-        purely-transitive ``ns2::foo`` look root-direct).
+        ``package`` is a PubGrub solver-variable string — S5-rekey (RFC
+        origin-as-identity §4.4): for a named/registry dep this is now a
+        BOUND source-id's canonical form, decoded back to a full ``DepKey``
+        (name AND namespace) via ``binding_resolver.depkey_for_canonical``
+        (falling back to the legacy ``DepKey.from_solver_var`` for the eager
+        git/tarball/local/member case, whose term key is still plain
+        ``dep.name``) — checked against ``root_direct_keys`` — a
+        namespace-aware set (R6 fix). A bare-name-only check would wrongly
+        match a namespace-qualified TRANSITIVE dep against an unrelated
+        root dep that merely shares the same bare name under a DIFFERENT
+        namespace (e.g. root ``ns1::foo`` must NOT make a purely-transitive
+        ``ns2::foo`` look root-direct).
         """
-        dk = DepKey.from_solver_var(package)
+        dk = _depkey_for_solved_name(package, self._binding_resolver)
         return dk in self._root_direct_keys
 
     def _bypasses_lock_preference(self, package: str) -> bool:
@@ -987,21 +1061,24 @@ class _Provider:
         """B2 (resolver-semantics RFC §4 stage 4): the prior lockfile's
         recorded version for ``package``, if one exists and parses.
 
-        ``package`` is a solver_var string (e.g. ``"ns::bar"`` for a
-        qualified named dep); decomposed via ``DepKey.from_solver_var`` (the
-        SOLE site for that, per its docstring) so the lookup matches against
-        ``LockedDep.name``/``LockedDep.namespace`` — never a raw ``::``
-        split. Returns ``None`` when there is no prior lock, the package is
-        new (not in the prior lock), its recorded version string doesn't
-        parse (never a hard error — a preference miss just falls through to
-        ordinary strategy selection in ``_pick_version``), or C3's
-        value-divergence bypass applies (``_bypasses_lock_preference``).
+        ``package`` is a PubGrub solver-variable string — S5-rekey (RFC
+        origin-as-identity §4.4): for a named dep this is now a BOUND
+        source-id's canonical form, decoded via
+        ``binding_resolver.depkey_for_canonical`` (falling back to the
+        legacy ``DepKey.from_solver_var`` for the eager-dep case) so the
+        lookup matches against ``LockedDep.name``/``LockedDep.namespace`` —
+        never a raw ``::`` split or a canonical-string split. Returns
+        ``None`` when there is no prior lock, the package is new (not in the
+        prior lock), its recorded version string doesn't parse (never a hard
+        error — a preference miss just falls through to ordinary strategy
+        selection in ``_pick_version``), or C3's value-divergence bypass
+        applies (``_bypasses_lock_preference``).
         """
         if self._params.prior is None:
             return None
         if self._bypasses_lock_preference(package):
             return None
-        dk = DepKey.from_solver_var(package)
+        dk = _depkey_for_solved_name(package, self._binding_resolver)
         locked = next(
             (
                 d
@@ -1042,20 +1119,25 @@ class _NamedStub:
     """Phase A stub — lightweight placeholder before fetch.
 
     ``dep_key`` carries the qualified identity (namespace + bare name).
-    ``name`` is a property returning ``dep_key.solver_var()`` — the string
-    key used in ``_Provider._candidates`` / ``_stubs`` and as the PubGrub
-    solver variable.  For ``namespace=None`` (all pre-S5b deps) this equals
-    the bare name, so existing behaviour is unchanged.
+    ``canonical`` is ``binding_resolver.canonical_for(dep_key)`` (RFC
+    origin-as-identity §4.4, S5-rekey) — computed ONCE at construction time
+    (``_enumerate_named_stubs`` has the resolver's ``binding_resolver`` on
+    hand via ``provider``), since a bare dataclass property has no seam to
+    reach ``BindingResolver`` itself (it needs the BOUND source-id, which
+    only ``BindingResolver`` holds).  ``name`` is kept as the property every
+    existing call site reads — it now returns ``canonical`` rather than
+    ``dep_key.solver_var()``.
     """
 
     dep_key: DepKey
     version: Version
     index_version: IndexVersion
+    canonical: str
 
     @property
     def name(self) -> str:
-        """Solver-variable string: bare name for namespace=None, else 'ns::name'."""
-        return self.dep_key.solver_var()
+        """Solver-variable string: the bound source-id's canonical form."""
+        return self.canonical
 
 
 # ---------------------------------------------------------------------------
@@ -1592,13 +1674,39 @@ def _find_nimble_file(dep_path: Path, name: str) -> Path:
     raise FileNotFoundError(f"no .nimble file found under {dep_path}")
 
 
+@dataclass(frozen=True)
+class _OciOverrideDep:
+    """Internal-only carrier for an ``OciTarget`` override's effective dep
+    (S8b, rfc-origin-as-identity.md §7 B5).
+
+    There is deliberately NO first-class ``oci=`` dep-declaration grammar in
+    ``manifest.py``'s ``Dep`` union (see ``test_oci_registry_consumer.py``'s
+    "NOT the manifest oci= dep form" note) — an OCI source is reachable ONLY
+    via an override target. This dataclass is the BFS-internal analogue of
+    ``LocalDep``/``TarballDep`` for that one path: a fixed
+    (registry, repository, digest) triple IS the whole identity (no version
+    enumeration, unlike the registry-index OCI path in ``_Provider._materialize``)
+    — exactly one candidate, mirroring ``_process_local_worker``/
+    ``_process_tarball_worker``.
+    """
+
+    name: str
+    registry: str
+    repository: str
+    digest: str
+    subpath: str | None = None
+    version: Version | None = None
+
+
 def _apply_git_override_to_url_dep(dep: UrlDep, ov: Override) -> UrlDep:
     """Apply a git-form override to a UrlDep, returning the overridden dep.
 
-    S8 dispatch: GitTarget → rewrite URL.  MemberTarget raises NotImplementedError
-    (S8b).  LocalTarget is NOT handled here — callers that accept the override
-    result must use ``_apply_override`` to get the correct ``Dep`` union type.
-    This function is kept for existing git-path callers that return ``UrlDep``.
+    S8 dispatch: GitTarget → rewrite URL.  Every OTHER target kind raises
+    NotImplementedError — callers that accept a non-git override result MUST
+    use ``_apply_override`` (which returns the correct ``Dep``-ish union
+    member) and route to the matching BFS queue slot BEFORE ever reaching
+    this function. This function is kept only for existing git-path callers
+    that specifically want a ``UrlDep`` back.
 
     A3b/D-A3: the redirected dep's ``version`` is the OVERRIDE RULE's
     ``version=`` (``ov.version``), never the original ``dep.version`` — this
@@ -1607,7 +1715,10 @@ def _apply_git_override_to_url_dep(dep: UrlDep, ov: Override) -> UrlDep:
     discarded, never read.
     """
     if isinstance(ov.target, GitTarget):
-        return UrlDep(name=dep.name, git=ov.target.git, ref=ov.target.ref, version=ov.version)
+        return UrlDep(
+            name=dep.name, git=ov.target.git, ref=ov.target.ref, version=ov.version,
+            subpath=ov.target.subpath,
+        )
     if isinstance(ov.target, LocalTarget):
         raise NotImplementedError(
             f"LocalTarget override for {dep.name!r} is not yet wired "
@@ -1618,49 +1729,80 @@ def _apply_git_override_to_url_dep(dep: UrlDep, ov: Override) -> UrlDep:
             f"MemberTarget override for {dep.name!r} is not yet wired "
             "(S8b — resolver interception sites for member targets)"
         )
+    if isinstance(ov.target, (OciTarget, TarballTarget, RegistryTarget)):
+        raise NotImplementedError(
+            f"{type(ov.target).__name__} override for {dep.name!r} must be "
+            "pre-intercepted by the caller via _apply_override (S8b) — "
+            "_apply_git_override_to_url_dep only ever returns a UrlDep"
+        )
     raise NotImplementedError(f"Unknown override target kind: {type(ov.target)}")
 
 
-def _override_target_to_pkey(ov: Override) -> "tuple[object, ...]":
-    """Map an Override target to the provenance-gate key used for pre-seeding (S8).
-
-    Centralises the OverrideTarget → pkey mapping so ``resolve`` and
-    ``resolve_workspace`` don't each inline an identical match.  Mirrors Rust's
-    ``override_target_to_pkey`` (M9 SSOT).
-
-    Git   → ("url", git, ref)
-    Local → ("local-override", path)
-    Member → ("member-override", member_name)
-    """
-    if isinstance(ov.target, GitTarget):
-        return ("url", ov.target.git, ov.target.ref)
-    if isinstance(ov.target, LocalTarget):
-        return ("local-override", ov.target.path)
-    if isinstance(ov.target, MemberTarget):
-        return ("member-override", ov.target.member_name)
-    raise NotImplementedError(f"Unknown override target kind: {type(ov.target)}")
-
-
-def _apply_override(name: str, ov: Override) -> "UrlDep | LocalDep":
+def _apply_override(
+    name: str, ov: Override
+) -> "UrlDep | LocalDep | TarballDep | NamedDep | _OciOverrideDep":
     """Apply an override to a dep by name, returning the effective dep.
 
-    S8a: GitTarget → UrlDep (existing path); LocalTarget → LocalDep (new, S8a).
-    S8b: MemberTarget — callers must handle MemberTarget BEFORE calling this
-    function (workspace BFS seed, _enqueue_dep, BFS wave loop).  This function
-    is only reached for Git/Local targets; MemberTarget is pre-intercepted.
+    S8a: GitTarget → UrlDep; LocalTarget → LocalDep.
+    S8b: OciTarget → ``_OciOverrideDep``; TarballTarget → TarballDep;
+    RegistryTarget → NamedDep. MemberTarget — callers must handle
+    MemberTarget BEFORE calling this function (workspace BFS seed,
+    _enqueue_dep, BFS wave loop); this function is never reached for it.
 
-    Returns ``UrlDep`` for git-form overrides and ``LocalDep`` for local-form
-    overrides.  The caller is responsible for routing to the correct BFS queue
-    slot (``("url", dep)`` vs ``("local", dep)``).
+    The caller is responsible for routing the returned value to the matching
+    BFS queue slot (``("url", …)`` / ``("local", …)`` / ``("tarball", …)`` /
+    ``("named", …)`` / ``("oci", …)``).
 
     A3b/D-A3: ``version=ov.version`` — the override rule's own annotation,
     never the original dep's (discarded by construction; see
-    ``_apply_git_override_to_url_dep``).
+    ``_apply_git_override_to_url_dep``). For every kind EXCEPT
+    ``RegistryTarget`` this is the A3b declared-version FALLBACK label
+    (consulted only when the redirected tree carries no readable version).
+    For ``RegistryTarget`` it means something different (RFC §7 B5,
+    "version-scoped overrides"): the registry always carries real
+    per-version data, so ``ov.version`` becomes an EXACT solver constraint
+    (``== <version>``) on the redirected coordinate rather than a fallback
+    label — see ``RegistryTarget``'s docstring.
     """
     if isinstance(ov.target, GitTarget):
-        return UrlDep(name=name, git=ov.target.git, ref=ov.target.ref, version=ov.version)
+        return UrlDep(
+            name=name, git=ov.target.git, ref=ov.target.ref, version=ov.version,
+            subpath=ov.target.subpath,
+        )
     if isinstance(ov.target, LocalTarget):
         return LocalDep(name=name, path=ov.target.path, version=ov.version)
+    if isinstance(ov.target, TarballTarget):
+        return TarballDep(
+            name=name,
+            url=ov.target.url,
+            sha256=ov.target.sha256,
+            strip_components=ov.target.strip_components,
+            version=ov.version,
+            subpath=ov.target.subpath,
+        )
+    if isinstance(ov.target, OciTarget):
+        return _OciOverrideDep(
+            name=name,
+            registry=ov.target.registry,
+            repository=ov.target.repository,
+            digest=ov.target.digest,
+            subpath=ov.target.subpath,
+            version=ov.version,
+        )
+    if isinstance(ov.target, RegistryTarget):
+        # NOTE: the produced NamedDep's `.name` is the REGISTRY coordinate's
+        # own name (ov.target.name — e.g. "widget"), NOT the overridden
+        # dep's own name (`name` param, e.g. "old-fork"). This is the one
+        # target kind where those two can genuinely differ (the whole point
+        # of "redirect to a registry coordinate" is a possibly-different
+        # name). The caller's root Term/solver-var still keys off the
+        # ORIGINAL name (via binding_resolver.canonical_for(DepKey(name=name))
+        # in _seed_extended_override_target) — that already-bound root claim
+        # and this "named" BFS-arm enumeration coincide because BOTH resolve
+        # to the SAME canonical(SourceId) (content-addressed), even though
+        # they are two distinct BindingResolver claim keys internally.
+        constraint = f"== {format_version_str(ov.version)}" if ov.version is not None else None
+        return NamedDep(name=ov.target.name, constraint=constraint, namespace=ov.target.namespace)
     if isinstance(ov.target, MemberTarget):
         # Should not reach here — callers intercept MemberTarget before _apply_override.
         # If this fires, a new call-site was added without handling S8b.
@@ -1671,9 +1813,83 @@ def _apply_override(name: str, ov: Override) -> "UrlDep | LocalDep":
     raise NotImplementedError(f"Unknown override target kind: {type(ov.target)}")
 
 
+def _extended_override_bfs_item(name: str, ov: Override) -> tuple:
+    """The BFS queue tuple for a Tarball/Oci/Registry override target,
+    with NO root ``Term``/discovery bookkeeping (S8b) — the transitive-
+    enqueue counterpart of ``_seed_extended_override_target`` (root-only),
+    used by ``_enqueue_dep`` (the shared transitive-sub-dep enqueue path).
+    Caller must have already confirmed ``ov.target`` is one of these three
+    kinds (Git/Local/Member are handled by the caller's own branches).
+    """
+    eff = _apply_override(name, ov)
+    if isinstance(eff, TarballDep):
+        return ("tarball", eff)
+    if isinstance(eff, _OciOverrideDep):
+        return ("oci", eff)
+    assert isinstance(eff, NamedDep)
+    return ("named", DepKey(name=eff.name, namespace=eff.namespace), eff.constraint)
+
+
+def _seed_extended_override_target(
+    name: str,
+    ov: Override,
+    *,
+    binding_resolver: "BindingResolver",
+    root_terms: list[Term],
+    root_requires: list[str],
+    bfs_queue: list[object],
+    record_discovery: "Callable[[str], None]",
+) -> bool:
+    """S8b (rfc-origin-as-identity.md §7 B5): seed the BFS queue + root
+    ``Term`` for a Tarball/Oci/Registry override target on a ROOT dep.
+
+    Single source of truth for this one seeding pattern, reused at every
+    root-dep loop (``resolve()``'s UrlDep/NamedDep branches,
+    ``resolve_workspace()``'s per-member loop) — mirrors the existing
+    LocalTarget/MemberTarget root-seeding branches already inline at each of
+    those call sites, but factored out here (rather than copy-pasted a
+    THIRD/FOURTH time) since there is no natural single BFS-queue-kind
+    dispatch shared across three heterogeneous target kinds the way
+    LocalTarget's single ``("local", …)`` slot is.
+
+    Returns True iff ``ov.target`` is one of these three kinds and was fully
+    handled (the caller should ``continue``); False for Git/Local/Member,
+    which the caller's own pre-existing branches own.
+
+    Version-scoped overrides (D-A3, RFC §7 B5): for a ``RegistryTarget``,
+    ``ov.version`` (already folded into ``_apply_override``'s ``NamedDep``
+    as an exact ``== <version>`` constraint) becomes the root Term's
+    ``VersionSet`` — the solver only admits that one version. For Tarball/
+    Oci (single-fixed-artifact kinds — exactly one candidate always exists),
+    the term is ``full()`` regardless (Axis A (a)/D-A2 convention, matching
+    every other git/local/tarball root dep); ``ov.version`` there is instead
+    the A3b declared-version FALLBACK LABEL threaded through by
+    ``_apply_override``, not a solver constraint.
+    """
+    if not isinstance(ov.target, (TarballTarget, OciTarget, RegistryTarget)):
+        return False
+    eff = _apply_override(name, ov)
+    svar = binding_resolver.canonical_for(DepKey(name=name))
+    if isinstance(eff, TarballDep):
+        root_terms.append(Term.require(svar, VersionSet.full()))
+        bfs_queue.append(("tarball", eff))
+    elif isinstance(eff, _OciOverrideDep):
+        root_terms.append(Term.require(svar, VersionSet.full()))
+        bfs_queue.append(("oci", eff))
+    else:
+        assert isinstance(eff, NamedDep)
+        vs = eff.constraint_set if eff.constraint_set is not None else VersionSet.full()
+        root_terms.append(Term.require(svar, vs))
+        bfs_queue.append(("named", DepKey(name=eff.name, namespace=eff.namespace), eff.constraint))
+    root_requires.append(svar)
+    record_discovery(svar)
+    return True
+
+
 def _dep_to_term(
     dep: Dep,
     overrides_by_name: dict[str, Override],
+    binding_resolver: "BindingResolver",
 ) -> tuple[Term | None, str | None]:
     """Convert a dep to a solver Term + require name.
 
@@ -1685,31 +1901,61 @@ def _dep_to_term(
     ``VersionSet.full()``, never ``eq(sentinel)``.  The candidate label
     (real declared version, when parseable) is assigned post-fetch;
     ``full()`` removes the pre-commitment so it never races the label.
+
+    ``binding_resolver`` (RFC origin-as-identity §4.4, S5-rekey): the
+    solver-variable string for a ``NamedDep`` is the BOUND source-id's
+    canonical form, not the bare/qualified label — the caller must already
+    have this dep's root claim bound (true for every current caller:
+    ``_build_member_candidate``'s deps are included in the workspace's
+    ``reconcile_root_claims`` set, bound before ``BindingResolver``
+    construction completes).
     """
     if isinstance(dep, UrlDep):
-        # Override may redirect the URL; term is full() either way.
-        if dep.name in overrides_by_name:
-            ov = overrides_by_name[dep.name]
-            _ = ov  # override consumed by the fetch step; term is the same
-        return (Term.require(dep.name, VersionSet.full()), dep.name)
+        # RFC §4.4.1 (S5-rekey, phase 2): uniform canonical solver key — no
+        # eager-kind bare-name carve-out. Caller's root claim already bound.
+        _svar_u = binding_resolver.canonical_for(DepKey(name=dep.name))
+        # S8b: an override to RegistryTarget is the ONE kind where the term
+        # is NOT full() — the registry carries real per-version data, so a
+        # version-scoped override (ov.version set) becomes an exact
+        # constraint here too (mirrors _seed_extended_override_target).
+        # Every other override kind (Git/Local/Tarball/Oci) is a single-
+        # fixed-candidate source — term is full() either way, override or not.
+        if dep.name in overrides_by_name and isinstance(
+            overrides_by_name[dep.name].target, RegistryTarget
+        ):
+            _eff_u = _apply_override(dep.name, overrides_by_name[dep.name])
+            assert isinstance(_eff_u, NamedDep)
+            _vs_u = _eff_u.constraint_set if _eff_u.constraint_set is not None else VersionSet.full()
+            return (Term.require(_svar_u, _vs_u), _svar_u)
+        return (Term.require(_svar_u, VersionSet.full()), _svar_u)
 
     if isinstance(dep, NamedDep):
         if dep.name == "nim":
             return (None, None)
         # S5b: populate DepKey.namespace from the manifest dep (None for unqualified deps).
         _dep_key = DepKey(name=dep.name, namespace=dep.namespace)
-        svar = _dep_key.solver_var()  # = dep.name for namespace=None (backward compat)
+        svar = binding_resolver.canonical_for(_dep_key)
         vs = dep.constraint_set if dep.constraint_set is not None else VersionSet.full()
-        # Check if this named dep is overridden (becomes a URL-like dep, full() term).
+        # Check if this named dep is overridden (becomes a URL-like dep, full() term) —
+        # UNLESS the override target is itself a RegistryTarget (S8b), in which
+        # case the redirect's own (possibly version-scoped) constraint applies.
         if dep.name in overrides_by_name:
+            ov = overrides_by_name[dep.name]
+            if isinstance(ov.target, RegistryTarget):
+                _eff_n = _apply_override(dep.name, ov)
+                assert isinstance(_eff_n, NamedDep)
+                _vs_n = _eff_n.constraint_set if _eff_n.constraint_set is not None else VersionSet.full()
+                return (Term.require(svar, _vs_n), svar)
             return (Term.require(svar, VersionSet.full()), svar)
         return (Term.require(svar, vs), svar)
 
     if isinstance(dep, TarballDep):
-        return (Term.require(dep.name, VersionSet.full()), dep.name)
+        _svar_tb = binding_resolver.canonical_for(DepKey(name=dep.name))
+        return (Term.require(_svar_tb, VersionSet.full()), _svar_tb)
 
     if isinstance(dep, LocalDep):
-        return (Term.require(dep.name, VersionSet.full()), dep.name)
+        _svar_lo = binding_resolver.canonical_for(DepKey(name=dep.name))
+        return (Term.require(_svar_lo, VersionSet.full()), _svar_lo)
 
     if isinstance(dep, MemberDep):
         # Member resolution is a workspace concern (slice 9d).
@@ -1736,7 +1982,8 @@ def _enumerate_named_stubs(
 
     Takes a ``DepKey`` (S5a) so the solver variable and ``seen_named`` key
     are the qualified identity.  The bare name (``dep_key.name``) is used for
-    the registry lookup; the solver variable (``dep_key.solver_var()``) is used
+    the registry lookup; the solver variable
+    (``provider._binding_resolver.canonical_for(dep_key)``, S5-rekey) is used
     as the dict key in the provider's ``_stubs`` / ``_candidates``.
 
     Passes ``constraint=None`` to ``resolve_named_all`` so the solver sees
@@ -1779,11 +2026,14 @@ def _enumerate_named_stubs(
             )
         all_versions = kept
 
+    _canonical = provider._binding_resolver.canonical_for(dep_key)
     stubs: list[_NamedStub] = []
     for iv in all_versions:
         ver = _parse_version_strict(iv.version)
         if ver is not None:
-            stubs.append(_NamedStub(dep_key=dep_key, version=ver, index_version=iv))
+            stubs.append(
+                _NamedStub(dep_key=dep_key, version=ver, index_version=iv, canonical=_canonical)
+            )
     provider.register_named_stubs(dep_key, stubs)
 
 
@@ -1826,20 +2076,104 @@ def _provenance_key_for_local(dep: LocalDep) -> tuple[object, ...]:
 
 
 # ---------------------------------------------------------------------------
-# Helper: extract named req names from dep_terms (for transitive callback)
+# Helper: extract named requires from an EdgeSet (for transitive callback)
 # ---------------------------------------------------------------------------
 
 
-def _terms_to_named_reqs(
-    dep_terms: list[Term],
-    owner_name: str,
-) -> list[tuple[str, VersionSet]]:
-    """Extract (name, VersionSet) pairs from positive dep_terms."""
-    result: list[tuple[str, VersionSet]] = []
-    for t in dep_terms:
-        if t.positive and t.package != owner_name:
-            result.append((t.package, t.versions))
+def _edgeset_named_requires(
+    es: EdgeSet,
+    overrides_by_name: dict[str, Override],
+) -> list[tuple[DepKey, VersionSet]]:
+    """Extract ``(DepKey, VersionSet)`` pairs for every ``NamedRequire`` in an
+    already-materialized ``EdgeSet``.
+
+    S5-rekey (RFC origin-as-identity §4.4): this replaces the old
+    ``_terms_to_named_reqs`` (which extracted ``(str, VersionSet)`` pairs
+    from ``dep_terms``, the SOLVER-facing Term keys). Since a NamedRequire's
+    solver-variable Term key is now a BOUND source-id's canonical form (not
+    a ``"ns::name"`` string), it can no longer be decoded back into a
+    ``DepKey`` at ``_on_transitive_named`` time — the callback fires
+    mid-solve, on first discovery, BEFORE the claim is bound, so the
+    canonical string may not resolve via ``depkey_for_canonical`` yet, and a
+    canonical string is not a ``ns::name`` string ``DepKey.from_solver_var``
+    can parse. Extracting directly from the EdgeSet's own ``NamedRequire``
+    entries (which still carry the original ``name``/``namespace`` fields)
+    avoids that lossy round-trip entirely — the root-cause fix, not a
+    reverse-decode workaround.
+
+    Mirrors ``edgeset_to_terms``'s NamedRequire branch exactly (same
+    override/namespace rules — an overridden name is treated as bare,
+    namespace dropped, matching the term key ``edgeset_to_terms`` built for
+    it) so the ``DepKey`` returned here always agrees with what
+    ``edgeset_to_terms`` already registered as this require's Term.
+    """
+    from milpa.version import VersionSet as _VS
+
+    result: list[tuple[DepKey, VersionSet]] = []
+    for entry in es.requires:
+        if not isinstance(entry, NamedRequire):
+            continue
+        if entry.name == "nim":
+            continue
+        if entry.name in overrides_by_name:
+            # Mirrors edgeset_to_terms's override branch: bare name, full().
+            result.append((DepKey(name=entry.name), _VS.full()))
+            continue
+        vs = _VS.full()
+        if entry.constraint_str:
+            try:
+                vs = _VS.from_constraint(entry.constraint_str)
+            except Exception:
+                vs = _VS.full()
+        result.append((DepKey(name=entry.name, namespace=entry.namespace), vs))
     return result
+
+
+# ---------------------------------------------------------------------------
+# Helper: name -> bound source_id (RFC origin-as-identity §4.5, S4)
+# ---------------------------------------------------------------------------
+
+
+def _source_id_for_edge_cache(binding_resolver: "BindingResolver", name: str) -> SourceId:
+    """The ``SourceId`` ``edge_cache`` seals/looks up entries under for *name*.
+
+    RFC origin-as-identity §4.5 (S4): ``edge_cache`` is keyed by
+    ``(source_id, Version)``, not ``(name, Version)`` — two BFS parents that
+    reach ONE repo under TWO different labels must coalesce to ONE sealed
+    EdgeSet. The accepted ``SourceId`` for *name* is exactly what
+    ``BindingResolver`` already bound (root claim or accepted transitive
+    claim) — the single source of truth for "what does this label denote,"
+    reused here rather than re-derived.
+
+    Every call site (BFS-loop seal, ``_materialize``, Phase B dedup lookup,
+    attestation-policy's post-hoc EdgeSet collection) reaches *name* only
+    after it passed through ``BindingResolver`` (root-bound at construction,
+    or ``submit()`` returned ``NEW``/``DUPLICATE`` — a ``LOST_TO_ROOT`` name
+    never reaches a fetch/materialize/discovery-recording step). An unbound
+    name here is therefore an internal invariant violation, not a user-facing
+    condition — raised loudly (``MILPA_INTERNAL``) rather than silently
+    falling back to name-keying, which would quietly resurrect the bug this
+    slice fixes.
+
+    S5-rekey (RFC origin-as-identity §4.4): *name* is now the PubGrub
+    solver-variable string — a BOUND source-id's canonical form for a named/
+    registry dep, or the plain ``dep.name`` for a git/tarball/local/member
+    dep (those never route through ``DepKey``/``canonical_for`` — the term
+    key literally stays ``dep.name``, see ``_dep_to_term``/root-term
+    construction). Decoded via ``_depkey_for_solved_name`` (the shared
+    canonical-or-legacy decode — SSOT with ``_build_graph``'s equivalent
+    decode).
+    """
+    dk = _depkey_for_solved_name(name, binding_resolver)
+    sid = binding_resolver.source_id_for(dk)
+    if sid is None:
+        raise MilpaError(
+            MILPA_INTERNAL,
+            f"edge_cache seal/lookup for {name!r} has no source_id bound in "
+            f"BindingResolver — this is an internal milpa bug; please report it",
+            name=name,
+        )
+    return sid
 
 
 # ---------------------------------------------------------------------------
@@ -1851,19 +2185,21 @@ def _run_bfs_wave_loop(
     bfs_queue: list[object],
     executor: object,
     seen_named: set[DepKey],
-    seen_url: set[tuple[str, str]],
+    seen_url: set[tuple[str, str, str | None]],
     seen_tarball: set[str],
     seen_local: set[str],
-    edge_cache: "dict[tuple[str, Version], EdgeSet]",
+    seen_oci: set[str],
+    edge_cache: "dict[tuple[SourceId, Version], EdgeSet]",
     provider: "_Provider",
     overrides_by_name: "dict[str, Override]",
     deps_dir: Path,
     env: "MilpaEnv",
     params: "ResolveParams",
     index: "Index",
-    provenance_gate: "dict[str, tuple[tuple[object, ...], int]]",
     root_authority: "set[str]",
     record_discovery: "Callable[[str], None]",
+    binding_resolver: "BindingResolver",
+    is_strict: bool,
     root_self_name: "str | None" = None,
     root_self_version: "Version | None" = None,
 ) -> None:
@@ -1880,10 +2216,10 @@ def _run_bfs_wave_loop(
     ``root_self_name``/``root_self_version`` (§14.3): standalone-resolve-only
     — the root's own name + candidate-label version, used to validate a
     transitive ``named`` claim's constraint against the root's own version
-    BEFORE the provenance gate suppresses it (§14.2).  Both ``None`` (the
-    default) for ``resolve_workspace``, which never passes them — the
-    workspace member auto-coerce (§11.5) is a separate, pre-existing
-    mechanism, untouched by this parameter.
+    BEFORE ``BindingResolver`` suppresses it as ``LOST_TO_ROOT`` (§14.2).
+    Both ``None`` (the default) for ``resolve_workspace``, which never passes
+    them — the workspace member auto-coerce (§11.5) is a separate,
+    pre-existing mechanism, untouched by this parameter.
     """
     from concurrent.futures import Future as _Future
     from typing import cast as _cast
@@ -1897,18 +2233,6 @@ def _run_bfs_wave_loop(
     # see its docstring), the S3/S4b flag-re-read blocks below MUST consult
     # this map rather than reconstructing ``deps_dir / name`` themselves.
     url_dep_paths: dict[str, Path] = {}
-
-    # §10.0/§10.3 content-hash deferred validation: when a registry-owned
-    # name has no comparable git source (OCI-only entry / no provenance),
-    # ``_validate_transitive_url_against_registry`` defers the accept/reject
-    # decision to AFTER this claim's own fetch computes its content_hash
-    # (identity) — see that function's docstring. Keyed by ``id(future)``
-    # (NOT by name): two dispatches for the SAME name can coexist in one
-    # wave (the "two agreeing pins, different refs" dest-disambiguation
-    # branch below applies equally here, since a deferred claim also
-    # bypasses the tier gate). Populated at dispatch time (below), consumed
-    # and popped in the wave-drain loop once each future resolves.
-    pending_identity_validation: dict[int, frozenset[str]] = {}
 
     i = 0
     while i < len(bfs_queue):
@@ -1947,7 +2271,6 @@ def _run_bfs_wave_loop(
                 dep_key_n: DepKey = item[1]  # S5a: qualified DepKey (namespace+name)
                 if dep_key_n not in seen_named and dep_key_n.name != "nim":
                     seen_named.add(dep_key_n)
-                    record_discovery(dep_key_n.solver_var())  # Phase B: transitive named dep
                     # §14.3: validate (and possibly raise) BEFORE the gate
                     # suppresses this claim below — a no-op unless this claim
                     # names the standalone root's own name (root_self_name is
@@ -1956,45 +2279,63 @@ def _run_bfs_wave_loop(
                     _validate_root_self_constraint(
                         dep_key_n, item[2], root_self_name, root_self_version,
                     )
-                    # §10.0 authority lattice: a ``named`` claim is a tier-2
-                    # (registry) deference — route it through the SAME gate
-                    # the tier-3 url branch uses, keyed on the bare name (the
-                    # gate stays bare-name-scoped, matching root_authority;
-                    # see R6's comment on ``_root_direct_keys`` — the gate's
-                    # namespace scoping is a separate, pre-existing concern,
-                    # not part of #193). This (a) suppresses a transitive's
-                    # named claim for a root-authority name (§10.1 — root
-                    # wins over EVERY tier, not just tier-3), (b) lets a
-                    # tier-2 claim for a NON-index name that nonetheless
-                    # collides with an already-recorded tier-3 URL win the
-                    # gate (§10.3) — which only ever routes into
-                    # ``_enumerate_named_stubs`` raising ``TNG-NOT-FOUND``,
-                    # since a genuinely index-member name's tier-3 claims are
-                    # ALREADY redirected to a ``named`` item at the url
-                    # branch's gate-time check (see the ``kind == "url"``
-                    # case below) and so never reach this gate as tier-3 in
-                    # the first place — and (c) if a tier-3 URL for the SAME
-                    # non-index name arrives afterward, gets suppressed
-                    # before it is ever fetched (§10.5).
-                    #
-                    # Namespaced named deps (``dep_key_n.namespace is not
-                    # None``) are deliberately EXCLUDED from the gate: the
-                    # gate is bare-name-keyed, and a bare-name key would
-                    # wrongly collapse two DIFFERENT packages that merely
-                    # share a bare name under different namespaces (e.g.
-                    # root-direct ``ns1::foo`` vs a purely-transitive
-                    # ``ns2::foo`` — see
-                    # ``test_c2_lowest_direct.TestNamespaceQualifiedTransitiveNotConfusedWithRootDirect``).
-                    # Namespaced deps keep the pre-#193 behavior: always
-                    # enumerated, never gated.
-                    _proceed = (
-                        dep_key_n.namespace is not None
-                        or _check_provenance_gate(
-                            dep_key_n.name, _NAMED_PKEY, provenance_gate,
-                            root_authority, tier=TIER_REGISTRY,
-                        )
+                    # RFC origin-as-identity §4.3 (S3a) — BindingResolver is
+                    # now authoritative. This claim is ALWAYS submitted
+                    # (never skipped via a bare is_root/root_authority
+                    # shortcut) — that distinction matters for the root's
+                    # OWN self-name (§14 "root satisfies its own name"): its
+                    # root claim is a ``MemberSourceId`` sentinel (RFC §6
+                    # "workspace-of-one"), not a ``RegistrySourceId``, so a
+                    # constructed registry claim against it correctly comes
+                    # back ``LOST_TO_ROOT`` (suppressed — root_self_cand
+                    # alone already satisfies the term, no registry
+                    # enumeration needed/possible) rather than being
+                    # mistaken for an ordinary root-authoritative name that
+                    # should proceed unconditionally. An ordinary root-
+                    # declared registry dep re-arriving through this same
+                    # BFS arm instead comes back ``DUPLICATE`` (its claim
+                    # was already bound, identically, at
+                    # ``BindingResolver.__init__`` via
+                    # ``reconcile_root_claims``) and still proceeds. A
+                    # genuinely NAMESPACED transitive claim
+                    # (``dep_key_n.namespace is not None``) is no longer
+                    # specially excluded either — B1/G1's whole point is
+                    # that ``BindingResolver`` keys by the full ``DepKey``
+                    # (via the qualified ``ns::name`` solver var), so
+                    # ``ns1::foo``/``ns2::foo`` never cross-bind without a
+                    # bare-name special case.
+                    _named_claim = Claim(
+                        name=dep_key_n.solver_var(),
+                        source_id=normalize_source(
+                            RegistrySourceId(
+                                registry=DEFAULT_REGISTRY_ALIAS,
+                                namespace=resolved_registry_namespace(
+                                    dep_key_n.name, dep_key_n.namespace, index,
+                                ),
+                                name=dep_key_n.name,
+                            )
+                        ),
+                        is_root=False,
+                        claimant="transitive",
                     )
+                    _named_decision = binding_resolver.submit(_named_claim)
+                    # NEW or DUPLICATE both proceed to enumeration (a
+                    # DUPLICATE named claim is a harmless re-enumeration of
+                    # the same registry coordinate — including root's OWN
+                    # named dep re-arriving through this same BFS arm);
+                    # only LOST_TO_ROOT — this name is root/override/root-
+                    # self-pinned to a DIFFERENT source — is suppressed.
+                    _proceed = _named_decision.outcome is not BindOutcome.LOST_TO_ROOT
                     if _proceed:
+                        # S5-rekey (RFC origin-as-identity §4.4): record the
+                        # CANONICAL solver variable — computed only now,
+                        # AFTER submit() bound the key (canonical_for
+                        # requires it) — so _dedup_candidates' discovery-order
+                        # tie-break can actually find this entry (it looks up
+                        # by the SAME canonical string _candidates/solution
+                        # use). A LOST_TO_ROOT name never gets recorded here
+                        # (it never gets a solved candidate either).
+                        record_discovery(binding_resolver.canonical_for(dep_key_n))  # Phase B: transitive named dep
                         # Enumerate-all normative (resolver-semantics §2.1):
                         # do NOT pre-filter by constraint here.  The solver
                         # owns satisfiability via incompatibility accumulation;
@@ -2036,152 +2377,108 @@ def _run_bfs_wave_loop(
                     # We skip external queueing here.
                     if isinstance(ov.target, MemberTarget):
                         continue
+                    # S8b: TarballTarget/OciTarget/RegistryTarget override →
+                    # re-enqueue under the matching BFS kind. Appending to
+                    # bfs_queue from mid-scan is safe and already this
+                    # function's established idiom: the inner `while j <
+                    # len(bfs_queue)` scan re-checks its length every
+                    # iteration, so the newly-appended item is visited later
+                    # in this SAME wave's scan (before any futures are
+                    # drained) and dispatched by the ordinary "tarball"/
+                    # "oci"/"named" arms below — including their OWN
+                    # seen_tarball/seen_oci/seen_named dedup, so there is no
+                    # separate dedup check needed here (single source of
+                    # truth for the dedup, not a second copy).
+                    if isinstance(ov.target, (TarballTarget, OciTarget, RegistryTarget)):
+                        bfs_queue.append(_extended_override_bfs_item(dep_u.name, ov))
+                        continue
                     dep_u = _apply_git_override_to_url_dep(dep_u, ov)
-                # §10.0/§10.3/§10.5 validate-against-registry lattice: a non-
-                # root name present in the registry index is tier-2
-                # (registry-owned) as a STATIC property of the name — decided
-                # here, at claim-discovery time, from the (already-loaded)
-                # index alone, NOT from whether some other claim also exists
-                # for this name. A transitive's self-declared git= source for
-                # such a name MUST be validated against the registry's own
-                # recorded source BEFORE it is ever fetched (§10.5):
-                #   - AGREES (same git repository the registry records for
-                #     this name — a differing `ref` is still agreement, the
-                #     ref only selects a version) → ACCEPT: fall through to
-                #     ordinary tier-3 url processing below, unchanged. This
-                #     is a legitimate pin of the registry's own package: it
-                #     is fetched and resolves normally; content-hash dedup
-                #     (§3 Phase B) unifies it with any registry-version
-                #     candidate for the same name, and ordinary solver
-                #     version-negotiation reconciles differing pinned
-                #     versions. This deliberately bypasses
-                #     ``_check_provenance_gate``'s single-claim-per-name
-                #     arbitration below — once validated, this is no longer a
-                #     competing, untrusted source, so two agreeing pins (e.g.
-                #     two different transitives pinning two different refs of
-                #     the same real repo) must coexist as candidates, never
-                #     conflict with each other or with a same-named `named`
-                #     claim. The decision is a static function of THIS claim
-                #     plus the registry record alone (never of collisions
-                #     with other claims), so it is order-independent by
-                #     construction (§10.5). When no git provenance is
-                #     recorded but an OCI entry's ``source_url`` matches
-                #     instead (the package was published via OCI FROM this
-                #     same git repo), this is ALSO an outright AGREE — a
-                #     differing version/ref is still not a disagreement,
-                #     the version solver reconciles it.
-                #   - DISAGREES (a different source repo — checked first
-                #     against recorded git provenance, then, if none, against
-                #     any recorded OCI ``source_url``) → raise
-                #     RES-PROVENANCE-CONFLICT here, before any fetch is ever
-                #     dispatched. MUST NOT silently redirect to the registry
-                #     and MUST NOT silently honor the transitive's source —
-                #     the remedy is to declare the name in the root manifest
-                #     (tier 1 arbitrates).
-                #   - INCOMPARABLE TRANSPORT (an OCI-only registry entry with
-                #     NO recorded ``source_url`` either, or an entry with no
-                #     provenance at all) → the URL comparisons above are both
-                #     impossible, so fall back to CONTENT IDENTITY: if the
-                #     registry has a content_hash recorded for ANY version,
-                #     DEFER — accept this claim provisionally (same bypass as
-                #     AGREES above) and check its fetched content_hash
-                #     against the registry's recorded set once the
-                #     wave-drain loop below has it
-                #     (``pending_identity_validation``); match → same
-                #     package via a different transport, stays accepted;
-                #     mismatch → RES-PROVENANCE-CONFLICT, raised post-fetch.
-                #     No content_hash recorded anywhere (legacy/empty) →
-                #     nothing to validate against even deferred — raise
-                #     RES-PROVENANCE-CONFLICT immediately, same as DISAGREES.
-                # A ROOT url dep for a registry-known name is NEVER
-                # validated — root_authority already excludes it here (root
-                # stays tier-1; see overrides_by_name check above, which only
-                # ever fires for root-authority names).
-                # ``_registry_validated_agreement`` is True whenever this
-                # claim was checked above and did NOT raise — either an
-                # outright AGREEMENT (git-source URL match) or a DEFERRED
-                # content-hash validation (registry has no comparable git
-                # source, but a content_hash exists to check the fetched
-                # identity against once this dep is fetched below) — in
-                # either case the tier-based gate below is deliberately
-                # BYPASSED (see the comment block above): a claim that is
-                # accepted (or accepted-pending-validation) is no longer a
-                # competing, untrusted source, so two such pins of the same
-                # real package (different refs, from different transitives)
-                # must each proceed independently rather than being
-                # arbitrated against each other as if they disagreed. A
-                # deferred claim that later FAILS its content-hash check
-                # raises RES-PROVENANCE-CONFLICT post-fetch, in the
-                # wave-drain loop below (see ``pending_identity_validation``).
-                _registry_validated_agreement = False
-                _deferred_identity_hashes: frozenset[str] | None = None
-                if dep_u.name not in root_authority:
-                    _registry_pkg = index.lookup_bare(dep_u.name)
-                    if isinstance(_registry_pkg, Package):
-                        _deferred_identity_hashes = (
-                            _validate_transitive_url_against_registry(
-                                dep_u.name, dep_u.git, _registry_pkg,
-                            )
-                        )
-                        # No raise: accepted (outright, or pending the
-                        # deferred content-hash check below) — fall through
-                        # to ordinary tier-3 processing, bypassing the
-                        # tier-based gate.
-                        _registry_validated_agreement = True
-                    elif _registry_pkg is not None:
-                        # AmbiguousName: multiple namespaces share this bare
-                        # name — orthogonal to source validation (there is no
-                        # single package record to validate a source
-                        # against). Preserve the pre-existing redirect-to-
-                        # named behavior so the standard TNG-AMBIGUOUS-NAME
-                        # diagnostic (namespace-qualification remedy) fires,
-                        # unchanged by the validate-against-registry rework.
-                        bfs_queue.append(
-                            ("named", DepKey(name=dep_u.name, namespace=None), None)
-                        )
-                        continue
-                pkey_u = ("url", dep_u.git, dep_u.ref)
-                if not _registry_validated_agreement:
-                    # S4b: record the prior provenance entry BEFORE calling the gate,
-                    # so we can distinguish same-provenance dedup from root-suppression.
-                    # Same-provenance dedup (prior[0] == pkey_u) = additional consumer of
-                    # the same dep → accumulate flag_requests for the union (§3.1.3).
-                    # Root-suppression (different pkey) = dep overridden by root → skip.
-                    _prior_prov_u = provenance_gate.get(dep_u.name)
-                    if not _check_provenance_gate(
-                        dep_u.name, pkey_u, provenance_gate, root_authority,
-                        tier=TIER_SELF_URL,
-                    ):
-                        # S4b: if this is a same-provenance dedup, the current item is
-                        # a second (or later) consumer of the same dep.  Accumulate its
-                        # flag_requests so the union is computed in the S4b block below.
-                        if (
-                            _prior_prov_u is not None
-                            and _prior_prov_u[0] == pkey_u
-                            and dep_u.flag_requests
-                        ):
-                            wave_pending_flag_reqs.setdefault(dep_u.name, []).extend(
-                                dep_u.flag_requests
-                            )
-                        continue
-                url_key_u = (dep_u.git, dep_u.ref)
+                # RFC origin-as-identity §4.3/§6.1 (S3a/S3c) — BindingResolver
+                # is now authoritative; the old validate-against-registry
+                # AGREE/DISAGREE/DEFER lattice is retired (present-but-
+                # unreferenced below, deletion is a later slice). This claim
+                # is ALWAYS submitted (never skipped via a bare
+                # root_authority shortcut) — root's OWN item re-arriving
+                # through this same BFS arm (root-seeded exactly like a
+                # transitive claim) correctly comes back DUPLICATE (matches
+                # the binding already established at
+                # ``BindingResolver.__init__`` via ``reconcile_root_claims``)
+                # and proceeds; a TRANSITIVE claim disagreeing with a root-
+                # authoritative name for THIS SAME name correctly comes back
+                # LOST_TO_ROOT and is suppressed (Cargo-`[patch]` semantics —
+                # root wins silently). Skipping submit() entirely for any
+                # root-authoritative name (an earlier version of this code)
+                # was a real bug: it let a TRANSITIVE's disagreeing source
+                # for a root-declared name fall through to an unconditional
+                # fetch, since ``seen_url`` is keyed by (git, ref, subpath),
+                # not name (conformance fixture-065 "root override precedence").
+                #
+                # The registry-shadow tripwire (S3c) is gated on whether ROOT
+                # holds authority over this EXACT source key — it exists to
+                # catch a TRANSITIVE's bare name silently shadowing a registry
+                # coordinate, not to second-guess root's OWN explicit choice
+                # (root's own source is authoritative by construction; warning
+                # about it would be pure noise). The gate MUST key on the exact
+                # ``DepKey``, not a bare name: an unrelated root ``foo
+                # namespace="ns1"`` must NOT disable the dependency-confusion
+                # check for a bare ``foo`` a transitive sources elsewhere (that
+                # bare-name-projection gap was a real dependency-confusion
+                # bypass — a transitive could shadow a DIFFERENT registry-owned
+                # ``ns2/foo`` unchecked).
+                _url_claim = Claim(
+                    name=dep_u.name,
+                    source_id=normalize_source(GitSourceId(url=dep_u.git, subpath=dep_u.subpath)),
+                    is_root=False,
+                    claimant="transitive",
+                )
+                if not binding_resolver.is_root_authority(DepKey(name=dep_u.name)):
+                    check_registry_shadow(_url_claim, index, is_strict=is_strict)
+                _url_decision = binding_resolver.submit(_url_claim)
+                if _url_decision.outcome is BindOutcome.LOST_TO_ROOT:
+                    continue
+                # RFC §4.4.1 (S5-rekey, phase 2): uniform canonical solver
+                # key, computed NOW that the claim is bound (NEW or
+                # DUPLICATE) — used for every PubGrub-facing/candidate-dict
+                # key below (record_discovery, wave_pending_flag_reqs,
+                # url_dep_paths via the candidate's own name).
+                _svar_url_t = binding_resolver.canonical_for(DepKey(name=dep_u.name))
+                # NEW or DUPLICATE both fall through to the ordinary
+                # seen_url-keyed fetch-dedup below. A DUPLICATE outcome
+                # only means this source-id is ALREADY bound to this
+                # name — it does NOT mean this exact (url, ref) fetch
+                # already happened: a different pinned ref of the SAME
+                # source-id (RFC §12 case B — "declares the same URL+ref"
+                # is the only case that was already pkey-identical; a
+                # DIFFERING ref is a genuinely separate version
+                # candidate) must still be fetched and must still
+                # coexist as a candidate the solver can pick between —
+                # exactly what the ``seen_url``/``wave_url_names_dispatched``
+                # machinery below already does, keyed by (git, ref, subpath),
+                # not by name. The subpath component is REQUIRED (RFC §7
+                # "same repo + different subpath = different source-ids,
+                # correctly" — S8 monorepo grammar): omitting it collapses
+                # two deps that share a url+ref but live at different
+                # subdirectories into a single candidate, silently dropping
+                # the second one's distinct source-id.
+                url_key_u = (dep_u.git, dep_u.ref, dep_u.subpath)
                 if url_key_u in seen_url:
                     # Same URL already submitted in a prior wave (cross-wave dup).
                     # Accumulate flag_requests for multi-consumer union (§3.1.3).
                     if dep_u.flag_requests:
-                        wave_pending_flag_reqs.setdefault(dep_u.name, []).extend(
+                        wave_pending_flag_reqs.setdefault(_svar_url_t, []).extend(
                             dep_u.flag_requests
                         )
                     continue
                 seen_url.add(url_key_u)
-                record_discovery(dep_u.name)  # Phase B: transitive URL dep first-enqueue
+                record_discovery(_svar_url_t)  # Phase B: transitive URL dep first-enqueue
                 # Ordinarily dest is exactly deps_dir/name (unchanged from
                 # before) — the disambiguated branch is reachable only when
                 # ANOTHER url-dep candidate for this SAME name was already
-                # dispatched earlier in THIS wave (only possible via the
-                # validate-against-registry "two agreeing pins, different
-                # refs" shape, since every other path enforces at most one
-                # url-dep candidate per name — see _check_provenance_gate).
+                # dispatched earlier in THIS wave (the "two agreeing pins,
+                # different refs" shape — RFC origin-as-identity §10 S3a
+                # "same-URL / different-ref completeness": a ``DUPLICATE``
+                # binding decision still registers the pinned ref as a
+                # separate version candidate for the bound source-id).
                 # Concurrent CasAdmittingFetcher symlink placement at the
                 # SAME dest across two threads races and raises an OS-level
                 # error; a unique suffix on the SECOND-and-later occurrence
@@ -2202,17 +2499,13 @@ def _run_bfs_wave_loop(
                         env=env,
                         params=params,
                         overrides_by_name=overrides_by_name,
+                        root_self_name=root_self_name,
+                        binding_resolver=binding_resolver,
                     ))
                 _url_fut = executor.submit(_url_worker)  # type: ignore[union-attr]
                 wave_futures.append(_url_fut)
                 # S3: record dep reference so result-drain can compute dep_active_flags.
                 future_to_url_dep[id(_url_fut)] = dep_u
-                # §10.0/§10.3: this dispatch is pending a deferred content-hash
-                # validation — record which content_hash set to check the
-                # fetched identity against once the wave-drain loop below
-                # picks up this future's result.
-                if _deferred_identity_hashes is not None:
-                    pending_identity_validation[id(_url_fut)] = _deferred_identity_hashes
 
             elif kind == "tarball":
                 dep_t: TarballDep = item[1]
@@ -2229,6 +2522,8 @@ def _run_bfs_wave_loop(
                         env=env,
                         params=params,
                         overrides_by_name=overrides_by_name,
+                        root_self_name=root_self_name,
+                        binding_resolver=binding_resolver,
                     ))
                 wave_futures.append(executor.submit(_tarball_worker))  # type: ignore[union-attr]
 
@@ -2247,8 +2542,31 @@ def _run_bfs_wave_loop(
                         env=env,
                         params=params,
                         overrides_by_name=overrides_by_name,
+                        root_self_name=root_self_name,
+                        binding_resolver=binding_resolver,
                     ))
                 wave_futures.append(executor.submit(_local_worker))  # type: ignore[union-attr]
+
+            elif kind == "oci":
+                dep_o: "_OciOverrideDep" = item[1]
+                _oci_ref_o = f"{dep_o.registry}/{dep_o.repository}@{dep_o.digest}"
+                if _oci_ref_o in seen_oci:
+                    continue
+                seen_oci.add(_oci_ref_o)
+                record_discovery(dep_o.name)  # Phase B: transitive oci-override dep first-enqueue
+                def _oci_worker(
+                    _dep: "_OciOverrideDep" = dep_o,
+                ) -> tuple[str, object]:
+                    return ("oci", _process_oci_worker(
+                        _dep,
+                        deps_dir=deps_dir,
+                        env=env,
+                        params=params,
+                        overrides_by_name=overrides_by_name,
+                        root_self_name=root_self_name,
+                        binding_resolver=binding_resolver,
+                    ))
+                wave_futures.append(executor.submit(_oci_worker))  # type: ignore[union-attr]
 
         i = j  # advance read head past all items we just processed
 
@@ -2263,7 +2581,7 @@ def _run_bfs_wave_loop(
             kind_result = fut_result[0]
             fetch_result = fut_result[1]
             # Register candidate, seal edge_cache, and enqueue transitives.
-            if kind_result in ("url", "tarball", "local"):
+            if kind_result in ("url", "tarball", "local", "oci"):
                 if kind_result == "url":
                     # _process_url_worker's scratch destination is NOT
                     # necessarily deps_dir/name (see its docstring) — record
@@ -2274,44 +2592,6 @@ def _run_bfs_wave_loop(
                     )
                     cand_r, transitive_deps_r, es_r, dest_r = cand_and_deps_u
                     url_dep_paths[cand_r.name] = dest_r
-                    # §10.0/§10.3 content-hash deferred validation: resolve
-                    # the accept/reject decision now that the fetch is done
-                    # and this candidate's identity (content_hash) is known.
-                    # A transport failure never reaches here — `fut.result()`
-                    # above already propagated it as an ordinary fetch error
-                    # (FETCH-ALL-FAILED / FETCH-PROVENANCE-DIVERGENCE), so a
-                    # genuine network/transport problem is never misreported
-                    # as a provenance conflict; only a SUCCESSFUL fetch's
-                    # identity is ever compared here.
-                    _deferred_hashes_r = pending_identity_validation.pop(id(fut), None)
-                    if (
-                        _deferred_hashes_r is not None
-                        and cand_r.identity not in _deferred_hashes_r
-                    ):
-                        _orig_dep_for_msg = future_to_url_dep.get(id(fut))
-                        _claim_url = (
-                            _orig_dep_for_msg.git
-                            if _orig_dep_for_msg is not None
-                            else cand_r.name
-                        )
-                        raise MilpaError(
-                            RES_PROVENANCE_CONFLICT,
-                            f"provenance conflict for package {cand_r.name!r}: "
-                            f"a transitive dependency's git source "
-                            f"({_claim_url!r}) fetched content identity "
-                            f"{cand_r.identity!r}, which does not match any "
-                            f"content_hash recorded for {cand_r.name!r} in "
-                            f"the tianguis registry "
-                            f"({sorted(_deferred_hashes_r)!r}) — the registry "
-                            f"entry has no comparable git source (e.g. an "
-                            f"OCI-only entry), so identity was compared "
-                            f"instead, and it disagrees: this is a different "
-                            f"package. The root manifest does not override "
-                            f"{cand_r.name!r}. Add {cand_r.name!r} to your "
-                            f"milpa.kdl deps (or override it) to choose "
-                            f"which source to use.",
-                            name=cand_r.name,
-                        )
                 else:
                     # tarball/local workers still return the plain 3-tuple —
                     # their destination IS always deps_dir/name (root-declared
@@ -2323,10 +2603,17 @@ def _run_bfs_wave_loop(
                     )
                     cand_r, transitive_deps_r, es_r = cand_and_deps
                 provider.add(cand_r)
-                # Seal the edge_cache for this (name, version) — clause (a).
+                # Seal the edge_cache for this (source_id, version) — clause
+                # (a). RFC origin-as-identity §4.5 (S4): keyed by source_id,
+                # not name — two BFS parents reaching the SAME origin under
+                # TWO different labels (e.g. `z3` vs `nimz3` for one repo)
+                # must coalesce to ONE sealed EdgeSet, not two.
                 # First-encounter wins; no overwrite (worker produced the EdgeSet
                 # deterministically from the fetched tree).
-                cache_key_r = (cand_r.name, cand_r.version)
+                cache_key_r = (
+                    _source_id_for_edge_cache(binding_resolver, cand_r.name),
+                    cand_r.version,
+                )
                 if cache_key_r not in edge_cache:
                     edge_cache[cache_key_r] = es_r
 
@@ -2383,8 +2670,17 @@ def _run_bfs_wave_loop(
                     # deps_dir/name — see _process_url_worker's docstring);
                     # this consumer may be referencing a name fetched in an
                     # EARLIER wave, so the map (not just this wave's dest_r)
-                    # is required here.
-                    _pkdl = url_dep_paths.get(_pname, deps_dir / _pname) / "milpa.kdl"
+                    # is required here. RFC §4.4.1 (S5-rekey): _pname is now
+                    # the canonical solver-variable string (matches
+                    # provider._candidates/url_dep_paths keys) — the
+                    # FALLBACK path (defensive; url_dep_paths should always
+                    # have an entry by the time this runs) must decode back
+                    # to the bare filesystem name, never the canonical
+                    # string itself (filesystem layout stays name-based,
+                    # dep_dir_name SSOT — orthogonal to the solver key).
+                    _pkdl = url_dep_paths.get(
+                        _pname, deps_dir / _depkey_for_solved_name(_pname, binding_resolver).name
+                    ) / "milpa.kdl"
                     _pmf: tuple[FlagDecl, ...] = ()
                     _pmanifest = None
                     if _pkdl.exists():
@@ -2423,18 +2719,34 @@ def _run_bfs_wave_loop(
                                     continue
                                 # Newly admitted — extend parent dep_terms and enqueue.
                                 _nsub_name = getattr(_nsub, "name", None)
-                                if _nsub_name and _nsub_name not in _pcand.requires_names:
-                                    if isinstance(_nsub, UrlDep):
-                                        # Axis A (a)/D-A2: full() self-term, never eq(sentinel).
-                                        _pcand.dep_terms.append(
-                                            _S4bTerm.require(_nsub_name, _S4bVS.full())
-                                        )
-                                    else:
-                                        _vs_sub = getattr(_nsub, "constraint_set", None) or _S4bVS.full()
-                                        _pcand.dep_terms.append(
-                                            _S4bTerm.require(_nsub_name, _vs_sub)
-                                        )
-                                    _pcand.requires_names.append(_nsub_name)
+                                if _nsub_name:
+                                    # RFC §4.4.1 (S5-rekey, phase 2): uniform
+                                    # canonical solver key — pure guess
+                                    # (claim not yet submitted; that happens
+                                    # later when _enqueue_dep's target is
+                                    # dequeued by the "url"/"named" BFS arm).
+                                    from milpa.binding import canonical_key_for_requirement as _ckfr_s4b
+                                    _nsub_svar = _ckfr_s4b(
+                                        name=_nsub_name,
+                                        namespace=getattr(_nsub, "namespace", None),
+                                        url=_nsub.git if isinstance(_nsub, UrlDep) else None,
+                                        overrides_by_name=overrides_by_name,
+                                        index=index,
+                                        root_self_name=root_self_name,
+                                        binding_resolver=binding_resolver,
+                                    )
+                                    if _nsub_svar not in _pcand.requires_names:
+                                        if isinstance(_nsub, UrlDep):
+                                            # Axis A (a)/D-A2: full() self-term, never eq(sentinel).
+                                            _pcand.dep_terms.append(
+                                                _S4bTerm.require(_nsub_svar, _S4bVS.full())
+                                            )
+                                        else:
+                                            _vs_sub = getattr(_nsub, "constraint_set", None) or _S4bVS.full()
+                                            _pcand.dep_terms.append(
+                                                _S4bTerm.require(_nsub_svar, _vs_sub)
+                                            )
+                                        _pcand.requires_names.append(_nsub_svar)
                                 _enqueue_dep(_nsub, overrides_by_name, bfs_queue)
                     break  # only one candidate per name at any time
 
@@ -2449,18 +2761,20 @@ def _s4a_run_fixpoint(
     bfs_queue: "list[object]",
     executor: object,
     seen_named: "set[DepKey]",
-    seen_url: "set[tuple[str, str]]",
+    seen_url: "set[tuple[str, str, str | None]]",
     seen_tarball: "set[str]",
     seen_local: "set[str]",
-    edge_cache: "dict[tuple[str, Version], EdgeSet]",
+    seen_oci: "set[str]",
+    edge_cache: "dict[tuple[SourceId, Version], EdgeSet]",
     overrides_by_name: "dict[str, Override]",
     deps_dir: Path,
     env: "MilpaEnv",
     params: "ResolveParams",
     index: "Index",
-    provenance_gate: "dict[str, tuple[tuple[object, ...], int]]",
     root_authority: "set[str]",
     record_discovery: "Callable[[str], None]",
+    binding_resolver: "BindingResolver",
+    is_strict: bool,
     extra_manifests: "dict[str, object] | None" = None,
     root_self_name: "str | None" = None,
     root_self_version: "Version | None" = None,
@@ -2532,11 +2846,12 @@ def _s4a_run_fixpoint(
         for dep_name_k in list(provider._candidates.keys()):
             if dep_name_k == "__root__":
                 continue
-            # C1/H2 fix: decompose the solver-var (which may be "ns::bar") into
-            # a DepKey and use dep_dir_name so qualified deps resolve to
+            # C1/H2 fix: decompose the solver-var (S5-rekey: a BOUND
+            # source-id's canonical form for a named dep) into a DepKey and
+            # use dep_dir_name so qualified deps resolve to
             # ``_deps/@ns/bar/milpa.kdl`` rather than the nonexistent
             # ``_deps/ns::bar/milpa.kdl``.
-            _dk_s4b = DepKey.from_solver_var(dep_name_k)
+            _dk_s4b = _depkey_for_solved_name(dep_name_k, binding_resolver)
             kdl_path = deps_dir / dep_dir_name(_dk_s4b.name, _dk_s4b.namespace) / "milpa.kdl"
             if kdl_path.exists():
                 try:
@@ -2581,9 +2896,28 @@ def _s4a_run_fixpoint(
                 active_flag_names=frozenset(active_now.keys()),
             )
             for target_name, flag_reqs in cross_pkg.items():
-                if target_name not in additional_requests:
-                    additional_requests[target_name] = []
-                additional_requests[target_name].extend(flag_reqs)
+                # S5-rekey (RFC origin-as-identity §4.4): target_name is the
+                # BARE identifier from the dep's own `flags{}.enables{}`
+                # block — project to whatever key its ALREADY-admitted
+                # candidate is actually registered under (bare for an eager
+                # git/tarball/local target, canonical for a named/registry
+                # one — the M1 security gate above guarantees the target is
+                # already bound by this point, so canonical_key_for_
+                # requirement's binding_resolver-first branch always fires,
+                # never the guess fallback).
+                from milpa.binding import canonical_key_for_requirement as _ckfr_step2
+                _svar_target = _ckfr_step2(
+                    name=target_name,
+                    namespace=None,
+                    url=None,
+                    overrides_by_name=overrides_by_name,
+                    index=index,
+                    root_self_name=root_self_name,
+                    binding_resolver=binding_resolver,
+                )
+                if _svar_target not in additional_requests:
+                    additional_requests[_svar_target] = []
+                additional_requests[_svar_target].extend(flag_reqs)
 
         if not additional_requests:
             _converged = True
@@ -2677,29 +3011,50 @@ def _s4a_run_fixpoint(
                 ):
                     continue
                 if isinstance(sub_dep, _UrlDep):
-                    dep_key = (sub_dep.git, sub_dep.ref)
+                    # (git, ref, subpath) — see the identical comment on the
+                    # BFS wave loop's ``url_key_u`` above; the two dedup
+                    # sites must agree on this key's granularity (RFC §7 —
+                    # same url+ref, different subpath, is a DIFFERENT dep).
+                    dep_key = (sub_dep.git, sub_dep.ref, sub_dep.subpath)
+                    # RFC §4.4.1 (S5-rekey, phase 2): uniform canonical solver
+                    # key — no eager-kind bare-name carve-out. Computed via
+                    # the pure canonical_key_for_requirement (not
+                    # BindingResolver.canonical_for) because this sub_dep's
+                    # claim is not yet submitted at this point — that happens
+                    # later, when the "url" BFS arm processes it off the
+                    # queue (mirrors the NamedDep branch below).
+                    from milpa.binding import canonical_key_for_requirement as _ckfr_s4a_url
+                    _svar_sub = _ckfr_s4a_url(
+                        name=sub_dep.name,
+                        namespace=None,
+                        url=sub_dep.git,
+                        overrides_by_name=overrides_by_name,
+                        index=index,
+                        root_self_name=root_self_name,
+                        binding_resolver=binding_resolver,
+                    )
                     if dep_key in seen_url:
                         # Already fetched — just extend the parent's terms if needed.
                         # Axis A (a)/D-A2: full() self-term, never eq(sentinel).
                         if target_cand is not None:
-                            if sub_dep.name not in target_cand.requires_names:
+                            if _svar_sub not in target_cand.requires_names:
                                 from milpa.solver import Term as _Term
                                 from milpa.version import VersionSet as _VS
                                 target_cand.dep_terms.append(
-                                    _Term.require(sub_dep.name, _VS.full())
+                                    _Term.require(_svar_sub, _VS.full())
                                 )
-                                target_cand.requires_names.append(sub_dep.name)
+                                target_cand.requires_names.append(_svar_sub)
                         continue
 
                     # Not yet fetched — extend terms AND enqueue.
                     if target_cand is not None:
-                        if sub_dep.name not in target_cand.requires_names:
+                        if _svar_sub not in target_cand.requires_names:
                             from milpa.solver import Term as _Term
                             from milpa.version import VersionSet as _VS
                             target_cand.dep_terms.append(
-                                _Term.require(sub_dep.name, _VS.full())
+                                _Term.require(_svar_sub, _VS.full())
                             )
-                            target_cand.requires_names.append(sub_dep.name)
+                            target_cand.requires_names.append(_svar_sub)
                     _enqueue_dep(sub_dep, overrides_by_name, bfs_queue)
 
                 elif isinstance(sub_dep, _NamedDep):
@@ -2707,7 +3062,25 @@ def _s4a_run_fixpoint(
                     # discovered during solve have namespace=None; direct manifest deps carry
                     # the namespace from their manifest declaration).
                     _sdk = DepKey(name=sub_dep.name, namespace=sub_dep.namespace)
-                    _svar = _sdk.solver_var()
+                    # S5-rekey (RFC origin-as-identity §4.4): the solver
+                    # variable is the BOUND source-id's canonical form.
+                    # Computed via the pure canonical_key_for_requirement
+                    # (not BindingResolver.canonical_for) because this
+                    # sub_dep's claim is not yet submitted at this point —
+                    # that happens later, when ``_enqueue_dep`` below lands
+                    # it back on the BFS queue and the "named" arm processes
+                    # it (mirrors edgeset_to_terms's identical pre-submission
+                    # need for the same reason).
+                    from milpa.binding import canonical_key_for_requirement as _ckfr_s4a
+                    _svar = _ckfr_s4a(
+                        name=sub_dep.name,
+                        namespace=sub_dep.namespace,
+                        url=None,
+                        overrides_by_name=overrides_by_name,
+                        index=index,
+                        root_self_name=root_self_name,
+                        binding_resolver=binding_resolver,
+                    )
                     if _sdk in seen_named:
                         if target_cand is not None:
                             if _svar not in target_cand.requires_names:
@@ -2753,6 +3126,7 @@ def _s4a_run_fixpoint(
             seen_url=seen_url,
             seen_tarball=seen_tarball,
             seen_local=seen_local,
+            seen_oci=seen_oci,
             edge_cache=edge_cache,
             provider=provider,
             overrides_by_name=overrides_by_name,
@@ -2760,9 +3134,10 @@ def _s4a_run_fixpoint(
             env=env,
             params=params,
             index=index,
-            provenance_gate=provenance_gate,
             root_authority=root_authority,
             record_discovery=record_discovery,
+            binding_resolver=binding_resolver,
+            is_strict=is_strict,
             root_self_name=root_self_name,
             root_self_version=root_self_version,
         )
@@ -2914,9 +3289,10 @@ def _s4c_check_flag_conflicts(
         # We need this regardless of whether dep_active_flags has an entry,
         # because a dep with no consumer requests may still have default=#true
         # flags that conflict.
-        # C1/H2 fix: decompose the solver-var via DepKey so qualified deps
-        # (solver-var "ns::bar") resolve to ``_deps/@ns/bar/milpa.kdl``.
-        _dk_s4c = DepKey.from_solver_var(dep_name)
+        # C1/H2 fix: decompose the solver-var (S5-rekey: a BOUND source-id's
+        # canonical form for a named dep) via DepKey so qualified deps
+        # resolve to ``_deps/@ns/bar/milpa.kdl``.
+        _dk_s4c = _depkey_for_solved_name(dep_name, provider._binding_resolver)  # type: ignore[attr-defined]
         kdl_path = deps_dir / dep_dir_name(_dk_s4c.name, _dk_s4c.namespace) / "milpa.kdl"
         if not kdl_path.exists():
             continue
@@ -2937,7 +3313,10 @@ def _s4c_check_flag_conflicts(
                 continue  # no active flags — nothing to check
 
         # Delegate to the SSOT helper (also used for root CLI flag check).
-        _raise_if_flag_conflicts(dep_name, dm.flags, active_map)
+        # RFC §4.4.1 (S5-rekey): the error payload's ``dep`` field must be
+        # the bare/qualified legacy name, never the raw canonical solver
+        # key — _dk_s4c (decoded above) is already the correct projection.
+        _raise_if_flag_conflicts(_dk_s4c.solver_var(), dm.flags, active_map)
 
 
 # ---------------------------------------------------------------------------
@@ -3095,34 +3474,35 @@ def resolve(
     } | {DepKey(name=ov.name) for ov in manifest.overrides}
 
     # R6: namespace-aware authority set — used ONLY by is_root_direct (the
-    # lowest-direct precompute), never the provenance gate above, which
-    # stays on this bare-name projection. Provably byte-identical to the
-    # old independently-built `root_authority` set: both are sourced from
+    # lowest-direct precompute). Provably byte-identical to the old
+    # independently-built `root_authority` set: both are sourced from
     # exactly `all_root_deps` (regular + dev-deps) + `manifest.overrides`
     # names — the SAME two sources — so projecting `root_direct_keys` down
     # to just its `.name` field yields the exact same set of bare names.
-    root_authority: set[str] = {k.name for k in root_direct_keys}
-
-    # provenance_gate: name → (prov_key, authority_tier)  (§10.0: 1=root,
-    # 2=registry/named, 3=self-declared url/local/tarball)
     #
-    # NOT pre-seeded: root deps register themselves as they are processed
-    # in the BFS loop.  The gate is used for TRANSITIVE conflict detection:
-    # when a transitive dep tries to claim a name that root authority already
-    # registered with a DIFFERENT pkey, the transitive claim is suppressed;
-    # when a registry (tier-2) claim and a self-declared (tier-3) claim
-    # disagree, the registry wins regardless of discovery order.
-    # ``root_authority`` (the name set above) is the check for root
-    # suppression — the gate stores which pkey+tier a claim actually used.
-    provenance_gate: dict[str, tuple[tuple[object, ...], int]] = {}
+    # RFC origin-as-identity §6 "Kept": ``root_authority`` (this bare-name
+    # projection) survives post-S3b for TWO remaining single-purpose
+    # consumers, now that the ``provenance_gate``/``_check_provenance_gate``
+    # side-table that used to be its primary consumer is deleted:
+    #   1. ``_version_unknown_constrained_err`` — branches the
+    #      ``RES-VERSION-UNKNOWN-CONSTRAINED`` remedy on whether the
+    #      package has a user-owned declaration site.
+    #   2. the registry-shadow tripwire gate in ``_run_bfs_wave_loop``
+    #      (``if dep_u.name not in root_authority: check_registry_shadow(...)``)
+    #      — root's own explicit source choice is never second-guessed.
+    # Source ADMISSION/arbitration itself is entirely ``BindingResolver``'s
+    # job now (``binding.py``). Its bare-name (not ``DepKey``) scoping is a
+    # known, deliberately out-of-scope gap — the open #192/R6 namespace door.
+    root_authority: set[str] = {k.name for k in root_direct_keys}
 
     # ------------------------------------------------------------------
     # Step 4: build the provider and dedup sets
     # ------------------------------------------------------------------
-    seen_url: set[tuple[str, str]] = set()
+    seen_url: set[tuple[str, str, str | None]] = set()
     seen_named: set[DepKey] = set()  # S5a: qualified key (namespace+name)
     seen_local: set[str] = set()
     seen_tarball: set[str] = set()
+    seen_oci: set[str] = set()  # S8b: keyed by "registry/repository@digest"
 
     # Phase B dedup: BFS-insertion discovery order (list of dep names in first-
     # enqueue order).  Root deps in declaration order first; transitive deps in
@@ -3139,23 +3519,60 @@ def resolve(
 
     # Resolver-scoped edge memo (§4.2.1 resolve_edges clause a).
     # Sealed once per (name, version) — shared with provider for _materialize.
-    edge_cache: dict[tuple[str, Version], EdgeSet] = {}
+    edge_cache: dict[tuple[SourceId, Version], EdgeSet] = {}
 
     from milpa.trust import effective_trust_policy as _eff_trust
     _is_strict_early = _eff_trust(manifest.attestation_policy, params.require_attested_metadata) == "strict"
+
+    # RFC origin-as-identity §4.3 (S3a): the binding phase that produces the
+    # solver's source-id variables. Root/override claims are reconciled
+    # (override pre-empts a same-name root dep declaration) and bound here,
+    # once, before any transitive claim can arrive; only transitive claims
+    # go through ``binding_resolver.submit()`` in the BFS loop below.
+    # MemberTarget overrides are excluded from reconciliation for a
+    # standalone (non-workspace) resolve — mirrors the root-seeding loop's
+    # own MemberTarget-in-single-package no-op below (M7): there is no
+    # workspace context for such an override to redirect into.
+    # §14/§6 "root satisfies its own name" — the standalone root is a
+    # workspace-of-one (RFC §6 "Kept"): its OWN name binds to a
+    # ``MemberSourceId`` sentinel, exactly like a workspace member's self-
+    # registration, so a transitive `requires "<manifest.name>"` naturally
+    # comes back ``LOST_TO_ROOT`` (never a registry enumeration attempt —
+    # there is no registry entry for the project's own name) when it
+    # reaches the "named" BFS arm below.
+    #
+    # Constructed BEFORE ``_Provider`` (S4): ``_Provider._materialize`` needs
+    # ``binding_resolver.source_id_for`` to key the edge_cache by source_id
+    # rather than name (RFC §4.5) — neither construction depends on the
+    # other's output, so this is a pure reorder, not a behavior change.
+    binding_resolver = BindingResolver(
+        reconcile_root_claims(
+            all_root_deps,
+            [ov for ov in manifest.overrides if not isinstance(ov.target, MemberTarget)],
+            index=index,
+        )
+        + [
+            Claim(
+                name=manifest.name,
+                source_id=MemberSourceId(member_name=manifest.name),
+                is_root=True,
+                claimant="root-self",
+            )
+        ]
+    )
 
     provider = _Provider(
         env=env,
         deps_dir=deps_dir,
         params=params,
         overrides_by_name=overrides_by_name,
-        root_authority=root_authority,
         root_direct_keys=root_direct_keys,
         seen_named=seen_named,
         seen_url=seen_url,
-        provenance_gate=provenance_gate,
+        binding_resolver=binding_resolver,
         edge_cache=edge_cache,
         strict_attestation=_is_strict_early,
+        root_self_name=manifest.name,
     )
 
     # ------------------------------------------------------------------
@@ -3186,11 +3603,25 @@ def resolve(
                 ov = overrides_by_name[dep.name]
                 # S8a: LocalTarget override on a root UrlDep → local BFS slot.
                 if isinstance(ov.target, LocalTarget):
+                    # RFC §4.4.1 (S5-rekey, phase 2): solver variable = BOUND
+                    # source-id canonical form, UNIFORMLY (no eager-kind bare-
+                    # name carve-out). Root claim already bound at
+                    # BindingResolver.__init__ (reconcile_root_claims), above.
+                    _svar_lt = binding_resolver.canonical_for(DepKey(name=dep.name))
                     # Axis A (a)/D-A2: full() self-term, never eq(sentinel).
-                    root_terms.append(Term.require(dep.name, VersionSet.full()))
-                    root_requires.append(dep.name)
+                    root_terms.append(Term.require(_svar_lt, VersionSet.full()))
+                    root_requires.append(_svar_lt)
                     bfs_queue.append(("local", LocalDep(name=dep.name, path=ov.target.path, version=ov.version)))
-                    _record_discovery(dep.name)
+                    _record_discovery(_svar_lt)
+                    continue
+                # S8b: TarballTarget/OciTarget/RegistryTarget override on a
+                # root UrlDep → route to the matching BFS slot.
+                if _seed_extended_override_target(
+                    dep.name, ov,
+                    binding_resolver=binding_resolver, root_terms=root_terms,
+                    root_requires=root_requires, bfs_queue=bfs_queue,
+                    record_discovery=_record_discovery,
+                ):
                     continue
                 # S8b: MemberTarget in a single-package manifest is a no-op (no
                 # workspace context; member candidates are never pre-registered
@@ -3201,12 +3632,14 @@ def resolve(
                     effective_dep = _apply_git_override_to_url_dep(dep, ov)
             else:
                 effective_dep = dep
+            # RFC §4.4.1 (S5-rekey, phase 2): uniform canonical solver key.
+            _svar_url = binding_resolver.canonical_for(DepKey(name=dep.name))
             # Axis A (a)/D-A2: full() self-term, never eq(sentinel) — the causality
             # fix (term built pre-fetch; the real label is assigned post-fetch).
-            root_terms.append(Term.require(dep.name, VersionSet.full()))
-            root_requires.append(dep.name)
+            root_terms.append(Term.require(_svar_url, VersionSet.full()))
+            root_requires.append(_svar_url)
             bfs_queue.append(("url", effective_dep))
-            _record_discovery(dep.name)  # Phase B: root URL deps in declaration order
+            _record_discovery(_svar_url)  # Phase B: root URL deps in declaration order
 
         elif isinstance(dep, NamedDep):
             if dep.name == "nim":
@@ -3216,13 +3649,23 @@ def resolve(
                 ov = overrides_by_name[dep.name]
                 # S8a: LocalTarget override on a root NamedDep → local BFS slot.
                 if isinstance(ov.target, LocalTarget):
+                    _svar_nlt = binding_resolver.canonical_for(DepKey(name=dep.name))
                     # Axis A (a)/D-A2: full() self-term, never eq(sentinel).
                     root_terms.append(
-                        Term.require(dep.name, VersionSet.full())
+                        Term.require(_svar_nlt, VersionSet.full())
                     )
-                    root_requires.append(dep.name)
+                    root_requires.append(_svar_nlt)
                     bfs_queue.append(("local", LocalDep(name=dep.name, path=ov.target.path, version=ov.version)))
-                    _record_discovery(dep.name)  # Phase B: overridden named → local
+                    _record_discovery(_svar_nlt)  # Phase B: overridden named → local
+                    continue
+                # S8b: TarballTarget/OciTarget/RegistryTarget override on a
+                # root NamedDep → route to the matching BFS slot.
+                if _seed_extended_override_target(
+                    dep.name, ov,
+                    binding_resolver=binding_resolver, root_terms=root_terms,
+                    root_requires=root_requires, bfs_queue=bfs_queue,
+                    record_discovery=_record_discovery,
+                ):
                     continue
                 # S8b: MemberTarget in a single-package manifest is a no-op;
                 # fall through to named-dep handling (no workspace member to resolve to).
@@ -3230,50 +3673,74 @@ def resolve(
                     # S5b: carry namespace from manifest dep
                     _dk_mt = DepKey(name=dep.name, namespace=dep.namespace)
                     vs = dep.constraint_set if dep.constraint_set is not None else VersionSet.full()
-                    root_terms.append(Term.require(_dk_mt.solver_var(), vs))
-                    root_requires.append(_dk_mt.solver_var())
+                    # RFC §4.4.1 (S5-rekey, phase 2): uniform canonical solver
+                    # key. Root claim already bound at BindingResolver.__init__
+                    # (reconcile_root_claims), above.
+                    _svar_mt = binding_resolver.canonical_for(_dk_mt)
+                    root_terms.append(Term.require(_svar_mt, vs))
+                    root_requires.append(_svar_mt)
                     bfs_queue.append(("named", _dk_mt, dep.constraint))
-                    _record_discovery(_dk_mt.solver_var())
+                    _record_discovery(_svar_mt)
                     continue
                 effective_dep = _apply_git_override_to_url_dep(
                     UrlDep(name=dep.name, git="", ref=""), ov
                 )
+                _svar_nu = binding_resolver.canonical_for(DepKey(name=dep.name))
                 # Axis A (a)/D-A2: full() self-term, never eq(sentinel).
                 root_terms.append(
-                    Term.require(dep.name, VersionSet.full())
+                    Term.require(_svar_nu, VersionSet.full())
                 )
-                root_requires.append(dep.name)
+                root_requires.append(_svar_nu)
                 bfs_queue.append(("url", effective_dep))
-                _record_discovery(dep.name)  # Phase B: overridden named → URL
+                _record_discovery(_svar_nu)  # Phase B: overridden named → URL
             else:
                 # S5b: carry namespace from manifest dep.
                 _dk = DepKey(name=dep.name, namespace=dep.namespace)
                 vs = dep.constraint_set if dep.constraint_set is not None else VersionSet.full()
-                root_terms.append(Term.require(_dk.solver_var(), vs))
-                root_requires.append(_dk.solver_var())
+                # RFC §4.4.1 (S5-rekey, phase 2): uniform canonical solver key.
+                # Root claim already bound at BindingResolver.__init__
+                # (reconcile_root_claims), above.
+                _svar = binding_resolver.canonical_for(_dk)
+                root_terms.append(Term.require(_svar, vs))
+                root_requires.append(_svar)
                 bfs_queue.append(("named", _dk, dep.constraint))
-                _record_discovery(_dk.solver_var())  # Phase B: named deps in declaration order
+                _record_discovery(_svar)  # Phase B: named deps in declaration order
                 # S3: store flag_requests keyed by solver_var so _materialize can use them.
                 if dep.flag_requests:
-                    provider._flag_requests_by_name[_dk.solver_var()] = dep.flag_requests
+                    provider._flag_requests_by_name[_svar] = dep.flag_requests
 
         elif isinstance(dep, TarballDep):
+            # RFC §4.4.1 (S5-rekey, phase 2): uniform canonical solver key.
+            _svar_tb = binding_resolver.canonical_for(DepKey(name=dep.name))
             # Axis A (a)/D-A2: full() self-term, never eq(sentinel).
-            root_terms.append(Term.require(dep.name, VersionSet.full()))
-            root_requires.append(dep.name)
+            root_terms.append(Term.require(_svar_tb, VersionSet.full()))
+            root_requires.append(_svar_tb)
             bfs_queue.append(("tarball", dep))
-            _record_discovery(dep.name)  # Phase B: root tarball deps in declaration order
+            _record_discovery(_svar_tb)  # Phase B: root tarball deps in declaration order
 
         elif isinstance(dep, LocalDep):
+            # RFC §4.4.1 (S5-rekey, phase 2): uniform canonical solver key.
+            _svar_lo = binding_resolver.canonical_for(DepKey(name=dep.name))
             # Axis A (a)/D-A2: full() self-term, never eq(sentinel).
-            root_terms.append(Term.require(dep.name, VersionSet.full()))
-            root_requires.append(dep.name)
+            root_terms.append(Term.require(_svar_lo, VersionSet.full()))
+            root_requires.append(_svar_lo)
             bfs_queue.append(("local", dep))
-            _record_discovery(dep.name)  # Phase B: root local deps in declaration order
+            _record_discovery(_svar_lo)  # Phase B: root local deps in declaration order
 
         elif isinstance(dep, MemberDep):
-            # Member deps in a single-package manifest are out of scope (slice 9d).
-            pass
+            # RFC §4.4.1 (D3): a `member "<name>"` reference is workspace-only
+            # topology. In a single-package (non-workspace) manifest it has no
+            # candidate to resolve to. Fail closed with a coded error rather
+            # than silently dropping the edge (which would mask a real authoring
+            # mistake). The Rust impl raises the SAME slug at its root-seed arm.
+            raise MilpaError(
+                RES_MEMBER_OUTSIDE_WORKSPACE,
+                f"member {dep.name!r} is declared in a single-package manifest; "
+                "`member` deps are only valid inside a workspace — declare a "
+                "`workspace { member … }` block, or use git=/local= for a "
+                "cross-repo dependency",
+                name=dep.name,
+            )
 
     root_cand = _Candidate(
         name="__root__",
@@ -3298,8 +3765,13 @@ def resolve(
     _root_self_version, _root_self_version_source = _root_self_candidate_version(
         manifest, params.manifest_dir
     )
+    # S5-rekey (RFC origin-as-identity §4.4): keyed by the BOUND source-id's
+    # canonical form (the root-self MemberSourceId sentinel), not the bare
+    # manifest name — so a transitive requirement on the root's own name
+    # (computed via canonical_key_for_requirement's root_self_name branch)
+    # finds this candidate under the SAME key it requires.
     root_self_cand = _Candidate(
-        name=manifest.name,
+        name=binding_resolver.canonical_for(DepKey(name=manifest.name)),
         version=_root_self_version,
         # §14.5: no separate identity — the project root is not an isolated,
         # independently-hashed tree the way a fetched dep or workspace
@@ -3317,18 +3789,14 @@ def resolve(
     # §14.2: the root's own name is root-authoritative (§10.1) — added here
     # (rather than folded into the root_direct_keys/root_authority
     # construction above) so the two additions stay visually adjacent to the
-    # self-candidate they protect.
+    # self-candidate they protect. The root's OWN claim on its own name is
+    # bound into ``binding_resolver`` above (the ``root-self`` ``Claim`` with
+    # a ``MemberSourceId`` — RFC origin-as-identity §4.3/§6 "root satisfies
+    # its own name"), so a transitive claim on this same name is suppressed
+    # by ``BindingResolver.submit`` returning ``LOST_TO_ROOT``, with no
+    # dedicated pre-seed needed here.
     root_direct_keys.add(DepKey(name=manifest.name))
     root_authority.add(manifest.name)
-
-    # §14.2: pre-seed the provenance gate so the FIRST transitive claim on
-    # the root's own name is already a "second" claim against this sentinel
-    # entry — suppressed by the ordinary root-wins branch in
-    # ``_check_provenance_gate``, with no dedicated root-self case needed
-    # there.  Mirrors ``resolve_workspace``'s MemberTarget-override pre-seed
-    # (same technique, same reason: register root authority for a name
-    # BEFORE any transitive claim on it can arrive).
-    provenance_gate[manifest.name] = (_ROOT_SELF_PKEY, TIER_ROOT)
 
     # ------------------------------------------------------------------
     # Step 6: BFS materialisation loop (slice 9b-7: parallel fetch)
@@ -3357,6 +3825,7 @@ def resolve(
             seen_url=seen_url,
             seen_tarball=seen_tarball,
             seen_local=seen_local,
+            seen_oci=seen_oci,
             edge_cache=edge_cache,
             provider=provider,
             overrides_by_name=overrides_by_name,
@@ -3364,9 +3833,10 @@ def resolve(
             env=env,
             params=params,
             index=index,
-            provenance_gate=provenance_gate,
             root_authority=root_authority,
             record_discovery=_record_discovery,
+            binding_resolver=binding_resolver,
+            is_strict=_is_strict_early,
             root_self_name=manifest.name,
             root_self_version=_root_self_version,
         )
@@ -3391,15 +3861,17 @@ def resolve(
             seen_url=seen_url,
             seen_tarball=seen_tarball,
             seen_local=seen_local,
+            seen_oci=seen_oci,
             edge_cache=edge_cache,
             overrides_by_name=overrides_by_name,
             deps_dir=deps_dir,
             env=env,
             params=params,
             index=index,
-            provenance_gate=provenance_gate,
             root_authority=root_authority,
             record_discovery=_record_discovery,
+            binding_resolver=binding_resolver,
+            is_strict=_is_strict_early,
             root_self_name=manifest.name,
             root_self_version=_root_self_version,
         )
@@ -3415,49 +3887,71 @@ def resolve(
     _s4c_check_flag_conflicts(provider, deps_dir)
 
     # ------------------------------------------------------------------
-    # Step 6b: Phase B content-hash dedup/alias
-    #
-    # After all eager deps are fetched, group candidates by identity.
-    # Groups of size ≥ 2 share a content hash → collapse to one canonical
-    # candidate.  Canonical = group member earliest in BFS-insertion order
-    # (discovery_order list).  Non-canonical candidates are removed from
-    # the provider's candidate set and their _deps/<name> dirs are removed.
-    # All dep_terms / requires_names in surviving candidates pointing to a
-    # non-canonical name are rewritten to the canonical name.
-    # The canonical candidate gains an 'aliases' set for _build_graph.
-    # ------------------------------------------------------------------
-    aliases_map: dict[str, str] = _dedup_candidates(
-        provider, deps_dir, discovery_order, overrides_by_name
-    )
-
-    # ------------------------------------------------------------------
     # Step 7: wire Phase B transitive callback BEFORE solve
     #
     # When the solver calls ``provider.dependencies()`` for a named stub,
     # any newly-discovered transitive named deps must be enrolled
     # immediately so the solver can see them.
     # ------------------------------------------------------------------
-    def _on_transitive_named(name: str) -> None:
-        # ``name`` here is a solver_var string (e.g. ``"ns::bar"`` for qualified
-        # deps or plain ``"bar"`` for bare deps).  Decompose via from_solver_var
-        # so the namespace is preserved through to _enumerate_named_stubs.
-        # C1 / H2 (rfc-resolver-correctness.md): use DepKey.from_solver_var as the
-        # SOLE site that parses a ``::``-joined solver_var back into components.
-        _dk_t = DepKey.from_solver_var(name)
-        if _dk_t in seen_named or _dk_t.name == "nim":
+    def _on_transitive_named(dep_key: DepKey) -> None:
+        # S5-rekey (RFC origin-as-identity §4.4): the caller
+        # (``_edgeset_named_requires`` via ``_Provider._materialize``) now
+        # passes the ORIGINAL ``DepKey`` directly — no ``DepKey.from_solver_var``
+        # reverse-decode here, since the solver-variable string this dep's
+        # Term used is a BOUND source-id's canonical form, not a
+        # ``"ns::bar"`` string (and may not even be bound yet — this
+        # callback's whole job is the first-ever admission of a mid-solve
+        # transitive named dep).
+        if dep_key in seen_named or dep_key.name == "nim":
             return
-        seen_named.add(_dk_t)
-        # §14.2: a late (solve-time-discovered) transitive claim on the
-        # root's own name must NOT be enumerated from the registry either —
-        # the root's own pre-registered candidate (Step 5b) is already the
-        # sole candidate for that name. This mirrors the BFS "named" branch's
-        # provenance-gate suppression, but this callback fires OUTSIDE the
-        # gate machinery entirely (Phase B lazy materialisation, not BFS), so
-        # the check is inline here instead.
-        if _dk_t.namespace is None and _dk_t.name == manifest.name:
+        seen_named.add(dep_key)
+        # RFC origin-as-identity §4.3 (S3a): this callback fires OUTSIDE the
+        # BFS wave loop entirely (Phase B lazy materialisation, mid-solve —
+        # ``_Provider._materialize`` calls it for every newly-discovered
+        # transitive named dep), so it must independently route through
+        # ``BindingResolver`` too — it is a SEPARATE admission site from the
+        # "named" BFS arm, not a re-entry into it. This is what makes §14.2
+        # "root satisfies its own name" (the MemberSourceId sentinel claim,
+        # see ``resolve()``'s BindingResolver construction) work here too:
+        # a late transitive claim on the root's own name mismatches that
+        # sentinel and comes back LOST_TO_ROOT, exactly like a root/override-
+        # pinned name would — root_self_cand alone remains the sole
+        # candidate. A genuine mid-solve conflict (RFC's own
+        # "TestMidSolveResidualClosedByImmediateValidation" fixture — a
+        # registry package's OWN manifest requires a name an eager transitive
+        # already bound to a disagreeing source) raises RES-BINDING-CONFLICT
+        # here, exactly like the BFS "named" arm would.
+        _named_claim_t = Claim(
+            name=dep_key.solver_var(),
+            source_id=normalize_source(
+                RegistrySourceId(
+                    registry=DEFAULT_REGISTRY_ALIAS,
+                    namespace=resolved_registry_namespace(
+                        dep_key.name, dep_key.namespace, index,
+                    ),
+                    name=dep_key.name,
+                )
+            ),
+            is_root=False,
+            claimant="transitive",
+        )
+        _named_decision_t = binding_resolver.submit(_named_claim_t)
+        if _named_decision_t.outcome is BindOutcome.LOST_TO_ROOT:
             return
+        # S5-rekey: record_discovery AFTER the claim is bound (canonical_for
+        # requires it) — moved past the LOST_TO_ROOT early-return above, which
+        # only tightens discovery_order to actually-participating deps (a
+        # LOST_TO_ROOT name never gets a solved candidate anyway, so this is
+        # a no-op for _dedup_candidates' tie-break, never a behavior change).
+        _record_discovery(binding_resolver.canonical_for(dep_key))  # Phase B/S4b: mid-solve named dep —
+        # a dedup canonical-selection tie-break now needs this position too,
+        # since S4b's cross-origin collapse runs post-solve and can include a
+        # named dep that was only ever discovered via THIS callback (mirrors
+        # resolve_workspace()'s equivalent _ws_record_discovery call, which
+        # already did this — this was a latent asymmetry between the two
+        # entry points, harmless while dedup ran pre-solve, load-bearing now).
         _enumerate_named_stubs(
-            _dk_t, None, index, provider, deps_dir, env,
+            dep_key, None, index, provider, deps_dir, env,
             exclude_newer=params.exclude_newer,
         )
 
@@ -3473,16 +3967,41 @@ def resolve(
             Version(0, 0, 0),
             strategy=params.strategy,
         )
+        # S5-rekey (RFC origin-as-identity §4.4): project the certificate's
+        # PubGrub package strings back to the legacy "ns::name"/bare form —
+        # certificate_to_json (solver.py) has no BindingResolver access.
+        cert = _project_solve_success(cert, binding_resolver)
     except VersionUnknownConstrained as exc:
-        raise _version_unknown_constrained_err(exc, root_authority) from exc
+        raise _version_unknown_constrained_err(exc, root_authority, binding_resolver) from exc
     except SolverError as exc:
         from milpa.errors import SOLVE_CONFLICT
+        _projected_exc = _project_solver_error(exc, binding_resolver)
         raise MilpaError(
             SOLVE_CONFLICT,
-            f"dependency conflict: {exc}",
-            chain=exc.chain,
-            solver_error=exc,
+            f"dependency conflict: {_projected_exc}",
+            chain=_projected_exc.chain,
+            solver_error=_projected_exc,
         ) from exc
+
+    # ------------------------------------------------------------------
+    # Step 8b: Phase B content-hash dedup/alias (RFC origin-as-identity §3.3/
+    # §4.5, S4b — cross-origin reconciliation)
+    #
+    # Runs on the SOLVED graph (post-solve, pre-build): group the solution's
+    # chosen candidates by identity.  Groups of size ≥ 2 share a content hash
+    # → collapse to one canonical dep.  Canonical = group member earliest in
+    # BFS-insertion order (discovery_order list).  Running post-solve (not
+    # pre-solve, as Phase B originally did) is what makes this cross-origin:
+    # a named (registry) candidate is only ever materialized (fetched) when
+    # the solver asks for its dependencies, so its real identity isn't known
+    # until solve_with_cert returns — by then, every solved candidate (named
+    # or eager) has been. _build_graph uses aliases_map to fold each
+    # non-canonical entry into its canonical peer, carrying its own
+    # provenance along (both origins' audit trail survives the collapse).
+    # ------------------------------------------------------------------
+    aliases_map: dict[str, str] = _dedup_candidates(
+        provider, deps_dir, discovery_order, overrides_by_name, solution
+    )
 
     # ------------------------------------------------------------------
     # Step 9: build the ResolvedGraph (attach cert for CLI §2.5)
@@ -3490,6 +4009,7 @@ def resolve(
     graph = _build_graph(
         solution, provider, deps_dir, params.strategy,
         aliases_map=aliases_map, entry_trust=params.entry_trust,
+        binding_resolver=binding_resolver,
     )
 
     # ------------------------------------------------------------------
@@ -3503,12 +4023,29 @@ def resolve(
     # ------------------------------------------------------------------
     from milpa.attestation import enforce_attestation_policy
     is_strict = _is_strict_early  # already computed above
-    # edge_cache holds (name, version) → EdgeSet for all deps seen during BFS.
-    # We exclude __root__ (it has no EdgeSet in the cache).
+    # edge_cache holds (source_id, version) → EdgeSet for all deps seen during
+    # BFS (RFC origin-as-identity §4.5, S4). __root__ and workspace members
+    # are excluded naturally: neither is ever recorded in ``discovery_order``
+    # (root never goes through BFS-seal; members are pre-registered
+    # candidates, never fetched/materialized). Reverse-map source_id → a
+    # display name via ``discovery_order`` (BFS-first wins on a coalesced
+    # diamond — the same canonical-selection convention ``_dedup_candidates``
+    # uses) so ``enforce_attestation_policy``'s messages stay name-keyed.
+    _name_by_source_id: dict[SourceId, str] = {}
+    for _n in discovery_order:
+        # S5-rekey: discovery_order now holds canonical solver-variable
+        # strings for named deps (bare dep.name for eager deps) — decode via
+        # the shared canonical-or-legacy helper for BOTH the lookup key and
+        # the DISPLAY name stored below (attestation-policy warning text
+        # must never show the raw canonical string).
+        _dk_disp = _depkey_for_solved_name(_n, binding_resolver)
+        _sid = binding_resolver.source_id_for(_dk_disp)
+        if _sid is not None and _sid not in _name_by_source_id:
+            _name_by_source_id[_sid] = _dk_disp.solver_var()
     resolved_edge_map: dict[str, EdgeSet] = {
-        name: es
-        for (name, _ver), es in edge_cache.items()
-        if name != "__root__"
+        _name_by_source_id[sid]: es
+        for (sid, _ver), es in edge_cache.items()
+        if sid in _name_by_source_id
     }
     enforce_attestation_policy(resolved_edge_map, is_strict)
 
@@ -3536,8 +4073,11 @@ def resolve(
             stacklevel=4,
         )
 
-    # M6: warn about overrides that name a dep not in the resolved graph.
+    # M6 / RES-DEAD-OVERRIDE (rfc-origin-as-identity.md §10 item 12 / B10,
+    # S5b): warn about overrides that name a dep not in the resolved graph.
     # A typo in an override name silently no-ops without this check.
+    # Non-fatal — resolution still succeeds — same warn-only pattern as
+    # RES-REGISTRY-SHADOW's default policy.
     _resolved_dep_names = {dep.name for dep in graph.deps}
     _dead_override_names = sorted(
         ov.name for ov in manifest.overrides
@@ -3550,6 +4090,24 @@ def resolve(
             UserWarning,
             stacklevel=4,
         )
+
+    # RFC origin-as-identity.md §4.7/B3 (S3a-req): when the slot projection
+    # dropped a declared label in favor of another, that collapse must be
+    # VISIBLE — never a silent disappearance from _deps/ / nim.cfg. One note
+    # per dropped alias, on the resolve trace (stderr).
+    from milpa.lockfile import collapse_notes as _collapse_notes
+    for _note in _collapse_notes(list(graph.deps)):
+        print(f"[milpa] note: {_note}", file=sys.stderr)
+
+    # RFC origin-as-identity.md §4.6 (S6 + S7): the complete import-slot
+    # check — post-solve, post-dedup, before anything is written under
+    # _deps/. Runs the S6 directory-slot floor first, then the symbol-level
+    # scan over the same CAS store rebuild_deps_view materializes from
+    # below. live_symbol_provider() is manifest_declared fidelity ONLY —
+    # see its docstring for the evidence-based reason tree_scanned fidelity
+    # is not (yet) part of the zero-config hard-fail default.
+    from milpa.import_slot import check_import_slot_collisions, live_symbol_provider
+    check_import_slot_collisions(graph, live_symbol_provider(), store=env.store)
 
     # B-nimcfg: rebuild the _deps/ view as a pure function of the resolved graph.
     # This creates alias symlinks and removes stale entries from prior resolves.
@@ -3565,329 +4123,14 @@ def resolve(
 # ---------------------------------------------------------------------------
 
 
-# Authority tiers (resolver-semantics.md §10.0 — the provenance lattice).
-# 1 = Root (root/member deps + dev-deps + overrides) — the project owner.
-# 2 = Registry (a ``named``/index claim) — the attested tianguis registry.
-# 3 = Self-declared URL (transitive git=/local=/tarball=) — untrusted.
-# A higher tier (LOWER number) suppresses a lower-tier (HIGHER number)
-# disagreement, deterministically, without error.
-TIER_ROOT = 1
-TIER_REGISTRY = 2
-TIER_SELF_URL = 3
-
-# Sentinel pkey for a ``named``/registry claim: a ``named`` dep is a
-# deference to the tianguis registry, not a self-declared source — every
-# named claim for the same solver_var is therefore the SAME conceptual
-# claim regardless of which transitive makes it or what version constraint
-# it carries (constraints aren't provenance).  Two named claims for the
-# same name can never disagree at the provenance-key level.
-_NAMED_PKEY: tuple[object, ...] = ("named",)
-
-# §14.2: sentinel pkey pre-seeded into ``provenance_gate`` for the standalone
-# root's own name, before any transitive claim on it can arrive.  Any real
-# claim's pkey (``_NAMED_PKEY``, or a ``("url", git, ref)`` tuple) is
-# structurally distinct from this sentinel, so ``_check_provenance_gate``
-# always takes the "different provenance, root wins" branch — suppressing
-# the claim with no dedicated root-self logic in the gate itself.
-_ROOT_SELF_PKEY: tuple[object, ...] = ("root-self",)
-
-
-# ---------------------------------------------------------------------------
-# Registry-validation mechanism (resolver-semantics.md §10.0/§10.3 — the
-# validate-against-registry rework of the provenance lattice's tier-2 rule).
-# ---------------------------------------------------------------------------
-
-
-def _normalize_git_source_url(url: str) -> str:
-    """Normalize *url* for git-source AGREEMENT comparison (§10.0).
-
-    Strips a trailing ``/`` and a trailing ``.git`` suffix, and lowercases
-    the scheme + authority (host[:port]) component only — path casing is
-    preserved, since many git hosts are path-case-sensitive (unlike the
-    hostname). This is deliberately NOT full URL canonicalization (no
-    userinfo/port-default handling, no ssh-vs-https transport unification,
-    no percent-decoding) — the only thing this comparison needs to answer is
-    "is this the same repository the registry records", which the milpa KDL
-    ``(url)`` convention (spec's git urls are always full ``scheme://host/
-    path`` form, never SCP-style ``git@host:path``) makes tractable with
-    this narrow normalization. Reused (in spirit) from the existing
-    ``.git``-suffix stripping in ``edge_sources._name_from_url`` /
-    ``nimble.url_to_name`` (M3 SSOT for name derivation) — this function is
-    the analogous single source of truth for URL *comparison*, not name
-    derivation, so it is not literally the same code path, but applies the
-    identical ``.git``-suffix convention.
-    """
-    from urllib.parse import urlsplit, urlunsplit
-
-    s = url.strip()
-    if s.endswith("/"):
-        s = s[:-1]
-    if s.endswith(".git"):
-        s = s[:-4]
-    parts = urlsplit(s)
-    if not parts.netloc:
-        # No recognizable scheme://authority (e.g. a malformed or SCP-style
-        # value) — fall back to the stripped-and-lowercased whole string so
-        # comparison is still total (never raises), just less precise.
-        return s.lower()
-    return urlunsplit((parts.scheme.lower(), parts.netloc.lower(), parts.path, "", ""))
-
-
-def _registry_git_provenances(pkg: Package) -> list[GitIndexProvenance]:
-    """All ``GitIndexProvenance`` records recorded for *pkg*, across EVERY
-    version (registry-protocol document order, i.e. newest-version-first per
-    ``Index.lookup_bare``'s ``Package.versions`` ordering, then per-version
-    preference order).
-
-    A package's source repository is ordinarily stable across versions (only
-    the ref/tag changes), so checking every version's recorded provenance —
-    not just the newest — is what makes agreement-checking robust to a
-    transitive pinning an OLDER version's tag of the registry's own repo.
-    """
-    out: list[GitIndexProvenance] = []
-    for iv in pkg.versions:
-        for prov in iv.provenances:
-            if isinstance(prov, GitIndexProvenance):
-                out.append(prov)
-    return out
-
-
-def _registry_oci_source_urls(pkg: Package) -> list[str]:
-    """All non-``None`` ``OciIndexProvenance.source_url`` values recorded
-    for *pkg*, across EVERY version (same "every version, not just newest"
-    convention as ``_registry_git_provenances`` — the originating git repo
-    of an OCI-published package is ordinarily stable across versions).
-    """
-    out: list[str] = []
-    for iv in pkg.versions:
-        for prov in iv.provenances:
-            if isinstance(prov, OciIndexProvenance) and prov.source_url:
-                out.append(prov.source_url)
-    return out
-
-
-def _validate_transitive_url_against_registry(
-    name: str,
-    dep_git_url: str,
-    pkg: Package,
-) -> frozenset[str] | None:
-    """Validate a transitive's self-declared ``git=`` source for the
-    registry-owned name *name* against tianguis's recorded source for *pkg*
-    (resolver-semantics.md §10.0/§10.3 NORMATIVE — "Registry validation").
-
-    Returns one of:
-
-    - ``None`` — the claim is fully resolved as an AGREEMENT: the
-      transitive's git URL, normalized, matches EITHER a git source
-      recorded for ANY version of *pkg*, OR an OCI entry's recorded
-      ``source_url`` for ANY version of *pkg*. The caller falls through and
-      treats the claim as an accepted, ordinary tier-3 url dep. A differing
-      ``ref``/``commit_sha``/version is NOT a disagreement (it only selects
-      a version, or a newer unreleased ref, of the same repo) — this
-      function never compares those fields.
-    - A non-empty ``frozenset[str]`` of ``content_hash`` values — *pkg* has
-      NO comparable git source recorded (no ``GitIndexProvenance``, and no
-      OCI entry has a recorded ``source_url``), so the URL comparison above
-      is impossible, but at least one of *pkg*'s versions DOES record a
-      ``content_hash``. milpa's identity is transport-independent
-      (spec/identity.md) — a package published to the registry as an OCI
-      artifact FROM a git repo, and a transitive pinning that SAME repo by
-      URL, are the same package under different transports. The decision
-      is therefore DEFERRED to content identity: the caller MUST fetch the
-      transitive's git source, compute its ``content_hash``, and check
-      membership in the returned set — a match means AGREE (accept), a
-      non-match means DISAGREE (``RES-PROVENANCE-CONFLICT``, raised by the
-      caller post-fetch). This is the FALLBACK path, only reached when
-      NEITHER a git source NOR an OCI ``source_url`` is recorded anywhere
-      for *pkg* (e.g. legacy entries predating the ``source_url`` field).
-
-    Raises ``MilpaError(RES-PROVENANCE-CONFLICT)`` when the claim is already
-    resolvable as a DISAGREEMENT with no further (post-fetch) check needed:
-
-    - a git source IS recorded for *pkg* and none matches ``dep_git_url``
-      (a different repository), or
-    - no git source is recorded, but an OCI ``source_url`` IS recorded and
-      none matches ``dep_git_url`` (a different repository — this is
-      resolved statically, pre-fetch, exactly like the git-vs-git
-      disagreement case, since a recorded ``source_url`` is just as
-      comparable a fact as a recorded git provenance), or
-    - *pkg* has no comparable git source, no OCI ``source_url``, AND no
-      ``content_hash`` recorded for any version either — nothing exists to
-      validate against, even deferred (legacy/empty entries).
-
-    Never fetches anything itself — this function is a cheap, static,
-    pre-fetch check; a deferred (frozenset) result only names WHAT to check
-    once the caller's own fetch pipeline (which runs regardless, since the
-    claim is accepted-pending-validation) has computed the identity.
-    """
-    git_provs = _registry_git_provenances(pkg)
-    if git_provs:
-        claim_norm = _normalize_git_source_url(dep_git_url)
-        registry_urls = {p.url for p in git_provs}
-        if claim_norm in {_normalize_git_source_url(u) for u in registry_urls}:
-            return None
-        raise MilpaError(
-            RES_PROVENANCE_CONFLICT,
-            f"provenance conflict for package {name!r}: a transitive "
-            f"dependency declares source {dep_git_url!r}, but the tianguis "
-            f"registry records {sorted(registry_urls)!r} for {name!r} — a "
-            f"different source repository. The root manifest does not "
-            f"override {name!r}. Add {name!r} to your milpa.kdl deps (or "
-            f"override it) to choose which source to use.",
-            name=name,
-        )
-
-    # No git provenance recorded — try the OCI ``source_url`` fact next
-    # (still a static, pre-fetch, URL-comparable source), BEFORE falling
-    # back to the (post-fetch, deferred) content-hash mechanism. An OCI
-    # artifact published FROM a git repo, referenced by a transitive at
-    # that SAME repo (even at a newer/different ref than any published
-    # version — the version solver reconciles that), is the same package.
-    oci_source_urls = _registry_oci_source_urls(pkg)
-    if oci_source_urls:
-        claim_norm = _normalize_git_source_url(dep_git_url)
-        if claim_norm in {_normalize_git_source_url(u) for u in oci_source_urls}:
-            return None
-        raise MilpaError(
-            RES_PROVENANCE_CONFLICT,
-            f"provenance conflict for package {name!r}: a transitive "
-            f"dependency declares source {dep_git_url!r}, but the tianguis "
-            f"registry records OCI publish source(s) "
-            f"{sorted(set(oci_source_urls))!r} for {name!r} — a different "
-            f"source repository. The root manifest does not override "
-            f"{name!r}. Add {name!r} to your milpa.kdl deps (or override "
-            f"it) to choose which source to use.",
-            name=name,
-        )
-
-    # Incomparable transport (OCI-only entry with no recorded source_url,
-    # or no provenance recorded at all): fall back to CONTENT IDENTITY,
-    # milpa's one transport-independent fact. A package published to
-    # tianguis as an OCI artifact FROM a git repo (e.g. `milpa publish` from
-    # a source checkout) and a transitive pinning that repo by URL are the
-    # SAME package under different transports — content_hash is the only
-    # thing left that can prove (or disprove) that.
-    content_hashes = frozenset(
-        iv.content_hash for iv in pkg.versions if iv.content_hash
-    )
-    if content_hashes:
-        return content_hashes
-    raise MilpaError(
-        RES_PROVENANCE_CONFLICT,
-        f"provenance conflict for package {name!r}: a transitive "
-        f"dependency declares a git source ({dep_git_url!r}), but the "
-        f"tianguis registry has no comparable git source recorded for "
-        f"{name!r} (the registry entry is OCI-only with no recorded "
-        f"publish source, or has no provenance at all), and no "
-        f"content_hash is recorded for any version of {name!r} either — "
-        f"the transport cannot be validated by source or by identity. The "
-        f"root manifest does not override {name!r}. Add {name!r} to your "
-        f"milpa.kdl deps (or override it) to choose which source to use.",
-        name=name,
-    )
-
-
-def _check_provenance_gate(
-    name: str,
-    pkey: tuple[object, ...],
-    provenance_gate: dict[str, tuple[tuple[object, ...], int]],
-    root_authority: set[str],
-    tier: int,
-) -> bool:
-    """Check the provenance gate for ``name`` with key ``pkey`` at ``tier``.
-
-    Returns True if the dep should be fetched/enumerated; False if suppressed.
-    Raises MilpaError(RES-PROVENANCE-CONFLICT) on an irresolvable tier-3-vs-
-    tier-3 disagreement.
-
-    Gate semantics (resolver-semantics.md §10.0 authority lattice,
-    validate-against-registry per §10.3/§10.5 — a name's tier is decided
-    from static facts alone: root-authority membership and registry-index
-    membership, never from which claims happen to collide):
-    - First claim for a name: register (name in ``root_authority`` forces
-      the recorded tier to ``TIER_ROOT`` regardless of the caller-supplied
-      ``tier`` — root's own declaration, whatever kind it is, is always the
-      binding tier-1 claim) + proceed.
-    - Same pkey as prior claim: dedup → suppress (already fetching/enumerated).
-    - Different pkey + either side is root-authority: root wins → suppress,
-      no error (§10.1).
-    - Different pkey, non-root, differing tiers: the higher tier (lower
-      number) wins, deterministically and ORDER-INDEPENDENTLY —
-      * the new claim's tier is weaker (higher number) than the recorded
-        claim's → suppress the new claim (return False) — for a tier-3 URL
-        arriving after a tier-2 registry claim was already recorded, this
-        suppression happens BEFORE the fetch is ever dispatched (§10.5);
-      * the new claim's tier is stronger (lower number) than the recorded
-        claim's — the new claim wins: overwrite the gate entry and proceed
-        (return True).  This branch is reached only for a ``named`` claim
-        (tier=``TIER_REGISTRY``) arriving after a tier-3 URL claim was
-        already recorded for a name that is NOT in the registry index (an
-        index-member name's url claims never reach this gate at TIER_SELF_URL
-        at all — see below); letting the ``named`` claim proceed here just
-        routes it into ``_enumerate_named_stubs``, which immediately raises
-        ``TNG-NOT-FOUND`` (the name genuinely isn't in the index) — so no
-        eager tier-3 candidate for that name can survive into the solver
-        either; resolution aborts here regardless of the stale candidate.
-        No post-hoc sweep of ``provider._candidates`` is needed.
-    - Different pkey, non-root, SAME tier (only reachable for two tier-3
-      claims — two tier-2 claims always share ``_NAMED_PKEY`` and dedup
-      above): conflict, UNLESS a tier-2 (registry) claim for this name is
-      already on record — impossible to reach with prior/new both at tier 3
-      while a tier-2 entry is recorded (a tier-2 registration always
-      upgrades the stored tier to 2), so reaching this branch already
-      proves no tier-2 claim exists → raise RES-PROVENANCE-CONFLICT. Per
-      §10.3, this now also proves the name is NOT in the registry index: an
-      index-member name's url claims are validated against the registry's
-      recorded source (``_validate_transitive_url_against_registry``, called
-      from the ``kind == "url"`` case in ``_run_bfs_wave_loop``) BEFORE ever
-      reaching this gate — an agreeing claim bypasses this gate entirely
-      (accepted directly, never registered here, so two agreeing pins of
-      the same real repo at different refs never collide with each other),
-      and a disagreeing claim raises RES-PROVENANCE-CONFLICT immediately at
-      its own validation, never becoming a candidate that could reach this
-      gate as ``TIER_SELF_URL``. So two claims recorded here at the same
-      (tier-3) level can only belong to a non-index name.
-    """
-    is_root = name in root_authority
-    prior = provenance_gate.get(name)
-    if prior is None:
-        # First time we see this name — register and proceed.
-        provenance_gate[name] = (pkey, TIER_ROOT if is_root else tier)
-        return True
-    if prior[0] == pkey:
-        # Same provenance — already fetching/fetched/enumerated; dedup.
-        return False
-    # Different provenance for the same name.
-    if is_root or prior[1] == TIER_ROOT:
-        # Root authority (either the prior or this call is root) — suppress.
-        return False
-    if tier > prior[1]:
-        # New claim is strictly lower authority than the recorded claim.
-        return False
-    if tier < prior[1]:
-        # New claim is strictly higher authority — it wins (see docstring
-        # for why no stale-candidate sweep is needed here).
-        provenance_gate[name] = (pkey, tier)
-        return True
-    # Same (non-root) tier, different pkey: only two tier-3 claims can reach
-    # here (see docstring) — a genuine untrusted-tier disagreement.
-    raise MilpaError(
-        RES_PROVENANCE_CONFLICT,
-        f"provenance conflict for package {name!r}: "
-        f"one transitive dep claims {prior[0]!r} "
-        f"and another claims {pkey!r}. "
-        f"The root manifest does not override {name!r}. "
-        f"Add an override in your milpa.kdl to resolve which source to use.",
-        name=name,
-    )
-
-
 def _process_url_worker(
     dep: UrlDep,
     dest: Path,
     env: MilpaEnv,
     params: ResolveParams,
     overrides_by_name: dict[str, Override],
+    root_self_name: "str | None" = None,
+    binding_resolver: "BindingResolver | None" = None,
 ) -> tuple[_Candidate, list[object], EdgeSet, Path]:
     """Fetch one URL dep (worker: pure I/O, no shared-state mutation).
 
@@ -4046,7 +4289,7 @@ def _process_url_worker(
         dep_decl_source=DepDeclEdgeSource(env.dep_decl_store) if env.dep_decl_store is not None else None,
     )
 
-    dep_terms, requires_names, requires_predicates = edgeset_to_terms(es, overrides_by_name)
+    dep_terms, requires_names, requires_predicates = edgeset_to_terms(es, overrides_by_name, env.index, root_self_name, binding_resolver)
     src_dir = es.src_dir
 
     commit_sha: str | None = result.receipt.transport_fields().get("commit_sha")
@@ -4085,8 +4328,18 @@ def _process_url_worker(
     # Axis A (b)/D-A2: label with the fetched package's declared version
     # (milpa.kdl → .nimble), else the sentinel (version-unknown stays as-is).
     _candidate_version, _version_source, _version_unknown = _candidate_label(ctx)
+    # RFC §4.4.1 (S5-rekey, phase 2): uniform canonical solver key — this
+    # candidate's own claim was already submitted (root at
+    # BindingResolver.__init__, or transitive via the "url" BFS arm's
+    # binding_resolver.submit()) BEFORE this worker was ever dispatched, so
+    # canonical_for is safe to call directly (no guess-fallback needed).
+    _svar_cand_url = (
+        binding_resolver.canonical_for(DepKey(name=dep.name))
+        if binding_resolver is not None
+        else dep.name
+    )
     candidate = _Candidate(
-        name=dep.name,
+        name=_svar_cand_url,
         version=_candidate_version,
         identity=result.identity,
         src_dir=src_dir,
@@ -4127,6 +4380,11 @@ def _enqueue_dep(
             # no external queue entry (provenance gate suppresses any stale git claim).
             if isinstance(ov.target, MemberTarget):
                 return
+            # S8b: TarballTarget/OciTarget/RegistryTarget → route to the
+            # matching BFS slot.
+            if isinstance(ov.target, (TarballTarget, OciTarget, RegistryTarget)):
+                bfs_queue.append(_extended_override_bfs_item(dep.name, ov))
+                return
             dep = _apply_git_override_to_url_dep(dep, ov)
         bfs_queue.append(("url", dep))
     elif isinstance(dep, NamedDep):
@@ -4140,6 +4398,11 @@ def _enqueue_dep(
                 return
             # S8b: MemberTarget override — member already pre-registered in workspace.
             if isinstance(ov.target, MemberTarget):
+                return
+            # S8b: TarballTarget/OciTarget/RegistryTarget → route to the
+            # matching BFS slot.
+            if isinstance(ov.target, (TarballTarget, OciTarget, RegistryTarget)):
+                bfs_queue.append(_extended_override_bfs_item(dep.name, ov))
                 return
             bfs_queue.append(("url", _apply_git_override_to_url_dep(
                 UrlDep(name=dep.name, git="", ref=""), ov
@@ -4174,6 +4437,8 @@ def _process_tarball_worker(
     env: MilpaEnv,
     params: ResolveParams,
     overrides_by_name: dict[str, Override],
+    root_self_name: "str | None" = None,
+    binding_resolver: "BindingResolver | None" = None,
 ) -> tuple[_Candidate, list[object], EdgeSet]:
     """Fetch one tarball dep (worker: pure I/O, no shared-state mutation).
 
@@ -4256,15 +4521,24 @@ def _process_tarball_worker(
         dep_decl_source=DepDeclEdgeSource(env.dep_decl_store) if env.dep_decl_store is not None else None,
     )
 
-    dep_terms, requires_names, requires_predicates = edgeset_to_terms(es, overrides_by_name)
+    dep_terms, requires_names, requires_predicates = edgeset_to_terms(es, overrides_by_name, env.index, root_self_name, binding_resolver)
     src_dir = es.src_dir
     recorded_sha256 = dep.sha256 or archive_sha256 or locked_sha256
 
     # Axis A (b)/D-A2: label with the fetched package's declared version
     # (milpa.kdl → .nimble), else the sentinel (version-unknown stays as-is).
     _candidate_version, _version_source, _version_unknown = _candidate_label(ctx)
+    # RFC §4.4.1 (S5-rekey, phase 2): uniform canonical solver key — this
+    # candidate's own claim is always a root claim (M2 gate: transitive
+    # tarball deps are dropped), bound at BindingResolver.__init__ before
+    # any worker runs.
+    _svar_cand_tb = (
+        binding_resolver.canonical_for(DepKey(name=dep.name))
+        if binding_resolver is not None
+        else dep.name
+    )
     candidate = _Candidate(
-        name=dep.name,
+        name=_svar_cand_tb,
         version=_candidate_version,
         identity=result.identity,
         src_dir=src_dir,
@@ -4285,6 +4559,104 @@ def _process_tarball_worker(
 
 
 # ---------------------------------------------------------------------------
+# OCI-override dep processing (S8b, rfc-origin-as-identity.md §7 B5)
+# ---------------------------------------------------------------------------
+
+
+def _process_oci_worker(
+    dep: "_OciOverrideDep",
+    deps_dir: Path,
+    env: MilpaEnv,
+    params: ResolveParams,
+    overrides_by_name: dict[str, Override],
+    root_self_name: "str | None" = None,
+    binding_resolver: "BindingResolver | None" = None,
+) -> tuple[_Candidate, list[object], EdgeSet]:
+    """Fetch one OCI-override dep (worker: pure I/O, no shared-state mutation).
+
+    An OCI dep is reachable ONLY via an ``OciTarget`` override — there is no
+    first-class manifest ``oci=`` dep-declaration grammar (see
+    ``_OciOverrideDep``'s docstring). The fixed (registry, repository,
+    digest) triple IS the whole identity — no "version enumeration" like the
+    registry-index OCI path in ``_Provider._materialize``; exactly one
+    candidate, mirroring ``_process_local_worker``/``_process_tarball_worker``.
+
+    Returns ``(_Candidate, transitive_dep_list, edge_set)``.
+    The caller seals ``edge_set`` into the resolver-scoped ``edge_cache``.
+    """
+    prov = OciProvenance(registry=dep.registry, repository=dep.repository, digest=dep.digest)
+    dest = deps_dir / dep.name
+    try:
+        result = env.fetcher.fetch(dep.name, prov, dest=dest)
+    except MilpaError as exc:
+        raise MilpaError(
+            "FETCH-ALL-FAILED",
+            f"all candidates for {dep.name!r} failed: {exc.message}",
+            name=dep.name,
+            inner_slug=exc.slug,
+        ) from exc
+    except Exception as exc:
+        raise MilpaError(
+            "FETCH-ALL-FAILED",
+            f"all candidates for {dep.name!r} failed: {exc}",
+            name=dep.name,
+        ) from exc
+
+    # Extract edges via the appropriate source (NORMATIVE §9: transitive .deps only).
+    has_milpa_kdl = (result.path / "milpa.kdl").exists()
+    ctx = EdgeSourceCtx(
+        dep_path=result.path,
+        dep_name=dep.name,
+        dep_decl=None,   # OCI-override deps are not index-registered → no DepDecl
+        # False, matching Local/Tarball: dep_decl is already None here, so
+        # this flag's real purpose (distrust an index-sourced DepDecl for a
+        # redirected package) is moot — there is no DepDecl to distrust.
+        is_overridden=False,
+        has_milpa_kdl=has_milpa_kdl,
+        overrides_by_name=overrides_by_name,
+        version=dep.version,  # A3b: version= annotation fallback (step 4)
+    )
+    es = _resolve_edges_pure(
+        dep.name, _URL_DEP_VERSION, ctx,
+        dep_decl_source=DepDeclEdgeSource(env.dep_decl_store) if env.dep_decl_store is not None else None,
+    )
+
+    dep_terms, requires_names, requires_predicates = edgeset_to_terms(
+        es, overrides_by_name, env.index, root_self_name, binding_resolver
+    )
+    src_dir = es.src_dir
+
+    # Axis A (b)/D-A2: label with the fetched package's declared version
+    # (milpa.kdl → .nimble), else the sentinel (version-unknown stays as-is).
+    _candidate_version, _version_source, _version_unknown = _candidate_label(ctx)
+    # RFC §4.4.1 (S5-rekey, phase 2): uniform canonical solver key — this
+    # candidate's own claim is always a root claim (an OCI override is only
+    # ever reachable as a redirected root/root-catch-up claim — there is no
+    # transitive OCI-dep grammar), bound at BindingResolver.__init__ before
+    # any worker runs.
+    _svar_cand_oci = (
+        binding_resolver.canonical_for(DepKey(name=dep.name))
+        if binding_resolver is not None
+        else dep.name
+    )
+    candidate = _Candidate(
+        name=_svar_cand_oci,
+        version=_candidate_version,
+        identity=result.identity,
+        src_dir=src_dir,
+        dep_terms=dep_terms,
+        requires_names=requires_names,
+        provenance=prov,
+        requires_predicates=requires_predicates,
+        # A4: no declared version found — version-unknown.
+        version_unknown=_version_unknown,
+        declared_version_source=_version_source,
+    )
+    transitive_deps = edgeset_to_bfs_deps(es, overrides_by_name)
+    return candidate, transitive_deps, es
+
+
+# ---------------------------------------------------------------------------
 # Local dep processing
 # ---------------------------------------------------------------------------
 
@@ -4295,6 +4667,8 @@ def _process_local_worker(
     env: MilpaEnv,
     params: ResolveParams,
     overrides_by_name: dict[str, Override],
+    root_self_name: "str | None" = None,
+    binding_resolver: "BindingResolver | None" = None,
 ) -> tuple[_Candidate, list[object], EdgeSet]:
     """Fetch one local dep (worker: pure I/O, no shared-state mutation).
 
@@ -4334,14 +4708,23 @@ def _process_local_worker(
         dep_decl_source=DepDeclEdgeSource(env.dep_decl_store) if env.dep_decl_store is not None else None,
     )
 
-    dep_terms, requires_names, requires_predicates = edgeset_to_terms(es, overrides_by_name)
+    dep_terms, requires_names, requires_predicates = edgeset_to_terms(es, overrides_by_name, env.index, root_self_name, binding_resolver)
     src_dir = es.src_dir
 
     # Axis A (b)/D-A2: label with the fetched package's declared version
     # (milpa.kdl → .nimble), else the sentinel (version-unknown stays as-is).
     _candidate_version, _version_source, _version_unknown = _candidate_label(ctx)
+    # RFC §4.4.1 (S5-rekey, phase 2): uniform canonical solver key — this
+    # candidate's own claim is always a root claim (M2 gate: transitive
+    # local deps are dropped), bound at BindingResolver.__init__ before
+    # any worker runs.
+    _svar_cand_lo = (
+        binding_resolver.canonical_for(DepKey(name=dep.name))
+        if binding_resolver is not None
+        else dep.name
+    )
     candidate = _Candidate(
-        name=dep.name,
+        name=_svar_cand_lo,
         version=_candidate_version,
         identity=result.identity,
         src_dir=src_dir,
@@ -4358,6 +4741,139 @@ def _process_local_worker(
 
 
 # ---------------------------------------------------------------------------
+# Observed-provenance dispatch — shared by _build_graph's per-candidate
+# assembly and its S4b alias-provenance merge (single source of truth; see
+# CLAUDE.md's audit-for-duplication discipline).
+# ---------------------------------------------------------------------------
+
+
+def _observed_provenance_record_for_candidate(
+    cand: "_Candidate",
+) -> "ProvenanceRecord | None":
+    """Map a ``_Candidate``'s ``.provenance`` to its OBSERVED lockfile record.
+
+    Used both for a candidate's OWN entry in ``_build_graph`` and — RFC
+    origin-as-identity §3.3/§4.5 (S4b) — for each alias folded into a
+    canonical dep by the post-solve content-hash collapse: a cross-origin
+    merge (e.g. a ``RegistrySourceId`` coordinate and a ``GitSourceId`` URL
+    that fetch byte-identical trees) must carry BOTH origins' observed
+    provenance forward, never just the survivor's.
+    """
+    prov = cand.provenance
+    if isinstance(prov, GitProvenance):
+        return GitProvenanceRecord(
+            url=prov.url,
+            ref=prov.ref,
+            commit_sha=prov.commit_sha,
+            # R1-04: wire submodule_shas from _Candidate into the lockfile record.
+            submodule_shas=cand.submodule_shas,
+            origin="observed",
+        )
+    if isinstance(prov, LocalProvenance):
+        # Dead branch: _process_local_worker always wraps local deps in
+        # _LocalDepProvenance (the declared relative path) before storing
+        # them in _Candidate.provenance, so a raw LocalProvenance (which
+        # carries the ABSOLUTE resolved path) is never stored here.
+        # If this fires, the caller wired a LocalProvenance directly into
+        # _Candidate — that would silently write an absolute path to the
+        # lockfile, violating lockfile-schema §4.3.  Raise hard.
+        raise AssertionError(
+            f"_build_graph: _Candidate for {cand.name!r} carries a raw "
+            f"LocalProvenance (absolute path={prov.path!r}); "
+            f"local deps must use _LocalDepProvenance so the declared "
+            f"relative path is written to the lockfile (§4.3)."
+        )
+    if isinstance(prov, _LocalDepProvenance):
+        # _LocalDepProvenance stores the DECLARED (relative) path — correct for lockfile.
+        return LocalProvenanceRecord(path=prov.declared_path, origin="observed")
+    if isinstance(prov, TarballProvenance):
+        return TarballProvenanceRecord(
+            url=prov.url,
+            sha256=prov.expected_sha256,
+            origin="observed",
+        )
+    if isinstance(prov, MemberProvenanceRecord):
+        # Member candidate — provenance record already typed correctly.
+        return prov
+    if isinstance(prov, OciProvenance):
+        return OciProvenanceRecord(
+            registry=prov.registry,
+            repository=prov.repository,
+            digest=prov.digest,
+            origin="observed",
+        )
+    if isinstance(prov, RootProvenanceRecord):
+        # §14.5: root-self candidate — provenance record already typed correctly.
+        return prov
+    return None
+
+
+def _version_str_for_candidate(cand: "_Candidate", version: Version) -> str:
+    """The lockfile-boundary version string for one solved candidate.
+
+    A5 (§5 NORMATIVE): a version-unknown candidate flattens to the
+    absent-version literal "0.0.0" — paired with declared_version_source=None,
+    a combination no Known case ever produces (a Known always names its
+    source). Scoped to non-registry candidates ONLY (``not cand.is_registry``):
+    a named/index dep's real version comes straight from the index and never
+    goes through declared_version_for, so it always keeps its real formatted
+    version regardless of declared_version_source (never populated for that
+    kind — out of Axis A's scope). Shared by the canonical dep's own
+    assembly and (S4b) an aliased-away candidate's own entry-trust check.
+    """
+    return (
+        "0.0.0"
+        if (not cand.is_registry and cand.declared_version_source is None)
+        else format_version_str(version)
+    )
+
+
+def _run_entry_trust_gate(
+    cand: "_Candidate",
+    bare_name: str,
+    version_str: str,
+    entry_trust: "EntryTrustConfig | None",
+) -> None:
+    """Evaluate + enforce the entry-trust gate for one registry candidate.
+
+    P3a (RFC per-entry-attestation.md §3, §5): post-solve, per selected
+    registry-resolved dep. A ``strict``-policy failure raises and aborts
+    graph construction (RFC §3: "a failing selected version is a hard, late
+    resolve failure with no automatic fallback").
+
+    Shared by the canonical dep's own gate check and — RFC origin-as-
+    identity.md §3.3/§4.5 (S4b) — an aliased-away registry candidate's: a
+    cross-origin dedup collapse must never let a package skip its OWN
+    attestation obligation merely because a non-registry (or differently-
+    attested) peer happened to win the BFS canonical tie-break. No-op when
+    ``entry_trust`` is ``None`` or the candidate isn't registry-resolved.
+    """
+    if entry_trust is None or not cand.is_registry:
+        return
+    from milpa.entry_trust import enforce_entry_trust, evaluate_entry_attestation
+
+    _gate_result, _gate_cause = evaluate_entry_attestation(
+        attestation=cand.attestation,
+        content_hash=cand.identity or "",
+        namespace=cand.registry_namespace,
+        name=bare_name,
+        version=version_str,
+        verifier=entry_trust.verifier,
+        bundle_store=entry_trust.bundle_store,
+        trust_bundle=entry_trust.trust_bundle,
+        expected_vendor_signer=entry_trust.expected_vendor_signer,
+    )
+    enforce_entry_trust(
+        _gate_result,
+        entry_trust.policy,
+        namespace=cand.registry_namespace,
+        name=bare_name,
+        version=version_str,
+        cause=_gate_cause,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Phase B: content-hash dedup/alias
 # ---------------------------------------------------------------------------
 
@@ -4367,41 +4883,67 @@ def _dedup_candidates(
     deps_dir: Path,
     discovery_order: list[str],
     overrides_by_name: dict[str, Override],
+    solution: dict[str, Version],
 ) -> dict[str, str]:
-    """Collapse eagerly-fetched candidates that share a content identity.
+    """Collapse solved candidates that share a content identity.
 
     Returns ``aliases_map``: a dict mapping non-canonical name → canonical name.
     Empty when no dedup occurred.
 
-    Algorithm (Phase B, spec/resolver-semantics.md Phase B):
-    1. Group all non-root candidates by their content identity (``identity`` field).
+    RFC origin-as-identity.md §3.3/§4.5 (S4b — cross-origin reconciliation of
+    Phase B). This pass runs **after** ``solve_with_cert`` returns, over the
+    solver's FINAL picks (``solution``) only — never the full enumerated
+    stub/version space. That is what lets a *named* (registry-resolved) dep
+    participate: a named dep is a lazy stub until the solver actually asks for
+    its dependencies (``_Provider._materialize``), which happens for every
+    package PubGrub includes in ``solution`` before it can be included. By the
+    time this pass runs, every solved candidate — named or eager (git/tarball/
+    local) — carries a real, VERIFIED fetched-bytes ``identity`` (never the
+    unverified index-declared claim). This is exactly what §3.3's merge-on-
+    proof bar requires: two DISTINCT source-ids (e.g. a ``RegistrySourceId``
+    coordinate and a ``GitSourceId`` URL) that fetch byte-identical trees
+    collapse to one canonical dep + one ``_deps/<slot>/`` view — milpa's edge
+    over Cargo, realized here, at the solver's own boundary.
+
+    Algorithm (Phase B, spec/resolver-semantics.md Phase B, extended by S4b):
+    1. Group every solved (name, version) pair by content identity (``identity``).
     2. For each group of size ≥ 2: pick the canonical member as the one with the
        smallest index in ``discovery_order`` (BFS-insertion order, NOT lex).
-    3. For non-canonical members: remove from provider._candidates and remove
-       their ``_deps/<name>`` dir (B-nimcfg will later replace this with the
-       proper atomic alias-symlink view).
-    4. Rewrite all surviving candidates' ``dep_terms[i].package`` and
+    3. Invariant guard (requires-equality): for each dedup group, re-derive
+       each member's requires from its sealed edge_cache entry and assert they
+       are equal after alias-rewriting (identical content ⇒ identical tree ⇒
+       identical requires; any mismatch is a bug, not a user error — raises
+       ``MILPA_INTERNAL``, never silently picks one side).
+    4. Rewrite every surviving (non-aliased) solved candidate's
        ``requires_names`` entries that reference a non-canonical name to the
-       canonical name.
-    5. Invariant guard (requires-equality): for each dedup group, re-derive
-       each member's requires from its fetched tree and assert they are equal
-       after alias-rewriting (identical content ⇒ identical tree ⇒ identical
-       requires; any mismatch is a bug, not a user error).
+       canonical name (so the lockfile's ``requires`` list never names a
+       collapsed-away label). ``dep_terms`` is NOT rewritten here — PubGrub
+       has already run; nothing reads ``dep_terms`` after ``solve_with_cert``
+       returns.
 
-    Named candidates (stubs, not fetched yet) are NOT deduped — they are
-    materialized lazily by the solver after this pass.
+    ``_build_graph`` uses ``aliases_map`` two ways: (a) it skips building a
+    separate ``ResolvedDep`` for any non-canonical name (folded into its
+    canonical peer), and (b) it appends each alias's OWN observed provenance
+    to the canonical dep's ``provenances`` list — a cross-origin collapse
+    keeps BOTH origins' full audit trail, never just the survivor's.
     """
-    candidates = provider._candidates  # type: ignore[attr-defined]  # dict[str, dict[Version, _Candidate]]
-
-    # Step 1: group by identity.
+    # Step 1: materialize (if needed — a named stub not yet queried by the
+    # solver still can't happen here, since PubGrub must call dependencies()
+    # for everything it puts in `solution`) every solved candidate and group
+    # by identity.
     by_identity: dict[str, list[str]] = {}
-    for name, versions in candidates.items():
+    solved_candidates: dict[str, _Candidate] = {}
+    for name, version in solution.items():
         if name == "__root__":
             continue
-        for c in versions.values():
-            if not c.identity:
-                continue
-            by_identity.setdefault(c.identity, []).append(name)
+        try:
+            c = provider.get(name, version)
+        except KeyError:
+            continue
+        solved_candidates[name] = c
+        if not c.identity:
+            continue
+        by_identity.setdefault(c.identity, []).append(name)
 
     aliases_map: dict[str, str] = {}  # non-canonical → canonical
 
@@ -4414,21 +4956,26 @@ def _dedup_candidates(
             continue
 
         # Step 2: pick canonical = group member with smallest discovery_order index.
-        # Names NOT in discovery_order get _LARGE (should not happen for non-root
-        # URL/tarball/local deps, but guard defensively).
+        # Names NOT in discovery_order get _LARGE (should not happen — every
+        # BFS/root/transitive admission site records its solver_var into
+        # discovery_order, including the mid-solve named-transitive callback).
         canonical = min(group, key=lambda n: discovery_index.get(n, _LARGE))
 
         non_canonicals = [n for n in group if n != canonical]
 
-        # Step 5: invariant guard — re-derive requires from the sealed edge_cache.
+        # Step 3: invariant guard — re-derive requires from the sealed edge_cache.
         # Identical content ⇒ identical tree ⇒ identical requires. Any mismatch
         # is a bug, not a user error → MILPA-INTERNAL.
-        # S2b: use provider._edge_cache instead of re-parsing the fetched tree —
-        # the edge_cache is sealed by the main thread after each worker returns and
-        # is already flag-filtered by _manifest_to_edgeset.
+        # RFC origin-as-identity §4.5 (S4): edge_cache is keyed by
+        # (source_id, version) — translate member_name through the SAME
+        # BindingResolver the seal step used, and use THIS member's own solved
+        # version (a named dep's real version, not the eager-dep sentinel —
+        # ``solution[member_name]`` is correct uniformly for both kinds).
         all_requires: list[frozenset[str]] = []
         for member_name in group:
-            cached_es = provider._edge_cache.get((member_name, _URL_DEP_VERSION))  # type: ignore[attr-defined]
+            _member_ver = solution[member_name]
+            _member_sid = _source_id_for_edge_cache(provider._binding_resolver, member_name)  # type: ignore[attr-defined]
+            cached_es = provider._edge_cache.get((_member_sid, _member_ver))  # type: ignore[attr-defined]
             raw_deps = edgeset_to_bfs_deps(cached_es, overrides_by_name) if cached_es is not None else []
             # Canonicalize dep names through the alias map (partially built so far
             # — for same-group members: no alias yet; across-group: alias may exist).
@@ -4454,38 +5001,19 @@ def _dedup_candidates(
                     group=group,
                 )
 
-        # Step 3: remove non-canonical candidates from the provider.
-        # NOTE: _deps/<other> dir removal is intentionally OMITTED here —
-        # rebuild_deps_view (B-nimcfg SSOT) owns _deps/ contents and will
-        # remove stale non-canonical dirs and create alias symlinks atomically
-        # after the graph is assembled. The stopgap inline removal is gone.
         for other in non_canonicals:
-            candidates.pop(other, None)
             aliases_map[other] = canonical
 
     if not aliases_map:
         return aliases_map
 
-    # Step 4: rewrite dep_terms and requires_names in all surviving candidates.
-    for versions in candidates.values():
-        for c in versions.values():
-            # Rewrite requires_names (parallel to dep_terms).
-            c.requires_names = [
-                aliases_map.get(r, r) for r in c.requires_names
-            ]
-            # Rewrite solver dep_terms (frozen Terms — create new instances).
-            from milpa.solver import Term as _Term
-            new_dep_terms = []
-            for term in c.dep_terms:
-                can = aliases_map.get(term.package)
-                if can is not None:
-                    # Preserve positive/negative polarity.
-                    new_dep_terms.append(
-                        _Term(package=can, positive=term.positive, versions=term.versions)
-                    )
-                else:
-                    new_dep_terms.append(term)
-            c.dep_terms = new_dep_terms
+    # Step 4: rewrite requires_names in all surviving (non-aliased) solved
+    # candidates so a downstream requirer of a collapsed label points at the
+    # canonical name in the lockfile's ``requires`` list.
+    for name, c in solved_candidates.items():
+        if name in aliases_map:
+            continue
+        c.requires_names = [aliases_map.get(r, r) for r in c.requires_names]
 
     return aliases_map
 
@@ -4612,6 +5140,101 @@ def rebuild_deps_view(
 # ---------------------------------------------------------------------------
 
 
+def _depkey_for_solved_name(name: str, binding_resolver: "BindingResolver | None") -> DepKey:
+    """Decode a PubGrub solver-variable string back into a ``DepKey``.
+
+    S5-rekey (RFC origin-as-identity §4.4): *name* is a BOUND source-id's
+    canonical form for a named/registry dep (``binding_resolver.
+    depkey_for_canonical``), or the plain ``dep.name`` for a git/tarball/
+    local/member dep (those never route through ``DepKey``/``canonical_for``
+    — their term key stays ``dep.name``, see ``_dep_to_term``/root-term
+    construction). ``depkey_for_canonical`` returns ``None`` for the latter
+    case (never registered as a canonical string) — the SAME fallback
+    ``DepKey.from_solver_var`` gave uniformly before S5-rekey. ``binding_resolver
+    is None`` only in the (currently unreachable via any production caller)
+    default-param case; falls back identically.
+    """
+    if binding_resolver is not None:
+        dk = binding_resolver.depkey_for_canonical(name)
+        if dk is not None:
+            return dk
+    return DepKey.from_solver_var(name)
+
+
+def _project_solve_success(
+    result: "SolveSuccess", binding_resolver: "BindingResolver"
+) -> "SolveSuccess":
+    """Project every PubGrub package string in a §5.1 success certificate
+    back to the legacy "ns::name"/bare form (S5-rekey, RFC origin-as-
+    identity §4.4).
+
+    ``certificate_to_json`` (solver.py) is a generic PubGrub serializer with
+    no knowledge of ``BindingResolver`` — deliberately decoupled from
+    resolver-specific admission concerns. The canonical solver-variable
+    string it would otherwise print for a named dep is a SOLVER-INTERNAL
+    representation (mirrors why the lockfile's ``requires`` list needs the
+    same projection, ``_build_graph``'s ``requires=`` construction) — never
+    meant to leak into the user-facing certificate. Rebuilt via
+    ``dataclasses.replace`` since every solver dataclass here is frozen.
+    """
+    import dataclasses
+    from milpa.solver import SolveSuccess as _SolveSuccess, WitnessEntry as _WitnessEntry
+
+    def _proj(pkg: str) -> str:
+        return _depkey_for_solved_name(pkg, binding_resolver).solver_var()
+
+    new_resolved = tuple((_proj(pkg), ver) for pkg, ver in result.resolved)
+    new_witness = tuple(
+        dataclasses.replace(w, package=_proj(w.package), satisfied_by=_proj(w.satisfied_by))
+        for w in result.witness
+    )
+    return dataclasses.replace(result, resolved=new_resolved, witness=new_witness)  # type: ignore[return-value]
+
+
+def _project_solver_error(
+    exc: "SolverError", binding_resolver: "BindingResolver"
+) -> "SolverError":
+    """Project every PubGrub package string in a §5.2 failure certificate
+    back to the legacy "ns::name"/bare form (S5-rekey, RFC origin-as-
+    identity §4.4) — the failure-path counterpart to
+    ``_project_solve_success``.
+
+    Rebuilds ``exc.chain``/``exc._all_incompats`` (both frozen dataclasses,
+    walked bottom-up via ``dataclasses.replace``) and constructs a NEW
+    ``SolverError`` from them — ``SolverError.__init__`` regenerates its
+    prose ``message`` from the (now-projected) chain automatically.
+    ``cause_tag``/``consequent_description`` are left untouched: they are
+    internal diagnostics, not part of the §5.2 refutation's ``package``/
+    ``constraint`` fields ``certificate_to_json`` actually serializes, and
+    the certificate's ``message`` field is explicitly NOT byte-normative
+    (``certificate_to_json``'s own docstring).
+    """
+    import dataclasses
+    from milpa.solver import SolverError as _SolverError, Term as _Term
+
+    def _proj(pkg: str) -> str:
+        return _depkey_for_solved_name(pkg, binding_resolver).solver_var()
+
+    def _proj_term(t: "_Term") -> "_Term":
+        return dataclasses.replace(t, package=_proj(t.package))
+
+    new_steps = tuple(
+        dataclasses.replace(
+            step,
+            consequent_package=_proj(step.consequent_package),
+            antecedents=tuple(_proj_term(t) for t in step.antecedents),
+            antecedent_constraints=tuple(_proj_term(t) for t in step.antecedent_constraints),
+        )
+        for step in exc.chain.steps
+    )
+    new_chain = dataclasses.replace(exc.chain, steps=new_steps)
+    new_incompats = [
+        dataclasses.replace(ic, terms=tuple(_proj_term(t) for t in ic.terms))
+        for ic in exc._all_incompats
+    ]
+    return _SolverError(new_chain, new_incompats)
+
+
 def _build_graph(
     solution: dict[str, Version],
     provider: _Provider,
@@ -4619,6 +5242,7 @@ def _build_graph(
     strategy: Strategy,
     aliases_map: dict[str, str] | None = None,
     entry_trust: "EntryTrustConfig | None" = None,
+    binding_resolver: "BindingResolver | None" = None,
 ) -> ResolvedGraph:
     """Map ``solve()``'s solution dict to a ``ResolvedGraph``.
 
@@ -4633,17 +5257,17 @@ def _build_graph(
     iterates exactly the selected set, never a rejected/enumerated candidate.
     A ``strict``-policy failure raises and aborts graph construction (RFC §3:
     "a failing selected version is a hard, late resolve failure with no
-    automatic fallback").
+    automatic fallback"). RFC origin-as-identity §3.3/§4.5 (S4b): the gate
+    also runs for a registry candidate that S4b's dedup folded into a
+    canonical peer (see the alias branch below) — merging away a dep's own
+    ResolvedDep must never merge away its attestation obligation too.
     """
     GP = GitProvenance
-    LP = LocalProvenance
-    TP = TarballProvenance
     MP = MemberProvenanceRecord
-    OP = OciProvenance
-    RP = RootProvenanceRecord
 
     # Build reverse map: canonical → sorted list of aliases.
     canonical_to_aliases: dict[str, list[str]] = {}
+    _aliases_map: dict[str, str] = aliases_map or {}
     if aliases_map:
         for alias, canonical in aliases_map.items():
             canonical_to_aliases.setdefault(canonical, []).append(alias)
@@ -4658,70 +5282,43 @@ def _build_graph(
             cand = provider.get(name, version)
         except KeyError:
             continue
-        # C1 (rfc-resolver-correctness.md): ``name`` here is a solver_var string
-        # (e.g. ``"ns1::bar"`` for qualified deps).  Decompose it into bare name +
-        # namespace for ``ResolvedDep`` so the lockfile receives the bare name as
-        # the dep arg and namespace as a separate child node (never ``::`` on disk).
-        _cand_dk = DepKey.from_solver_var(name)
+
+        # RFC origin-as-identity §3.3/§4.5 (S4b): a solution entry that the
+        # post-solve content-hash collapse folded into a canonical peer never
+        # gets its own ResolvedDep (its provenance is merged into the
+        # canonical's below, from the canonical branch) — but if it was
+        # itself registry-resolved, ITS OWN attestation must still be
+        # checked here, before the skip, so a cross-origin collapse can
+        # never be used to bypass strict entry-trust policy merely because
+        # a differently-sourced peer happened to win the BFS canonical
+        # tie-break.
+        if name in _aliases_map:
+            _alias_dk = _depkey_for_solved_name(name, binding_resolver)
+            _run_entry_trust_gate(
+                cand,
+                _alias_dk.name,
+                _version_str_for_candidate(cand, version),
+                entry_trust,
+            )
+            continue
+
+        # C1 (rfc-resolver-correctness.md): ``name`` here is the PubGrub solver
+        # variable — S5-rekey (RFC origin-as-identity §4.4): for a named/
+        # registry dep this is now the BOUND source-id's canonical form, not a
+        # ``"ns1::bar"`` string, so it must be decoded via
+        # ``binding_resolver.depkey_for_canonical`` (falling back to
+        # ``DepKey.from_solver_var`` for the eager git/tarball/local/member
+        # case, whose term key is still the plain ``dep.name``, never
+        # canonicalized). Decompose into bare name + namespace for
+        # ``ResolvedDep`` so the lockfile receives the bare name as the dep
+        # arg and namespace as a separate child node (never the canonical
+        # string, and never ``::``, on disk).
+        _cand_dk = _depkey_for_solved_name(name, binding_resolver)
         _bare_name = _cand_dk.name        # e.g. "bar"
         _namespace = _cand_dk.namespace   # e.g. "ns1" or None
 
         # Map fetcher provenance → lockfile ProvenanceRecord (observed).
-        observed_record: (
-            GitProvenanceRecord
-            | LocalProvenanceRecord
-            | TarballProvenanceRecord
-            | MemberProvenanceRecord
-            | OciProvenanceRecord
-            | RootProvenanceRecord
-            | None
-        ) = None
-        if isinstance(cand.provenance, GP):
-            observed_record = GitProvenanceRecord(
-                url=cand.provenance.url,
-                ref=cand.provenance.ref,
-                commit_sha=cand.provenance.commit_sha,
-                # R1-04: wire submodule_shas from _Candidate into the lockfile record.
-                submodule_shas=cand.submodule_shas,
-                origin="observed",
-            )
-        elif isinstance(cand.provenance, LP):
-            # Dead branch: _process_local_worker always wraps local deps in
-            # _LocalDepProvenance (the declared relative path) before storing
-            # them in _Candidate.provenance, so a raw LocalProvenance (which
-            # carries the ABSOLUTE resolved path) is never stored here.
-            # If this fires, the caller wired a LocalProvenance directly into
-            # _Candidate — that would silently write an absolute path to the
-            # lockfile, violating lockfile-schema §4.3.  Raise hard.
-            raise AssertionError(
-                f"_build_graph: _Candidate for {cand.name!r} carries a raw "
-                f"LocalProvenance (absolute path={cand.provenance.path!r}); "
-                f"local deps must use _LocalDepProvenance so the declared "
-                f"relative path is written to the lockfile (§4.3)."
-            )
-        elif isinstance(cand.provenance, _LocalDepProvenance):
-            # _LocalDepProvenance stores the DECLARED (relative) path — correct for lockfile.
-            observed_record = LocalProvenanceRecord(path=cand.provenance.declared_path, origin="observed")
-        elif isinstance(cand.provenance, TP):
-            observed_record = TarballProvenanceRecord(
-                url=cand.provenance.url,
-                sha256=cand.provenance.expected_sha256,
-                origin="observed",
-            )
-        elif isinstance(cand.provenance, MP):
-            # Member candidate — provenance record already typed correctly.
-            observed_record = cand.provenance
-        elif isinstance(cand.provenance, OP):
-            observed_record = OciProvenanceRecord(
-                registry=cand.provenance.registry,
-                repository=cand.provenance.repository,
-                digest=cand.provenance.digest,
-                origin="observed",
-            )
-        elif isinstance(cand.provenance, RP):
-            # §14.5: root-self candidate — provenance record already typed
-            # correctly (mirrors the member branch above).
-            observed_record = cand.provenance
+        observed_record = _observed_provenance_record_for_candidate(cand)
 
         # D-lifecycle: build declared provenance records for each mirror URL that
         # was NOT the observed candidate. Declared = unverified (no commit_sha,
@@ -4744,49 +5341,34 @@ def _build_graph(
         if observed_record is not None:
             _all_provs.append(observed_record)
         _all_provs.extend(declared_records)
+
+        # RFC origin-as-identity §3.3/§4.5 (S4b): a cross-origin collapse
+        # keeps BOTH origins' full audit trail — append each folded alias's
+        # OWN observed provenance (never just the survivor's). Each alias is
+        # itself a solved candidate (it was materialized to compute its
+        # identity in _dedup_candidates), so its own version is exactly
+        # ``solution[alias]``.
+        for _alias_name in canonical_to_aliases.get(name, []):
+            _alias_ver = solution.get(_alias_name)
+            if _alias_ver is None:
+                continue
+            try:
+                _alias_cand = provider.get(_alias_name, _alias_ver)
+            except KeyError:
+                continue
+            _alias_prov = _observed_provenance_record_for_candidate(_alias_cand)
+            if _alias_prov is not None:
+                _all_provs.append(_alias_prov)
+
         all_provenances: tuple[ProvenanceRecord, ...] = tuple(_all_provs)
 
-        # A5 (§5 NORMATIVE): a version-unknown candidate flattens to the
-        # absent-version literal "0.0.0" at the lockfile boundary — paired
-        # with declared_version_source=None, a combination no Known case
-        # ever produces (a Known always names its source). Scoped to
-        # non-registry candidates ONLY (`not cand.is_registry`): a named/
-        # index dep's real version comes straight from the index and never
-        # goes through declared_version_for, so it always keeps its real
-        # formatted version regardless of declared_version_source (which is
-        # simply never populated for that kind — out of Axis A's scope).
-        version_str = (
-            "0.0.0"
-            if (not cand.is_registry and cand.declared_version_source is None)
-            else format_version_str(version)
-        )
+        version_str = _version_str_for_candidate(cand, version)
 
         # P3a (RFC per-entry-attestation.md §3, §5): the entry-trust gate —
         # post-solve, per selected registry-resolved dep. Runs BEFORE the
         # ResolvedDep is assembled so a strict-policy failure aborts graph
         # construction outright (no partially-built graph escapes).
-        if entry_trust is not None and cand.is_registry:
-            from milpa.entry_trust import enforce_entry_trust, evaluate_entry_attestation
-
-            _gate_result, _gate_cause = evaluate_entry_attestation(
-                attestation=cand.attestation,
-                content_hash=cand.identity or "",
-                namespace=cand.registry_namespace,
-                name=_bare_name,
-                version=version_str,
-                verifier=entry_trust.verifier,
-                bundle_store=entry_trust.bundle_store,
-                trust_bundle=entry_trust.trust_bundle,
-                expected_vendor_signer=entry_trust.expected_vendor_signer,
-            )
-            enforce_entry_trust(
-                _gate_result,
-                entry_trust.policy,
-                namespace=cand.registry_namespace,
-                name=_bare_name,
-                version=version_str,
-                cause=_gate_cause,
-            )
+        _run_entry_trust_gate(cand, _bare_name, version_str, entry_trust)
 
         # S4: build cond_requires from the candidate's requires_predicates dict.
         # requires_predicates maps name → list[predicate_tuple]; a dep in ≥2
@@ -4795,8 +5377,12 @@ def _build_graph(
         # key uses the same escaping as the emitter — cannot drift (C1 fix).
         from milpa.lockfile import CondRequire as _CondRequire, cond_require_sort_key
 
+        # S5-rekey (RFC origin-as-identity §4.4): requires_predicates is
+        # keyed by the PubGrub solver-variable string — project back to the
+        # legacy "ns::name"/bare form, same as `requires=` above (lockfile.py
+        # applies no separate conversion to CondRequire.name).
         _raw_cond: list[_CondRequire] = [
-            _CondRequire(name=rname, predicates=preds)
+            _CondRequire(name=_depkey_for_solved_name(rname, binding_resolver).solver_var(), predicates=preds)
             for rname, pred_list in cand.requires_predicates.items()
             for preds in pred_list
             if preds
@@ -4842,7 +5428,18 @@ def _build_graph(
             identity=cand.identity,
             version=version_str,
             src_dir=cand.src_dir,
-            requires=tuple(cand.requires_names),
+            # S5-rekey (RFC origin-as-identity §4.4): cand.requires_names holds
+            # PubGrub solver-variable strings — a BOUND source-id's canonical
+            # form for a named dep, never lockfile-safe on its own (mirrors
+            # why `name=` above needs `_bare_name`, not the raw solver var).
+            # Project each entry back to the legacy "ns::name" form via the
+            # same canonical-or-legacy decode, so lockfile.py's SOLE
+            # ``_req_name_to_lockfile`` conversion site (solver_var "ns::name"
+            # -> lockfile "ns/name") keeps working unchanged.
+            requires=tuple(
+                _depkey_for_solved_name(r, binding_resolver).solver_var()
+                for r in cand.requires_names
+            ),
             # D-lifecycle: full provenances tuple (observed + declared mirrors).
             provenances=all_provenances,
             # S5: unified per-dep active flag set, lex-sorted (RFC #23 §4).
@@ -4854,18 +5451,43 @@ def _build_graph(
             cond_requires=_cond_requires,
             # Phase B: aliases — lex-sorted list of non-canonical names that share
             # this dep's content identity.  Empty for non-deduped deps.
-            aliases=tuple(canonical_to_aliases.get(name, [])),
+            # RFC §4.4.1 (S5-rekey): canonical_to_aliases holds RAW PubGrub
+            # solver-variable strings (canonical for every kind, uniformly)
+            # — project each back to the bare name (matching ``name=``
+            # above; the lockfile's ``aliases`` field, unlike ``requires=``,
+            # has no separate "::"->"/" conversion step in lockfile.py, so
+            # it has only ever carried bare names) before it reaches the
+            # lockfile; re-sort after projection since canonical-string
+            # lexicographic order need not match bare-name lexicographic
+            # order.
+            aliases=tuple(sorted(
+                _depkey_for_solved_name(a, binding_resolver).name
+                for a in canonical_to_aliases.get(name, [])
+            )),
             # C1: carry namespace for qualified named deps.
             namespace=_namespace,
             # RFC per-entry-attestation.md P2: carry the attestation claim from
             # the candidate (None for non-named deps and unattested entries).
             attestation=cand.attestation,
-            # P3a: the entry's REAL index namespace, for milpa verify's
-            # offline re-verification (only meaningful alongside attestation).
-            registry_namespace=cand.registry_namespace if cand.is_registry else None,
+            # RFC origin-as-identity §4.4 (B2/G10 field-duplication audit):
+            # ``registry_namespace`` is DELETED from ResolvedDep — it
+            # duplicated ``source_id.namespace`` for a ``RegistrySourceId``.
+            # ``milpa verify``'s offline re-verification and the lockfile's
+            # ``LockAttestation.namespace`` now read ``source_id.namespace``
+            # directly (see ``_locked_from_resolved``).
             # A5: sibling source for the declared version (None for
             # version-unknown and for named/index candidates, which never
             # populate it — see the field's doc comment on _Candidate).
+            # RFC origin-as-identity §4.4 (S3a): the binding phase's own
+            # accepted SourceId for this dep's DepKey — carried onto the
+            # on-disk lockfile's structured ``source { … }`` node as of S5
+            # (§4.1/§7). ``None`` when no ``binding_resolver`` was passed
+            # (defensive; both live entry points always pass one).
+            source_id=(
+                binding_resolver.source_id_for(_cand_dk)
+                if binding_resolver is not None
+                else None
+            ),
             declared_version_source=(
                 cand.declared_version_source.value
                 if cand.declared_version_source is not None
@@ -4888,6 +5510,7 @@ def _build_member_candidate(
     overrides_by_name: dict[str, Override],
     member_versions: dict[str, Version],
     member_version_sources: dict[str, VersionSource | None],
+    binding_resolver: "BindingResolver",
 ) -> tuple[_Candidate, list[object]]:
     """Build a _Candidate for a workspace member (never fetched, cas_admissible=False).
 
@@ -4942,22 +5565,35 @@ def _build_member_candidate(
                         constraint=dep.constraint,
                         member=manifest.name,
                     )
-            dep_terms.append(Term.require(name, VersionSet.full()))
-            requires_names.append(name)
+            # RFC §4.4.1 (S5-rekey, phase 2): uniform canonical solver key —
+            # the referenced member's OWN candidate is registered under its
+            # canonical (MemberSourceId) form (below), so this auto-coerced
+            # self-term must key the SAME string. The member's own claim is
+            # already bound (member self-registration Claims, at
+            # BindingResolver construction, above).
+            _svar_coerce = binding_resolver.canonical_for(DepKey(name=name))
+            dep_terms.append(Term.require(_svar_coerce, VersionSet.full()))
+            requires_names.append(_svar_coerce)
             continue
         # Override: named dep with override → URL-like full() self-term (D-A2).
         if name in overrides_by_name:
-            dep_terms.append(Term.require(name, VersionSet.full()))
-            requires_names.append(name)
+            _svar_ov_mc = binding_resolver.canonical_for(DepKey(name=name))
+            dep_terms.append(Term.require(_svar_ov_mc, VersionSet.full()))
+            requires_names.append(_svar_ov_mc)
             continue
         # Regular dep: same logic as _dep_to_term.
-        t, r = _dep_to_term(dep, overrides_by_name)
+        t, r = _dep_to_term(dep, overrides_by_name, binding_resolver)
         if t is not None and r is not None:
             dep_terms.append(t)
             requires_names.append(r)
 
     return _Candidate(
-        name=manifest.name,
+        # RFC §4.4.1 (S5-rekey, phase 2): uniform canonical solver key — a
+        # member's own candidate is keyed by its bound MemberSourceId's
+        # canonical form, matching any consumer's reference to this SAME
+        # member name (auto-coerce above, a MemberTarget override target, or
+        # a transitive git/named require that turns out to BE this member).
+        name=binding_resolver.canonical_for(DepKey(name=manifest.name)),
         version=member_versions[manifest.name],
         identity=identity,
         src_dir=manifest.src_dir or "",
@@ -5122,9 +5758,9 @@ def resolve_workspace(
     # populated collection + one projection.
     #
     # R6: namespace-aware set — used ONLY by is_root_direct (the
-    # lowest-direct precompute), never the provenance gate. Member names and
-    # overrides have no namespace concept; each member dep's ACTUAL namespace
-    # is threaded through the same way as the single-package resolve() path.
+    # lowest-direct precompute). Member names and overrides have no
+    # namespace concept; each member dep's ACTUAL namespace is threaded
+    # through the same way as the single-package resolve() path.
     root_direct_keys: set[DepKey] = {DepKey(name=n) for n in members_by_name} | {
         DepKey(name=n) for n in overrides_by_name
     }
@@ -5142,25 +5778,20 @@ def resolve_workspace(
     # deps/dev-deps names — the SAME sources — so projecting
     # `root_direct_keys` down to just its `.name` field yields the exact
     # same set of bare names.
+    #
+    # RFC origin-as-identity §6 "Kept": see resolve()'s identical comment —
+    # ``root_authority`` survives post-S3b for ``_version_unknown_constrained_err``
+    # and the registry-shadow tripwire gate only; source admission/arbitration
+    # (including a MemberTarget override suppressing a transitive's stale
+    # claim on the same name — the old provenance-gate pre-seed this block
+    # used to carry) is entirely ``BindingResolver``'s job below.
     root_authority: set[str] = {k.name for k in root_direct_keys}
 
-    provenance_gate: dict[str, tuple[tuple[object, ...], int]] = {}
-    seen_url: set[tuple[str, str]] = set()
+    seen_url: set[tuple[str, str, str | None]] = set()
     seen_named: set[DepKey] = set()  # S5a: qualified key (namespace+name)
     seen_local: set[str] = set()
     seen_tarball: set[str] = set()
-
-    # S8b: pre-seed the provenance gate for MemberTarget overrides (root
-    # authority, TIER_ROOT).  Any transitive dep that arrives with the same
-    # name but a different provenance key (e.g. a git URL, or a `named`
-    # claim) will be suppressed by the gate because the root authority wins
-    # over every tier (§10.0).  This ensures that even if an external
-    # package declares a dep on "innerlib" as a git URL, we never fetch it when
-    # an override says { member "innerlib" }.
-    for _ov in workspace.workspace_manifest.overrides:
-        if isinstance(_ov.target, MemberTarget):
-            # Use the SSOT helper to map OverrideTarget → pkey (M9).
-            provenance_gate[_ov.name] = (_override_target_to_pkey(_ov), TIER_ROOT)
+    seen_oci: set[str] = set()  # S8b: keyed by "registry/repository@digest"
 
     # Phase B dedup: BFS-insertion discovery order (mirrors resolve()).
     # Members are pre-registered and NOT in discovery_order (they are
@@ -5175,18 +5806,62 @@ def resolve_workspace(
             ws_discovery_order.append(name)
 
     # Resolver-scoped edge memo (§4.2.1 resolve_edges clause a).
-    ws_edge_cache: dict[tuple[str, Version], EdgeSet] = {}
+    ws_edge_cache: dict[tuple[SourceId, Version], EdgeSet] = {}
+
+    # RFC origin-as-identity §4.3 (S3a): the binding phase, workspace form.
+    # Root claims are every member's OWN self-registration (MemberSourceId,
+    # conflict-free by W1-W5 name uniqueness) PLUS every member's declared
+    # deps/dev-deps, reconciled against the workspace overrides (a
+    # MemberTarget override is meaningful here — unlike the standalone
+    # resolve() path — since it redirects to an actually pre-registered
+    # member).
+    #
+    # Member auto-coerce (§11.5, mirrors ``_build_member_candidate``'s own
+    # ``name in member_versions`` check): a dep — ``MemberDep`` OR a bare
+    # ``NamedDep`` — whose name matches ANOTHER workspace member's name
+    # never makes its own claim; it resolves directly to that member's
+    # candidate (a ``full()`` self-term, handled entirely in
+    # ``_build_member_candidate``, never via BFS/binding). Excluded here so
+    # it doesn't collide with that member's own self-registration Claim
+    # above (same name, would otherwise look like a disagreeing registry
+    # claim to ``BindingResolver.__init__``).
+    #
+    # Constructed BEFORE ``_Provider`` (S4): ``_Provider._materialize`` needs
+    # ``binding_resolver.source_id_for`` to key the edge_cache by source_id
+    # rather than name (RFC §4.5) — neither construction depends on the
+    # other's output, so this is a pure reorder, not a behavior change.
+    _ws_all_member_deps: list[object] = []
+    for m in workspace.members:
+        for _wsd in list(m.manifest.deps) + list(m.manifest.dev_deps):
+            if _wsd.name in members_by_name:
+                continue
+            _ws_all_member_deps.append(_wsd)
+    binding_resolver = BindingResolver(
+        [
+            Claim(
+                name=m.manifest.name,
+                source_id=MemberSourceId(member_name=m.manifest.name),
+                is_root=True,
+                claimant="member",
+            )
+            for m in workspace.members
+        ]
+        + reconcile_root_claims(
+            _ws_all_member_deps,
+            workspace.workspace_manifest.overrides,
+            index=index,
+        )
+    )
 
     provider = _Provider(
         env=env,
         deps_dir=deps_dir,
         params=params,
         overrides_by_name=overrides_by_name,
-        root_authority=root_authority,
         root_direct_keys=root_direct_keys,
         seen_named=seen_named,
         seen_url=seen_url,
-        provenance_gate=provenance_gate,
+        binding_resolver=binding_resolver,
         edge_cache=ws_edge_cache,
         strict_attestation=_ws_is_strict,
     )
@@ -5212,6 +5887,7 @@ def resolve_workspace(
             overrides_by_name,
             member_versions,
             member_version_sources,
+            binding_resolver,
         )
         provider.add(cand)
 
@@ -5222,11 +5898,19 @@ def resolve_workspace(
     # regardless of their (real or sentinel) version label; a member has
     # exactly one candidate, so pre-committing to a version here would
     # spuriously conflict with a versioned member.
-    root_terms: list[Term] = [
-        Term.require(m.manifest.name, VersionSet.full())
+    # RFC §4.4.1 (S5-rekey, phase 2): uniform canonical solver key — must
+    # agree with _build_member_candidate's own canonical registration key
+    # (above). Each member's own MemberSourceId claim is already bound
+    # (member self-registration Claims, at BindingResolver construction).
+    _member_svars: list[str] = [
+        binding_resolver.canonical_for(DepKey(name=m.manifest.name))
         for m in workspace.members
     ]
-    root_requires: list[str] = [m.manifest.name for m in workspace.members]
+    root_terms: list[Term] = [
+        Term.require(_svar_m, VersionSet.full())
+        for _svar_m in _member_svars
+    ]
+    root_requires: list[str] = list(_member_svars)
 
     root_cand = _Candidate(
         name="__root__",
@@ -5269,7 +5953,25 @@ def resolve_workspace(
             if _ws_fd is None:
                 continue
             for _cpe in _ws_fd.enables_cross_pkg:  # CrossPkgEnable(dep, flag_requests)
-                _target = _cpe.dep
+                # S5-rekey (RFC origin-as-identity §4.4): _cpe.dep is the bare
+                # target name from the workspace-root `enables{}` block —
+                # project to whatever key the target's ALREADY-admitted
+                # candidate is actually registered under (bare for an eager
+                # git/tarball/local target, canonical for a named/registry
+                # one — the target is one of the members' own deps, already
+                # root-bound via reconcile_root_claims above, so
+                # canonical_key_for_requirement's binding_resolver-first
+                # branch always fires) so this accumulation lands under the
+                # SAME key _materialize reads.
+                from milpa.binding import canonical_key_for_requirement as _ckfr_ws_root
+                _target = _ckfr_ws_root(
+                    name=_cpe.dep,
+                    namespace=None,
+                    url=None,
+                    overrides_by_name=overrides_by_name,
+                    index=index,
+                    binding_resolver=binding_resolver,
+                )
                 # Accumulate (union) into provider._flag_requests_by_name.
                 existing = provider._flag_requests_by_name.get(_target, ())
                 provider._flag_requests_by_name[_target] = existing + _cpe.flag_requests
@@ -5299,8 +6001,15 @@ def resolve_workspace(
                 ov = overrides_by_name[name]
                 # S8a: LocalTarget override → route to local BFS slot.
                 if isinstance(ov.target, LocalTarget):
+                    # RFC §4.4.1 (S5-rekey, phase 2): uniform canonical
+                    # solver key — matches what _build_member_candidate's
+                    # _dep_to_term call independently computes for this SAME
+                    # dep (this loop only seeds the BFS fetch queue/
+                    # discovery bookkeeping; _dep_to_term builds the actual
+                    # Term). Root claim already bound.
+                    _svar_wslt = binding_resolver.canonical_for(DepKey(name=name))
                     bfs_queue.append(("local", LocalDep(name=name, path=ov.target.path, version=ov.version)))
-                    _ws_record_discovery(name)  # Phase B: overridden dep in seed order
+                    _ws_record_discovery(_svar_wslt)  # Phase B: overridden dep in seed order
                 elif isinstance(ov.target, MemberTarget):
                     # S8b: MemberTarget override — member already pre-registered.
                     # No external queue entry needed; provenance gate was pre-seeded
@@ -5308,35 +6017,70 @@ def resolve_workspace(
                     # is not an external dep and is never in ws_discovery_order.
                     pass
                 else:
+                    # S8b: GitTarget → UrlDep; LocalTarget already handled
+                    # above; TarballTarget/OciTarget/RegistryTarget → their
+                    # own BFS slot (mirrors _extended_override_bfs_item's
+                    # dispatch, but this call site already needs
+                    # _apply_override's result for the UrlDep/LocalDep case
+                    # too, so the full dispatch is inlined here rather than
+                    # calling both helpers).
                     effective_dep = _apply_override(name, ov)
+                    _svar_wsov = binding_resolver.canonical_for(DepKey(name=name))
                     if isinstance(effective_dep, UrlDep):
                         bfs_queue.append(("url", effective_dep))
+                    elif isinstance(effective_dep, TarballDep):
+                        bfs_queue.append(("tarball", effective_dep))
+                    elif isinstance(effective_dep, _OciOverrideDep):
+                        bfs_queue.append(("oci", effective_dep))
+                    elif isinstance(effective_dep, NamedDep):
+                        bfs_queue.append((
+                            "named",
+                            DepKey(name=effective_dep.name, namespace=effective_dep.namespace),
+                            effective_dep.constraint,
+                        ))
                     else:
-                        bfs_queue.append(("local", effective_dep))
-                    _ws_record_discovery(name)  # Phase B: overridden dep in seed order
+                        # Unreachable: LocalTarget/MemberTarget are already
+                        # handled above; every other kind is enumerated
+                        # explicitly above.
+                        raise AssertionError(
+                            f"unexpected _apply_override result for {name!r}: "
+                            f"{type(effective_dep)!r}"
+                        )
+                    _ws_record_discovery(_svar_wsov)  # Phase B: overridden dep in seed order
                 continue
             # Queue external deps.
             if isinstance(dep, UrlDep):
+                # RFC §4.4.1 (S5-rekey, phase 2): uniform canonical solver key.
+                _svar_wsu = binding_resolver.canonical_for(DepKey(name=name))
                 bfs_queue.append(("url", dep))
-                _ws_record_discovery(name)  # Phase B: URL dep in seed order
+                _ws_record_discovery(_svar_wsu)  # Phase B: URL dep in seed order
             elif isinstance(dep, NamedDep):
                 if name == "nim":
                     continue
                 # S5b: carry namespace from manifest dep.
                 _dk_ws = DepKey(name=name, namespace=dep.namespace)
+                # S5-rekey (RFC origin-as-identity §4.4): solver variable =
+                # BOUND source-id canonical form. This member dep's root
+                # claim is already bound (reconcile_root_claims, at
+                # BindingResolver construction, above).
+                _svar_ws = binding_resolver.canonical_for(_dk_ws)
                 bfs_queue.append(("named", _dk_ws, dep.constraint))
-                _ws_record_discovery(_dk_ws.solver_var())  # Phase B: named dep in seed order
+                _ws_record_discovery(_svar_ws)  # Phase B: named dep in seed order
                 # S11 (RFC #23 §3.8): accumulate flag_requests from ALL members
                 # (workspace-wide union).  Keyed by solver_var to agree with _materialize.
                 if dep.flag_requests:
-                    existing_named = provider._flag_requests_by_name.get(_dk_ws.solver_var(), ())
-                    provider._flag_requests_by_name[_dk_ws.solver_var()] = existing_named + dep.flag_requests
+                    existing_named = provider._flag_requests_by_name.get(_svar_ws, ())
+                    provider._flag_requests_by_name[_svar_ws] = existing_named + dep.flag_requests
             elif isinstance(dep, TarballDep):
+                # RFC §4.4.1 (S5-rekey, phase 2): uniform canonical solver key.
+                _svar_wstb = binding_resolver.canonical_for(DepKey(name=name))
                 bfs_queue.append(("tarball", dep))
-                _ws_record_discovery(name)  # Phase B: tarball dep in seed order
+                _ws_record_discovery(_svar_wstb)  # Phase B: tarball dep in seed order
             elif isinstance(dep, LocalDep):
+                # RFC §4.4.1 (S5-rekey, phase 2): uniform canonical solver key.
+                _svar_wslo = binding_resolver.canonical_for(DepKey(name=name))
                 bfs_queue.append(("local", dep))
-                _ws_record_discovery(name)  # Phase B: local dep in seed order
+                _ws_record_discovery(_svar_wslo)  # Phase B: local dep in seed order
 
     # ------------------------------------------------------------------
     # S4a (workspace): pre-seed member dep_active_flags and build the
@@ -5372,7 +6116,12 @@ def resolve_workspace(
         if not _seed_active:
             continue
         # Get the member's identity from its candidate.
-        _seed_cand_map = provider._candidates.get(_seed_manifest.name, {})
+        # RFC §4.4.1 (S5-rekey, phase 2): provider._candidates is keyed by
+        # the UNIFORM canonical solver variable (a member's own
+        # MemberSourceId canonical form, matching _build_member_candidate's
+        # registration) — never the bare manifest name.
+        _seed_svar = binding_resolver.canonical_for(DepKey(name=_seed_manifest.name))
+        _seed_cand_map = provider._candidates.get(_seed_svar, {})
         _seed_identity: str | None = None
         for _sc in _seed_cand_map.values():
             if _sc.identity:
@@ -5388,8 +6137,11 @@ def resolve_workspace(
                 _seed_merged[_sfn] = set()
             _seed_merged[_sfn].add(ActivationSource.DEFAULT)
         provider.dep_active_flags[_seed_identity] = _seed_merged
-        # Include this member's manifest in the fixpoint's dep_manifests.
-        _member_manifests_for_fixpoint[_seed_manifest.name] = _seed_manifest
+        # Include this member's manifest in the fixpoint's dep_manifests,
+        # keyed by the SAME canonical solver variable so _s4a_run_fixpoint's
+        # own identity_for_dep re-lookup (provider._candidates.get(dep_name_k))
+        # finds this SAME candidate on each fixpoint iteration.
+        _member_manifests_for_fixpoint[_seed_svar] = _seed_manifest
 
     # ------------------------------------------------------------------
     # BFS materialisation loop (parallel) — shared helper, see resolve()
@@ -5404,6 +6156,7 @@ def resolve_workspace(
             seen_url=seen_url,
             seen_tarball=seen_tarball,
             seen_local=seen_local,
+            seen_oci=seen_oci,
             edge_cache=ws_edge_cache,
             provider=provider,
             overrides_by_name=overrides_by_name,
@@ -5411,9 +6164,10 @@ def resolve_workspace(
             env=env,
             params=params,
             index=index,
-            provenance_gate=provenance_gate,
             root_authority=root_authority,
             record_discovery=_ws_record_discovery,
+            binding_resolver=binding_resolver,
+            is_strict=_ws_is_strict,
         )
 
         # ------------------------------------------------------------------
@@ -5436,33 +6190,59 @@ def resolve_workspace(
             seen_url=seen_url,
             seen_tarball=seen_tarball,
             seen_local=seen_local,
+            seen_oci=seen_oci,
             edge_cache=ws_edge_cache,
             overrides_by_name=overrides_by_name,
             deps_dir=deps_dir,
             env=env,
             params=params,
             index=index,
-            provenance_gate=provenance_gate,
             root_authority=root_authority,
             record_discovery=_ws_record_discovery,
+            binding_resolver=binding_resolver,
+            is_strict=_ws_is_strict,
             extra_manifests=_member_manifests_for_fixpoint,
         )
 
     # ------------------------------------------------------------------
     # Wire Phase B transitive callback BEFORE solve
     # ------------------------------------------------------------------
-    def _on_transitive_named(name: str) -> None:
-        # ``name`` here is a solver_var string (e.g. ``"ns::bar"`` for qualified
-        # deps or plain ``"bar"`` for bare deps).  Decompose via from_solver_var
-        # so the namespace is preserved through to _enumerate_named_stubs.
-        # Mirrors the single-package _on_transitive_named (resolve() step 7).
-        _dk_wt = DepKey.from_solver_var(name)
-        if _dk_wt in seen_named or _dk_wt.name == "nim":
+    def _on_transitive_named(dep_key: DepKey) -> None:
+        # S5-rekey (RFC origin-as-identity §4.4): caller passes the ORIGINAL
+        # ``DepKey`` directly (see ``_edgeset_named_requires``) — no
+        # ``DepKey.from_solver_var`` reverse-decode; mirrors the
+        # single-package ``_on_transitive_named`` (resolve() step 7).
+        if dep_key in seen_named or dep_key.name == "nim":
             return
-        seen_named.add(_dk_wt)
-        _ws_record_discovery(_dk_wt.solver_var())  # Phase B: lazy-materialized named dep
+        seen_named.add(dep_key)
+        # RFC origin-as-identity §4.3 (S3a): this callback fires OUTSIDE the
+        # BFS wave loop (mid-solve, Phase B lazy materialisation) — mirrors
+        # the single-package ``_on_transitive_named`` (resolve() step 7): an
+        # independent admission site that must route through
+        # ``BindingResolver`` too, not just the BFS "named" arm.
+        _named_claim_wt = Claim(
+            name=dep_key.solver_var(),
+            source_id=normalize_source(
+                RegistrySourceId(
+                    registry=DEFAULT_REGISTRY_ALIAS,
+                    namespace=resolved_registry_namespace(
+                        dep_key.name, dep_key.namespace, index,
+                    ),
+                    name=dep_key.name,
+                )
+            ),
+            is_root=False,
+            claimant="transitive",
+        )
+        _named_decision_wt = binding_resolver.submit(_named_claim_wt)
+        if _named_decision_wt.outcome is BindOutcome.LOST_TO_ROOT:
+            return
+        # S5-rekey: record_discovery AFTER the claim is bound (canonical_for
+        # requires it) — see resolve()'s equivalent callback for why moving
+        # past the LOST_TO_ROOT return is a no-op, not a behavior change.
+        _ws_record_discovery(binding_resolver.canonical_for(dep_key))  # Phase B: lazy-materialized named dep
         _enumerate_named_stubs(
-            _dk_wt, None, index, provider, deps_dir, env,
+            dep_key, None, index, provider, deps_dir, env,
             exclude_newer=params.exclude_newer,
         )
 
@@ -5481,17 +6261,6 @@ def resolve_workspace(
     _s4c_check_flag_conflicts(provider, deps_dir)
 
     # ------------------------------------------------------------------
-    # Step 6b (workspace): Phase B content-hash dedup/alias
-    #
-    # Mirrors resolve() step 6b: group external candidates by identity,
-    # collapse groups of size ≥ 2 to ONE canonical node.  Member candidates
-    # are never in ws_discovery_order so they are never deduplicated.
-    # ------------------------------------------------------------------
-    ws_aliases_map: dict[str, str] = _dedup_candidates(
-        provider, deps_dir, ws_discovery_order, overrides_by_name
-    )
-
-    # ------------------------------------------------------------------
     # Solve (+ build §5.1 certificate for --certificate flag)
     # ------------------------------------------------------------------
     try:
@@ -5501,16 +6270,35 @@ def resolve_workspace(
             Version(0, 0, 0),
             strategy=params.strategy,
         )
+        # S5-rekey (RFC origin-as-identity §4.4): project the certificate's
+        # PubGrub package strings back to the legacy "ns::name"/bare form —
+        # certificate_to_json (solver.py) has no BindingResolver access.
+        cert = _project_solve_success(cert, binding_resolver)
     except VersionUnknownConstrained as exc:
-        raise _version_unknown_constrained_err(exc, root_authority) from exc
+        raise _version_unknown_constrained_err(exc, root_authority, binding_resolver) from exc
     except SolverError as exc:
         from milpa.errors import SOLVE_CONFLICT
+        _projected_exc = _project_solver_error(exc, binding_resolver)
         raise MilpaError(
             SOLVE_CONFLICT,
-            f"dependency conflict: {exc}",
-            chain=exc.chain,
-            solver_error=exc,
+            f"dependency conflict: {_projected_exc}",
+            chain=_projected_exc.chain,
+            solver_error=_projected_exc,
         ) from exc
+
+    # ------------------------------------------------------------------
+    # Step 6b (workspace): Phase B content-hash dedup/alias (RFC origin-as-
+    # identity §3.3/§4.5, S4b — cross-origin reconciliation)
+    #
+    # Mirrors resolve() step 8b: runs on the SOLVED graph (post-solve, pre-
+    # build), grouping `solution`'s chosen candidates by identity.  Member
+    # candidates are never in ws_discovery_order, so a member never wins a
+    # canonical tie-break against a genuinely-external dep (members are never
+    # expected to coincide in content with a fetched dep in practice).
+    # ------------------------------------------------------------------
+    ws_aliases_map: dict[str, str] = _dedup_candidates(
+        provider, deps_dir, ws_discovery_order, overrides_by_name, solution
+    )
 
     # ------------------------------------------------------------------
     # Build graph (attach cert for CLI §2.5)
@@ -5518,21 +6306,69 @@ def resolve_workspace(
     graph = _build_graph(
         solution, provider, deps_dir, params.strategy,
         aliases_map=ws_aliases_map, entry_trust=params.entry_trust,
+        binding_resolver=binding_resolver,
     )
 
     # §13 attestation policy enforcement — mirrors single-package resolve().
     # Effective policy: OR of flag/env (via _ws_is_strict computed above) and
     # each member's attestation-policy "strict" declaration (§13.1 workspace rule).
     from milpa.attestation import enforce_attestation_policy
+    # RFC origin-as-identity §4.5 (S4): ws_edge_cache is keyed by
+    # (source_id, version) — reverse-map via ws_discovery_order, mirroring
+    # resolve()'s Step 10 (see its comment for the full rationale).
+    _ws_name_by_source_id: dict[SourceId, str] = {}
+    for _n in ws_discovery_order:
+        # S5-rekey: ws_discovery_order holds canonical solver-variable
+        # strings for named deps — decode for both the lookup key and the
+        # stored DISPLAY name (attestation-policy warning text).
+        _ws_dk_disp = _depkey_for_solved_name(_n, binding_resolver)
+        _sid = binding_resolver.source_id_for(_ws_dk_disp)
+        if _sid is not None and _sid not in _ws_name_by_source_id:
+            _ws_name_by_source_id[_sid] = _ws_dk_disp.solver_var()
     resolved_edge_map: dict[str, "EdgeSet"] = {
-        name: es
-        for (name, _ver), es in ws_edge_cache.items()
-        if name != "__root__"
+        _ws_name_by_source_id[sid]: es
+        for (sid, _ver), es in ws_edge_cache.items()
+        if sid in _ws_name_by_source_id
     }
     enforce_attestation_policy(resolved_edge_map, _ws_is_strict)
 
     from dataclasses import replace as _replace
     graph = _replace(graph, cert=cert)
+
+    # M6 / RES-DEAD-OVERRIDE (rfc-origin-as-identity.md §10 item 12 / B10,
+    # S5b): workspace mirror of resolve()'s identical check — a workspace
+    # root `overrides {}` entry naming a dep absent from the resolved graph
+    # is dead config (a typo, or a stale override left behind after the dep
+    # it targeted was removed). Non-fatal — resolution still succeeds.
+    import warnings as _ws_warnings
+    _ws_resolved_dep_names = {dep.name for dep in graph.deps}
+    _ws_dead_override_names = sorted(
+        ov.name for ov in workspace.workspace_manifest.overrides
+        if ov.name not in _ws_resolved_dep_names
+    )
+    if _ws_dead_override_names:
+        _ws_warnings.warn(
+            f"override(s) {', '.join(_ws_dead_override_names)!r} name dep(s) not present in the "
+            f"resolved graph — check for typos in override names",
+            UserWarning,
+            stacklevel=4,
+        )
+
+    # RFC origin-as-identity.md §4.7/B3 (S3a-req): see resolve()'s identical
+    # hook — the slot-projection collapse must be VISIBLE, never silent.
+    from milpa.lockfile import collapse_notes as _collapse_notes
+    for _note in _collapse_notes(list(graph.deps)):
+        print(f"[milpa] note: {_note}", file=sys.stderr)
+
+    # RFC origin-as-identity.md §4.6 (S6 + S7): the complete import-slot
+    # check — post-solve, post-dedup, before anything is written under
+    # _deps/. Runs the S6 directory-slot floor first, then the symbol-level
+    # scan over the same CAS store rebuild_deps_view materializes from
+    # below. live_symbol_provider() is manifest_declared fidelity ONLY —
+    # see its docstring for the evidence-based reason tree_scanned fidelity
+    # is not (yet) part of the zero-config hard-fail default.
+    from milpa.import_slot import check_import_slot_collisions, live_symbol_provider
+    check_import_slot_collisions(graph, live_symbol_provider(), store=env.store)
 
     # B-nimcfg: rebuild _deps/ view (alias symlinks + stale removal).
     rebuild_deps_view(graph, deps_dir, env.store)

@@ -32,6 +32,7 @@ fn manifest(deps: Vec<Dep>) -> Manifest {
         index_history_policy: milpa_manifest::TrustPolicy::Warn,
         index_history_policy_explicit: false,
         resolution: None,
+        provides: Vec::new(),
         optional_auto_flags: std::collections::BTreeSet::new(),
     }
 }
@@ -88,6 +89,7 @@ fn locked(name: &str, version: &str, identity: Option<&str>, prov: ProvenanceRec
         cond_requires: vec![],
         aliases: vec![],
         attestation: None,
+        source_id: None,
     }
 }
 
@@ -719,6 +721,17 @@ fn frozen_carries_attestation_from_locked_dep() {
         bundle_pin: Some("a".repeat(64)),
         namespace: "ns1".into(),
     });
+    // RFC origin-as-identity §4.1/§4.4/§7 (S5): registry_namespace is
+    // DELETED from ResolvedDep — offline subject reconstruction now reads
+    // `source_id`'s namespace instead, carried straight through frozen
+    // reconstruction (direct passthrough, no re-derivation).
+    locked_dep.source_id = Some(milpa_types::SourceId::Fetchable(
+        milpa_types::FetchableOrigin::Registry {
+            registry: "tianguis".into(),
+            namespace: Some("ns1".into()),
+            name: "foo".into(),
+        },
+    ));
     let lf = lock("maxver", vec![locked_dep]);
     let dd = deps_dir(&tmp);
     let graph = resolve_frozen(&manifest(vec![named("foo", None)]), &lf, &store, &dd).unwrap();
@@ -738,13 +751,17 @@ fn frozen_carries_attestation_from_locked_dep() {
         }),
         "frozen reconstruction must carry the attestation claim (incl. bundle_pin) from LockedDep"
     );
-    // CR13/4: LockAttestation.namespace must round-trip onto registry_namespace
-    // so `milpa verify`'s offline re-verification can rebuild the subject
-    // coordinate with no index available.
+    // S5: source_id (carrying the real namespace) must round-trip through
+    // frozen reconstruction so `milpa verify`'s offline re-verification can
+    // rebuild the subject coordinate with no index available.
     assert_eq!(
-        dep.registry_namespace,
-        Some("ns1".to_string()),
-        "frozen reconstruction must carry LockAttestation.namespace onto registry_namespace"
+        dep.source_id,
+        Some(milpa_types::SourceId::Fetchable(milpa_types::FetchableOrigin::Registry {
+            registry: "tianguis".into(),
+            namespace: Some("ns1".into()),
+            name: "foo".into(),
+        })),
+        "frozen reconstruction must carry LockedDep.source_id through onto ResolvedDep.source_id"
     );
 }
 
@@ -758,7 +775,7 @@ fn frozen_no_attestation_stays_none() {
     let dd = deps_dir(&tmp);
     let graph = resolve_frozen(&manifest(vec![named("foo", None)]), &lf, &store, &dd).unwrap();
     assert_eq!(graph.deps[0].attestation, None);
-    assert_eq!(graph.deps[0].registry_namespace, None);
+    assert_eq!(graph.deps[0].source_id, None);
 }
 
 /// Alias symlink materializes in _deps/ after resolve_frozen on a deduped dep.
@@ -829,6 +846,7 @@ fn frozen_carries_all_provenances() {
         submodule_shas: vec![],
     };
     let locked_dep = LockedDep {
+        source_id: None,
         declared_version_source: None,
         name: "foo".into(),
         namespace: None,
@@ -872,6 +890,7 @@ fn frozen_carries_all_provenances() {
 fn local_dep(name: &str, path: &str) -> milpa_types::ResolvedDep {
     milpa_types::ResolvedDep {
         declared_version_source: None,
+        source_id: None,
         name: name.into(),
         namespace: None,
         identity: String::new(),
@@ -887,7 +906,6 @@ fn local_dep(name: &str, path: &str) -> milpa_types::ResolvedDep {
         aliases: vec![],
         active_flags: vec![],
         attestation: None,
-        registry_namespace: None,
     }
 }
 
@@ -976,6 +994,7 @@ fn rebuild_deps_view_preserves_local_symlink_alongside_cas_dep() {
     let local = local_dep("locallib", &local_src.to_string_lossy());
     let git = milpa_types::ResolvedDep {
         declared_version_source: None,
+        source_id: None,
         name: "foo".into(),
         namespace: None,
         identity: identity.clone(),
@@ -994,7 +1013,6 @@ fn rebuild_deps_view_preserves_local_symlink_alongside_cas_dep() {
         aliases: vec![],
         active_flags: vec![],
         attestation: None,
-        registry_namespace: None,
     };
     let graph = milpa_types::ResolvedGraph { deps: vec![local, git] };
 

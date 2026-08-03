@@ -1,0 +1,5 @@
+name "a"
+kind "library"
+deps {
+    shared git=(url)"https://x.example.com/shared.git" ref="main"
+}

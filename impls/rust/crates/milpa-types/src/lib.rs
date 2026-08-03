@@ -259,6 +259,67 @@ impl Provenance {
     }
 }
 
+/// A version-independent origin — the solver variable (rfc-origin-as-identity.md
+/// §3/§4.1, S1). Origins that are fetched, hashed, and materialized under
+/// `_deps/`. Mirrors Python's `FetchableOrigin` union (`source_id.py`).
+///
+/// A **closed enum** (five kinds; `ref`/commit/digest are VERSIONS, not the
+/// origin, and are deliberately excluded from every variant here).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum FetchableOrigin {
+    /// A `git=` dependency's origin: the normalized repository URL. `url` is
+    /// ALWAYS normalized (`source_id::normalize_source`) by every trusted
+    /// caller; no `source_id::parse` exists (round-2.5, rfc-origin-as-
+    /// identity.md §4.1) — the frozen struct is the authoritative
+    /// representation, never reconstructed from a flat string.
+    Git {
+        url: String,
+        /// Normalized posix; `None` = repo root.
+        subpath: Option<String>,
+    },
+    /// An `oci=` dependency's origin: registry + repository, no digest/tag.
+    Oci {
+        registry: String,
+        repository: String,
+        subpath: Option<String>,
+    },
+    /// A `tarball=` dependency's origin. Each distinct URL is a distinct source.
+    Tarball {
+        url: String,
+        subpath: Option<String>,
+    },
+    /// A `local=` dependency's origin: a filesystem path. Canonicalized by
+    /// the caller (workspace-relative when under root, else absolute) —
+    /// case-SENSITIVE and case-PRESERVING by definition (RFC §4.1 D6: on a
+    /// case-insensitive filesystem, `Deps/Foo` and `deps/foo` are two
+    /// distinct origins, a known missed-unification limitation left to
+    /// `overrides {}`, not remedied here).
+    Local { path: String },
+    /// A `named`/registry-coordinate dependency's origin. `registry` is a
+    /// CONFIGURED ALIAS slug (`[A-Za-z0-9_-]+`), never a base URL (RFC §4.1
+    /// "Registry component is an alias, never a base URL"). `namespace` is
+    /// the REAL resolved index namespace, never the manifest qualifier.
+    Registry {
+        registry: String,
+        namespace: Option<String>,
+        name: String,
+    },
+}
+
+/// The full closed union — `FetchableOrigin` plus a workspace member (RFC
+/// §4.1 G4: `Member` is split OUT of `FetchableOrigin` deliberately — a
+/// member is never fetched, never CAS-hashed, and never carries an
+/// attestation subject; conflict-free by construction (W1-W5 name
+/// uniqueness). Code that types over `FetchableOrigin` gets "members do not
+/// participate in fetch/CAS/attestation" enforced by the type checker, not
+/// left as a convention to remember. Mirrors Python's `SourceId` union.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum SourceId {
+    Fetchable(FetchableOrigin),
+    /// A workspace member's origin.
+    Member { member_name: String },
+}
+
 /// Durable Rekor transparency-log reference (registry-protocol §3.2).
 ///
 /// Kind-independent — carried on [`EntryAttestation`] and [`LockAttestation`]
@@ -376,15 +437,14 @@ pub struct ResolvedDep {
     /// `lockfile.rs`), so `milpa verify`'s offline re-verification can
     /// locate the cached bundle for a locked dep with no index available.
     pub attestation: Option<EntryAttestation>,
-    /// P3a addition (RFC per-entry-attestation.md §3): the entry's REAL index
-    /// namespace (`registry::IndexVersion::namespace`), populated only for
-    /// registry-resolved candidates. `None` for URL/tarball/local/member deps
-    /// and for the synthetic root. Distinct from `namespace` above (manifest-
-    /// qualification only) — a bare (unqualified) named dep still resolves
-    /// through a real namespaced index entry. Folded into
-    /// `LockAttestation::namespace` at the `locked_from_resolved` boundary;
-    /// not otherwise emitted.
-    pub registry_namespace: Option<String>,
+    // RFC origin-as-identity §4.4 (B2/G10 field-duplication audit, S5):
+    // `registry_namespace` (formerly a field here, mirroring
+    // `_Candidate::registry_namespace`) is DELETED — it duplicated
+    // `source_id`'s namespace for a `FetchableOrigin::Registry` (the SAME
+    // real index namespace, populated by the SAME `resolved_registry_namespace`
+    // call at binding time). `LockAttestation::namespace` is now derived from
+    // `source_id`'s namespace at the `locked_from_resolved` construction
+    // boundary instead of from this field.
     /// A5 (resolution-semantics RFC §3 Axis A (b) / §5): the sibling field to
     /// `version` — WHICH precedence step (`manifest`/`nimble`/`tag`/
     /// `annotation`) produced a git/url/local/tarball/member dep's declared
@@ -396,6 +456,15 @@ pub struct ResolvedDep {
     /// `version == 0.0.0` — a combination no `Known` case ever produces, §5
     /// NORMATIVE) and for named/index-resolved deps (out of Axis A's scope).
     pub declared_version_source: Option<String>,
+    /// RFC origin-as-identity §4.4 (S3a): the version-independent origin the
+    /// binding phase (`binding::BindingResolver`) selected for this dep's
+    /// `DepKey` — IN-MEMORY ONLY. Deliberately NOT threaded into the on-disk
+    /// lockfile schema yet (that is a later slice's structured `source { … }`
+    /// node); `None` for the synthetic root dep and for any dep constructed
+    /// outside the live `resolve()`/`resolve_workspace()` path (e.g. frozen
+    /// reconstruction, until a later slice populates it there too). Mirrors
+    /// Python's `ResolvedDep.source_id`.
+    pub source_id: Option<SourceId>,
 }
 
 /// The resolved dependency graph — the resolver's output, the emitters' input.
@@ -559,6 +628,14 @@ pub struct LockedDep {
     /// version-unknown dep (`version == "0.0.0"`, no source — the
     /// unambiguous boundary pairing, §5 NORMATIVE) and for named/index deps.
     pub declared_version_source: Option<String>,
+    /// RFC origin-as-identity §4.1/§7 (S5): the version-independent origin,
+    /// serialized STRUCTURED as a `source { … }` node with typed children
+    /// (uv's model) — never a flat parsed string (no `parse()` exists).
+    /// `None` only for a lockfile predating S5 (forward-compat) — a
+    /// conformant S5+ emitter always writes this for every real dep. The
+    /// `FROZEN-SOURCE-ID-MISMATCH` / `FROZEN-REGISTRY-ALIAS-UNRESOLVED`
+    /// preconditions (`frozen.rs`, §7.1) read this field.
+    pub source_id: Option<SourceId>,
 }
 
 /// The parsed `milpa.lock` as data (parse/emit logic lives in `milpa-core`).

@@ -1,0 +1,16 @@
+// fixture-458: S4b (RFC origin-as-identity.md §3.3/§4.5) — cross-origin
+// content-hash collapse.
+//
+// "chronos" is resolved via the tianguis index (a RegistrySourceId) and
+// "chronos-fork" is a direct git= dep (a GitSourceId) — two DISTINCT
+// source-ids. Both fetch to byte-identical trees (same milpa.kdl content),
+// so Phase B's post-solve dedup pass collapses them to ONE canonical dep,
+// carrying BOTH origins' observed provenance (never just the survivor's).
+// "chronos" is declared first, so BFS-insertion order makes it canonical;
+// "chronos-fork" becomes its alias.
+name "testapp"
+kind "application"
+deps {
+    chronos
+    chronos-fork git=(url)"https://example.com/chronos-fork.git" ref="main"
+}

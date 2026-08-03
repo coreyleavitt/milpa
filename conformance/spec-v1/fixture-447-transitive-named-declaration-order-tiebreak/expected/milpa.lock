@@ -3,6 +3,11 @@ version 1
 strategy "maxver"
 
 dep "alpha" {
+    source {
+        kind "registry"
+        registry "tianguis"
+        name "alpha"
+    }
     identity "dag-sha256:a45affd9fa338aca315d49ffde89e8130370d3469b22463487f9c847ad8f893e"
     version "1.0.0"
     src_dir ""
@@ -17,6 +22,10 @@ dep "alpha" {
 }
 
 dep "portal" {
+    source {
+        kind "git"
+        url (url)"https://example.com/portal"
+    }
     identity "dag-sha256:f452fd2cd924fd5831bf98faec5e478dbdd90b78bd0f038536d1eced1bce507d"
     version "1.0.0"
     declared_version_source "tag"
@@ -32,6 +41,11 @@ dep "portal" {
 }
 
 dep "shared" {
+    source {
+        kind "registry"
+        registry "tianguis"
+        name "shared"
+    }
     identity "dag-sha256:2fbea98a2fc92632e18552c2fa9013ff70955faee2d5652d39a67d1ac444b063"
     version "1.0.0"
     src_dir ""
@@ -46,6 +60,11 @@ dep "shared" {
 }
 
 dep "zeta" {
+    source {
+        kind "registry"
+        registry "tianguis"
+        name "zeta"
+    }
     identity "dag-sha256:dc97e948d6e482126d156a53f326c54ce82872f2798b7f066d842d25f4817bd0"
     version "2.0.0"
     src_dir ""

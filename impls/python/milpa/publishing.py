@@ -377,6 +377,13 @@ class PublishPlan:
     wiring in ``cmd_publish``) has it available to populate a downstream
     registry entry's optional OCI-provenance ``source`` field
     (registry-protocol §3.3) without re-deriving it.
+
+    This is already the "audit-only provenance metadata" model RFC
+    origin-as-identity §3.2/§6 formalizes for ``OciIndexProvenance.source_url``
+    (``registry.py`` — the field this one ultimately populates): it never
+    participates in source-id resolution, only in attestation/traceability
+    ("which repo was this artifact built from"). Noted here (S3b sweep) so a
+    future audit doesn't need to rediscover the parallel.
     """
 
     source: PublishSource

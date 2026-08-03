@@ -608,6 +608,38 @@ class TestWorkspaceNimcfgs:
             '--path:"src"\n'
         )
 
+    def test_member_includes_namespace_qualified_transitive_dep(self, tmp_path: Path) -> None:
+        """R2 (code-review): a namespace-qualified transitive dep (a member's
+        `requires` entry is the qualified solver-var 'ns1::foo') must appear in
+        the member's nim.cfg --path closure. The old bare-name closure index
+        silently dropped it AND its whole subtree with no error."""
+        from milpa.lockfile import GitProvenanceRecord, MemberProvenanceRecord
+        ws = self._make_workspace(tmp_path, [("liba", "member-a", "src")])
+        graph = ResolvedGraph(deps=(
+            ResolvedDep(
+                name="liba",
+                identity="sha256:" + "0" * 64,
+                version="0.0.1",
+                src_dir="src",
+                requires=("ns1::foo",),
+                provenances=(MemberProvenanceRecord(name="liba"),),
+            ),
+            ResolvedDep(
+                name="foo",
+                namespace="ns1",
+                identity="sha256:" + "1" * 64,
+                version="0.0.1",
+                src_dir="",
+                requires=(),
+                provenances=(GitProvenanceRecord(
+                    url="https://example.com/foo.git", ref="main", commit_sha="a" * 40),),
+            ),
+        ))
+        result = format_workspace_nimcfgs(ws, graph)
+        nimcfg = result["member-a"]
+        # The namespaced transitive is on the member's --path closure (not dropped).
+        assert "foo" in nimcfg
+
     def test_member_with_no_deps_no_src_dir_emits_header_only(self, tmp_path: Path) -> None:
         """A member with no src_dir and no transitive deps gets header-only nim.cfg."""
         from milpa.lockfile import MemberProvenanceRecord

@@ -567,6 +567,23 @@ class TestTarballDepParse:
         m = parse_manifest(text)
         assert m.deps[0].strip_components == 0  # type: ignore[union-attr]
 
+    def test_tarball_dep_unknown_prop_raises(self) -> None:
+        """D4 (Python↔Rust divergence fix): an unknown property on a
+        TarballDep node must raise MAN-DEP-UNKNOWN-PROPS, matching the
+        sibling UrlDep/LocalDep parsers (and the Rust impl's allowlist in
+        ``parse_tarball_dep_inner``). Previously Python silently accepted
+        (and dropped) any extra property here."""
+        from milpa.errors import MAN_DEP_UNKNOWN_PROPS
+        text = textwrap.dedent("""\
+            name "x"
+            deps {
+                foo tarball=(url)"https://example.com/foo.tar.gz" bogus="x"
+            }
+        """)
+        with pytest.raises(MilpaError) as exc_info:
+            parse_manifest(text)
+        assert exc_info.value.slug == MAN_DEP_UNKNOWN_PROPS
+
     def test_tarball_dep_version_annotation_parsed(self) -> None:
         """A3b: ``version=`` on a TarballDep parses (reach extended beyond
         git/url — a constrained tarball dep otherwise has no escape hatch)."""
@@ -980,6 +997,50 @@ class TestMirrorsParse:
         assert_slug(text, expected)
 
 
+class TestProvidesParse:
+    """S7 (rfc-origin-as-identity.md §4.6): the ``provides {}`` block —
+    a package's own declared Nim import symbols, consumed by
+    ``import_slot.ManifestDeclaredSymbolProvider``."""
+
+    def test_top_level_provides_block_valid(self) -> None:
+        text = textwrap.dedent("""\
+            name "mypkg"
+            provides {
+                module "foo"
+                module "foo/bar"
+            }
+        """)
+        m = parse_manifest(text)
+        assert m.provides == ("foo", "foo/bar")
+
+    def test_top_level_provides_empty_block(self) -> None:
+        text = 'name "mypkg"\nprovides {\n}\n'
+        m = parse_manifest(text)
+        assert m.provides == ()
+
+    def test_absent_provides_defaults_empty(self) -> None:
+        m = parse_manifest('name "mypkg"\n')
+        assert m.provides == ()
+
+    def test_provides_unknown_child_raises(self) -> None:
+        text = 'name "mypkg"\nprovides {\n    symbol "foo"\n}\n'
+        with pytest.raises(MilpaError) as exc_info:
+            parse_manifest(text)
+        assert exc_info.value.slug == E.MAN_PROVIDES_UNKNOWN_NODE
+
+    def test_provides_module_no_args_raises(self) -> None:
+        text = 'name "mypkg"\nprovides {\n    module\n}\n'
+        with pytest.raises(MilpaError) as exc_info:
+            parse_manifest(text)
+        assert exc_info.value.slug == E.MAN_PROVIDES_MODULE_ARITY
+
+    def test_provides_module_non_string_arg_raises(self) -> None:
+        text = 'name "mypkg"\nprovides {\n    module 42\n}\n'
+        with pytest.raises(MilpaError) as exc_info:
+            parse_manifest(text)
+        assert exc_info.value.slug == E.MAN_PROVIDES_MODULE_ARITY
+
+
 # ---------------------------------------------------------------------------
 # 3c-6 — Overrides block
 # ---------------------------------------------------------------------------
@@ -1111,6 +1172,25 @@ class TestOverridesParse:
         text = fixture_kdl("fixture-037-man-override-duplicate")
         expected = fixture_error("fixture-037-man-override-duplicate")
         assert_slug(text, expected)
+
+    def test_override_duplicate_wins_over_second_entry_version_error(self) -> None:
+        """D5 (Python↔Rust divergence fix): when the SECOND ``pkg`` override
+        for the same name also carries an invalid ``version=``, the
+        duplicate-name check must win over the version-validation error —
+        a duplicate override name is a structural error reported before the
+        duplicate entry's contents are validated. Pins Python's existing
+        (correct) ordering; Rust was fixed to converge on this same order."""
+        from milpa.errors import MAN_OVERRIDE_DUPLICATE
+        text = textwrap.dedent("""\
+            name "x"
+            overrides {
+                pkg "foo" local="a"
+                pkg "foo" local="b" version="not-a-semver"
+            }
+        """)
+        with pytest.raises(MilpaError) as exc_info:
+            parse_manifest(text)
+        assert exc_info.value.slug == MAN_OVERRIDE_DUPLICATE
 
     def test_override_target_ambiguous_corpus_mixed(self) -> None:
         """Corpus fixture 203: MAN-OVERRIDE-TARGET-AMBIGUOUS (mixed forms)."""

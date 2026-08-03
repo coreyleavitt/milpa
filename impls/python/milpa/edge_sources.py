@@ -16,8 +16,10 @@ supplies its declared requires (EdgeSet)?" Three source kinds exist:
    → EdgeSet.  Enforces §9 (dev-deps excluded) and §10.2 (overrides dropped).
 3. ``NimbleEdgeSource``: heuristic line-scan of ``.nimble`` → EdgeSet (fallback).
 
-The coordinator ``resolve_edges`` selects the source **once per (package, version)**
-via a resolver-scoped ``edge_cache`` memo (clause a), then dispatches to the
+The coordinator ``resolve_edges`` selects the source **once per (source_id, version)**
+(RFC origin-as-identity §4.5, S4 — re-keyed from ``(name, version)`` so two
+consumer labels for one origin coalesce to one sealed EdgeSet) via a
+resolver-scoped ``edge_cache`` memo (clause a), then dispatches to the
 appropriate source (clauses b, c, d).
 
 ``EdgeSourceCtx`` carries the heterogeneous inputs the sources need.  The fields are
@@ -50,8 +52,11 @@ from milpa.predicate import dep_passes_flag_predicates
 from milpa.version import VersionSource, parse_version
 
 if TYPE_CHECKING:
+    from milpa.binding import BindingResolver
     from milpa.manifest import Override
+    from milpa.registry import Index
     from milpa.solver import Term
+    from milpa.source_id import SourceId
     from milpa.version import Version, VersionSet
 
 
@@ -650,8 +655,9 @@ def resolve_edges(
     name: str,
     version: "Version",
     ctx: EdgeSourceCtx,
-    edge_cache: dict[tuple[str, "Version"], EdgeSet],
+    edge_cache: "dict[tuple[SourceId, Version], EdgeSet]",
     *,
+    source_id: "SourceId",
     nimble_source: NimbleEdgeSource | None = None,
     milpakdl_source: MilpaKdlEdgeSource | None = None,
     dep_decl_source: "DepDeclEdgeSource | None" = None,
@@ -659,23 +665,35 @@ def resolve_edges(
 ) -> EdgeSet:
     """Thin cached wrapper: clause (a) + delegates to ``_resolve_edges_pure``.
 
-    Implements spec/resolver-semantics.md §4.2.1 ``resolve_edges`` (S4-i amendment):
+    Implements spec/resolver-semantics.md §4.2.1 ``resolve_edges`` (S4-i amendment),
+    re-keyed by RFC origin-as-identity §4.5 (S4):
 
     Clause (a) — Sealed once:
-        If ``(name, version)`` is in ``edge_cache``, return the sealed EdgeSet
-        immediately.  A diamond where two BFS parents reach ``D@v`` cannot yield
-        two different EdgeSets.
+        If ``(source_id, version)`` is in ``edge_cache``, return the sealed
+        EdgeSet immediately.  A diamond where two BFS parents reach the SAME
+        origin at the SAME version — even under two different consumer
+        labels (``name``) — cannot yield two different EdgeSets. Keying by
+        ``source_id`` rather than ``name`` is the point: before this slice,
+        two labels for one repo sealed two separate entries (a latent
+        correctness bug, RFC §2.1 "missed unification").
 
-    Clauses (b)(c)(d) — delegated to ``_resolve_edges_pure``.
+    Clauses (b)(c)(d) — delegated to ``_resolve_edges_pure`` (unchanged; those
+    still dispatch on ``name``/``ctx``, not ``source_id`` — only the CACHE
+    dimension moved).
 
     Parameters
     ----------
     name, version:
-        The package being resolved.
+        The package being resolved (``name`` still drives clauses b/c/d —
+        filesystem lookups, ``EdgeSourceCtx.dep_name``, etc.).
     ctx:
         Per-package context (dep_path, dep_decl, is_overridden, has_milpa_kdl, …).
     edge_cache:
-        Resolver-scoped memo; mutated in place (caller owns).
+        Resolver-scoped memo, keyed by ``(source_id, version)``; mutated in
+        place (caller owns).
+    source_id:
+        The origin *name* is bound to (``BindingResolver.source_id_for``) —
+        the cache-key dimension that replaces ``name`` (S4).
     nimble_source:
         Injectable NimbleEdgeSource (default: a fresh NimbleEdgeSource()).
     milpakdl_source:
@@ -698,8 +716,8 @@ def resolve_edges(
     EdgeSet
         Sealed in ``edge_cache`` on first call; returned from cache on repeat calls.
     """
-    # Clause (a): sealed once — parent-independent.
-    cache_key = (name, version)
+    # Clause (a): sealed once — parent-independent, keyed by source_id (S4).
+    cache_key = (source_id, version)
     if cache_key in edge_cache:
         return edge_cache[cache_key]
 
@@ -724,6 +742,9 @@ def resolve_edges(
 def edgeset_to_terms(
     es: EdgeSet,
     overrides_by_name: dict[str, "Override"],
+    index: "Index",
+    root_self_name: str | None = None,
+    binding_resolver: "BindingResolver | None" = None,
 ) -> tuple[list["Term"], list[str], dict[str, "list[tuple[object, ...]]"]]:
     """Convert an ``EdgeSet`` to the solver's ``(dep_terms, requires_names, requires_predicates)`` tuple.
 
@@ -750,6 +771,37 @@ def edgeset_to_terms(
         The EdgeSet from any EdgeSource.
     overrides_by_name:
         Root-manifest overrides dict (name → Override).
+    root_self_name:
+        The resolving root's own manifest name (§14 "root satisfies its own
+        name"), or ``None`` for a context with no such concept (e.g. inside
+        a workspace member candidate build). Passed straight through to
+        ``binding.canonical_key_for_requirement`` — see its docstring for
+        why this is needed (a transitive requirement on the root's own name
+        must resolve to the root-self ``MemberSourceId`` sentinel's
+        canonical form, not a synthesized registry guess).
+    binding_resolver:
+        The resolver's ``BindingResolver`` instance, when available — the
+        PRIMARY source for the require-name key (see
+        ``binding.canonical_key_for_requirement``'s docstring): if this
+        name's ``DepKey`` is already bound (a root git/tarball/local dep,
+        an override, root-self, or an earlier transitive claim), the term
+        key must agree with THAT binding's actual candidate key, not a
+        fresh guess. ``None`` only in a standalone/unit-test context with no
+        live resolve() in progress — falls back to the guess-only behavior.
+    index:
+        The tianguis index — needed (RFC origin-as-identity §4.4, S5-rekey)
+        to compute the PubGrub solver-variable string for a ``NamedRequire``
+        entry via ``binding.canonical_key_for_requirement``: the BOUND
+        source-id's canonical form, not the bare/qualified label, so that a
+        parent's OWN requirement on a name and another parent's requirement
+        on a differently-qualified alias for the SAME origin collapse to one
+        PubGrub variable. Computed via the pure, side-effect-free
+        ``canonical_key_for_requirement`` rather than
+        ``BindingResolver.canonical_for`` because this Term is built BEFORE
+        the child's own claim is formally ``submit()``ted (that happens
+        later, at BFS dispatch) — the pure helper computes the exact string
+        the eventual submission will accept, without requiring the key to
+        already be bound.
 
     Returns
     -------
@@ -787,35 +839,81 @@ def edgeset_to_terms(
             # URL requires → full() self-term (Axis A (a), D-A2).
             # ONE-NAME-PER-DECLARATION: prefer the DECLARED node name
             # (milpa.kdl/.nimble source, e.g. `"z3" git=(url)"…/nim-z3.git"`)
-            # so the solver term this parent candidate carries agrees with
-            # the name `edgeset_to_bfs_deps` enqueues the child under (it
-            # already prefers `entry.name`) and the name root-authority /
-            # `overrides {}` / the provenance gate key on. Falls back to the
-            # URL-tail derivation only when no declared name exists (DepDecl-
-            # sourced entries, where `entry.name` is always None).
+            # so the name `edgeset_to_bfs_deps` enqueues the child under (it
+            # already prefers `entry.name`) agrees with the name
+            # root-authority / `overrides {}` / the provenance gate key on.
+            # Falls back to the URL-tail derivation only when no declared
+            # name exists (DepDecl-sourced entries, where `entry.name` is
+            # always None).
             dep_name = entry.name if entry.name is not None else _name_from_url(entry.url)
             if dep_name is None:
                 continue
-            if dep_name not in seen_dep_names:
-                dep_terms.append(Term.require(dep_name, VersionSet.full()))
-                requires_names.append(dep_name)
-                seen_dep_names.add(dep_name)
+            # RFC §4.4.1 (S5-rekey, phase 2): uniform canonical solver key —
+            # no eager-kind bare-name carve-out. Computed via the pure,
+            # side-effect-free ``binding.canonical_key_for_requirement``
+            # (not ``BindingResolver.canonical_for``) because this Term is
+            # built BEFORE the child's own claim is formally ``submit()``ted
+            # (that happens later, at BFS dispatch — the "url" BFS arm). If
+            # this name's DepKey is already bound (a root git=/local=/
+            # tarball= declaration, or an earlier transitive claim under the
+            # SAME name — including a root ``bearssl git=<url>``), phase-1
+            # step 1 returns THAT bound source-id's canonical form,
+            # unifying pre-fetch with whatever already claimed the name —
+            # never a fresh guess that would leave two solver variables for
+            # one origin.
+            from milpa.binding import canonical_key_for_requirement as _canonical_key_for_requirement_url
+            _svar_u = _canonical_key_for_requirement_url(
+                name=dep_name,
+                namespace=None,
+                url=entry.url,
+                overrides_by_name=overrides_by_name,
+                index=index,
+                root_self_name=root_self_name,
+                binding_resolver=binding_resolver,
+            )
+            if _svar_u not in seen_dep_names:
+                dep_terms.append(Term.require(_svar_u, VersionSet.full()))
+                requires_names.append(_svar_u)
+                seen_dep_names.add(_svar_u)
             if entry.predicates:
-                requires_predicates.setdefault(dep_name, []).append(entry.predicates)
+                requires_predicates.setdefault(_svar_u, []).append(entry.predicates)
 
         elif isinstance(entry, NamedRequire):
             if entry.name == "nim":
                 continue
-            # H2 (rfc-resolver-correctness.md): use the solver_var (``ns::name``
-            # for qualified deps) as the PubGrub term key so that
-            # ``ns1::bar`` and ``ns2::bar`` are distinct solver variables even
-            # when both have bare name ``"bar"``.
-            from milpa.version import DepKey as _DK
-            _entry_dk = _DK(name=entry.name, namespace=entry.namespace)
-            _svar = _entry_dk.solver_var()  # "bar" or "ns1::bar"
+            # S5-rekey (RFC origin-as-identity §4.4.1): the PubGrub solver
+            # variable is UNIFORMLY the BOUND-or-guessed source-id's
+            # canonical form — computed via the pure, side-effect-free
+            # ``binding.canonical_key_for_requirement`` (not
+            # ``BindingResolver.canonical_for``) because this Term is built
+            # BEFORE the child's own claim is formally ``submit()``ted (that
+            # happens later, at BFS dispatch). No separate override
+            # special-case is needed here: when this name is overridden,
+            # the override is ALREADY a root claim (bound at
+            # BindingResolver.__init__), so phase-1 step 1 (binding-first)
+            # returns the override target's own canonical form directly —
+            # the exact key its root-loop Term/candidate already use. This
+            # is also what makes a parent's bare ``"foo"`` requirement and
+            # another parent's qualified ``"ns::foo"`` requirement for the
+            # SAME origin collapse to one PubGrub variable.
+            from milpa.binding import canonical_key_for_requirement as _canonical_key_for_requirement
+            _svar = _canonical_key_for_requirement(
+                name=entry.name,
+                namespace=entry.namespace,
+                url=None,
+                overrides_by_name=overrides_by_name,
+                index=index,
+                root_self_name=root_self_name,
+                binding_resolver=binding_resolver,
+            )
             if _svar not in seen_dep_names:
                 if entry.name in overrides_by_name:
-                    # Named dep with override → URL-like full() self-term (D-A2).
+                    # Axis A (a)/D-A2: an overridden named require's term is
+                    # always full() — this is a VersionSet concern (the term
+                    # never pre-commits to a version label the override
+                    # target might not carry), independent of the KEY
+                    # computation above (which already resolved to the
+                    # override target's own canonical form).
                     dep_terms.append(
                         Term.require(_svar, VersionSet.full())
                     )

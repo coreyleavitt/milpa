@@ -129,6 +129,15 @@ fn error_codes_match_fixtures() {
             "MAN-OVERRIDE-DUPLICATE",
         ),
         (
+            // D5 (Python↔Rust divergence fix): the SECOND `pkg "foo"` override
+            // also carries a malformed `version=`. The duplicate-name check
+            // must win over the version-validation error on the duplicate
+            // entry — converges Rust's ordering onto Python's (which already
+            // checks duplicate-name before parsing `version=`).
+            "name \"x\"\noverrides {\n  pkg \"foo\" local=\"a\"\n  pkg \"foo\" local=\"b\" version=\"not-a-semver\"\n}\n",
+            "MAN-OVERRIDE-DUPLICATE",
+        ),
+        (
             "name \"x\"\nflags {\n  a\n  a\n}\n",
             "MAN-FLAG-DUPLICATE",
         ),
@@ -1178,4 +1187,274 @@ fn s2_rfc_full_flag_example() {
     ];
     let result = flag_enables_closure(&flags, &set(&["full"]));
     assert_eq!(result, set(&["full", "tls", "http"]));
+}
+
+// ---------------------------------------------------------------------------
+// S8 — subpath grammar (rfc-origin-as-identity.md §4.1/§10 item 14). Mirrors
+// Python's test_subpath_grammar.py `TestSubpathParse`. (The `SourceId`-level
+// injectivity/escape-guard coverage — `TestSubpathDistinctOrigins`/
+// `TestSubpathEscapeGuard` — already exists in `source_id_tests.rs`, landed
+// with S1; only the GRAMMAR layer is new here.)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn s8_git_dep_subpath_parses() {
+    let m = pkg(
+        "name \"x\"\ndeps {\n  react-dom git=(url)\"https://github.com/facebook/react.git\" \
+         ref=\"main\" subpath=\"packages/react-dom\"\n}\n",
+    );
+    let Dep::Url(u) = &m.deps[0] else { panic!("expected UrlDep") };
+    assert_eq!(u.subpath.as_deref(), Some("packages/react-dom"));
+}
+
+#[test]
+fn s8_git_dep_no_subpath_is_none() {
+    let m = pkg("name \"x\"\ndeps {\n  foo git=(url)\"https://example.com/foo.git\" ref=\"main\"\n}\n");
+    let Dep::Url(u) = &m.deps[0] else { panic!("expected UrlDep") };
+    assert_eq!(u.subpath, None);
+}
+
+#[test]
+fn s8_tarball_dep_subpath_parses() {
+    let m = pkg(
+        "name \"x\"\ndeps {\n  foo tarball=(url)\"https://example.com/pkg.tar.gz\" subpath=\"pkg/foo\"\n}\n",
+    );
+    let Dep::Tarball(t) = &m.deps[0] else { panic!("expected TarballDep") };
+    assert_eq!(t.subpath.as_deref(), Some("pkg/foo"));
+}
+
+#[test]
+fn s8_tarball_dep_no_subpath_is_none() {
+    let m = pkg("name \"x\"\ndeps {\n  foo tarball=(url)\"https://example.com/pkg.tar.gz\"\n}\n");
+    let Dep::Tarball(t) = &m.deps[0] else { panic!("expected TarballDep") };
+    assert_eq!(t.subpath, None);
+}
+
+#[test]
+fn s8_git_dep_subpath_wrong_type_raises() {
+    assert_eq!(
+        doc_err(
+            "name \"x\"\ndeps {\n  foo git=(url)\"https://example.com/foo.git\" ref=\"main\" \
+             subpath=#true\n}\n"
+        ),
+        "MAN-DEP-UNKNOWN-PROPS"
+    );
+}
+
+#[test]
+fn s8_git_dep_subpath_round_trips() {
+    let m = pkg(
+        "name \"x\"\ndeps {\n  react-dom git=(url)\"https://github.com/facebook/react.git\" \
+         ref=\"main\" subpath=\"packages/react-dom\"\n}\n",
+    );
+    let out = crate::format::format_manifest(&m);
+    assert!(out.contains("subpath=\"packages/react-dom\""), "missing subpath in:\n{out}");
+    let m2 = pkg(&out);
+    let Dep::Url(u2) = &m2.deps[0] else { panic!("expected UrlDep") };
+    assert_eq!(u2.subpath.as_deref(), Some("packages/react-dom"));
+}
+
+#[test]
+fn s8_tarball_dep_subpath_round_trips() {
+    let m = pkg(
+        "name \"x\"\ndeps {\n  foo tarball=(url)\"https://example.com/pkg.tar.gz\" subpath=\"pkg/foo\"\n}\n",
+    );
+    let out = crate::format::format_manifest(&m);
+    assert!(out.contains("subpath=\"pkg/foo\""), "missing subpath in:\n{out}");
+    let m2 = pkg(&out);
+    let Dep::Tarball(t2) = &m2.deps[0] else { panic!("expected TarballDep") };
+    assert_eq!(t2.subpath.as_deref(), Some("pkg/foo"));
+}
+
+#[test]
+fn s8_manifest_parse_accepts_traversing_subpath_string() {
+    // The parser itself does NOT validate subpath — `source_id::normalize_source`
+    // is the SOLE validation boundary; a traversing string parses fine at the
+    // manifest layer (mirrors Python's identically-named test).
+    let m = pkg(
+        "name \"x\"\ndeps {\n  foo git=(url)\"https://example.com/foo.git\" ref=\"main\" \
+         subpath=\"../escape\"\n}\n",
+    );
+    let Dep::Url(u) = &m.deps[0] else { panic!("expected UrlDep") };
+    assert_eq!(u.subpath.as_deref(), Some("../escape"));
+}
+
+// ---------------------------------------------------------------------------
+// S8b — COMPLETE overrides grammar (rfc-origin-as-identity.md §7 B5 / §10
+// item 14): `OciTarget`/`TarballTarget`/`RegistryTarget` (Rust:
+// `OverrideTarget::{Oci,Tarball,Registry}`) + version-scoped overrides.
+// Mirrors Python's test_override_targets_extended.py grammar classes.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn s8b_oci_target_parses() {
+    let m = pkg(&format!(
+        "name \"x\"\noverrides {{\n  pkg \"foo\" oci=\"ghcr.io/acme/foo\" digest=\"sha256:{}\"\n}}\n",
+        "a".repeat(64)
+    ));
+    let ov = &m.overrides[0];
+    assert_eq!(ov.name, "foo");
+    let OverrideTarget::Oci { registry, repository, digest, subpath } = &ov.target else {
+        panic!("expected OverrideTarget::Oci")
+    };
+    assert_eq!(registry, "ghcr.io");
+    assert_eq!(repository, "acme/foo");
+    assert_eq!(digest, &format!("sha256:{}", "a".repeat(64)));
+    assert_eq!(*subpath, None);
+}
+
+#[test]
+fn s8b_oci_target_subpath_parses() {
+    let m = pkg(&format!(
+        "name \"x\"\noverrides {{\n  pkg \"foo\" oci=\"ghcr.io/acme/foo\" digest=\"sha256:{}\" \
+         subpath=\"pkg/foo\"\n}}\n",
+        "a".repeat(64)
+    ));
+    let OverrideTarget::Oci { subpath, .. } = &m.overrides[0].target else {
+        panic!("expected OverrideTarget::Oci")
+    };
+    assert_eq!(subpath.as_deref(), Some("pkg/foo"));
+}
+
+#[test]
+fn s8b_oci_target_missing_digest_raises() {
+    assert_eq!(
+        doc_err("name \"x\"\noverrides {\n  pkg \"foo\" oci=\"ghcr.io/acme/foo\"\n}\n"),
+        "MAN-OVERRIDE-DIGEST-MISSING"
+    );
+}
+
+#[test]
+fn s8b_oci_target_malformed_coordinate_no_slash_raises() {
+    assert_eq!(
+        doc_err(&format!(
+            "name \"x\"\noverrides {{\n  pkg \"foo\" oci=\"ghcronly\" digest=\"sha256:{}\"\n}}\n",
+            "a".repeat(64)
+        )),
+        "MAN-OVERRIDE-OCI-MALFORMED"
+    );
+}
+
+#[test]
+fn s8b_oci_target_round_trips() {
+    let m = pkg(&format!(
+        "name \"x\"\noverrides {{\n  pkg \"foo\" oci=\"ghcr.io/acme/foo\" digest=\"sha256:{}\"\n}}\n",
+        "b".repeat(64)
+    ));
+    let out = crate::format::format_manifest(&m);
+    let m2 = pkg(&out);
+    assert_eq!(m.overrides, m2.overrides);
+}
+
+#[test]
+fn s8b_tarball_target_parses() {
+    let m = pkg(
+        "name \"x\"\noverrides {\n  pkg \"foo\" tarball=(url)\"https://example.com/foo.tar.gz\" \
+         sha256=\"deadbeef\" strip_components=1\n}\n",
+    );
+    let OverrideTarget::Tarball { url, sha256, strip_components, subpath } = &m.overrides[0].target
+    else {
+        panic!("expected OverrideTarget::Tarball")
+    };
+    assert_eq!(url, "https://example.com/foo.tar.gz");
+    assert_eq!(sha256.as_deref(), Some("deadbeef"));
+    assert_eq!(*strip_components, 1);
+    assert_eq!(*subpath, None);
+}
+
+#[test]
+fn s8b_tarball_target_subpath_parses() {
+    let m = pkg(
+        "name \"x\"\noverrides {\n  pkg \"foo\" tarball=(url)\"https://example.com/foo.tar.gz\" \
+         subpath=\"pkg/foo\"\n}\n",
+    );
+    let OverrideTarget::Tarball { subpath, .. } = &m.overrides[0].target else {
+        panic!("expected OverrideTarget::Tarball")
+    };
+    assert_eq!(subpath.as_deref(), Some("pkg/foo"));
+}
+
+#[test]
+fn s8b_tarball_target_round_trips() {
+    let m = pkg(
+        "name \"x\"\noverrides {\n  pkg \"foo\" tarball=(url)\"https://example.com/foo.tar.gz\" \
+         sha256=\"deadbeef\" strip_components=1 subpath=\"pkg/foo\"\n}\n",
+    );
+    let out = crate::format::format_manifest(&m);
+    let m2 = pkg(&out);
+    assert_eq!(m.overrides, m2.overrides);
+}
+
+#[test]
+fn s8b_registry_target_parses() {
+    let m = pkg("name \"x\"\noverrides {\n  pkg \"old-fork\" named=\"widget\" namespace=\"acme\"\n}\n");
+    let ov = &m.overrides[0];
+    assert_eq!(ov.name, "old-fork");
+    let OverrideTarget::Registry { name, namespace } = &ov.target else {
+        panic!("expected OverrideTarget::Registry")
+    };
+    assert_eq!(name, "widget");
+    assert_eq!(namespace.as_deref(), Some("acme"));
+}
+
+#[test]
+fn s8b_registry_target_namespace_optional() {
+    let m = pkg("name \"x\"\noverrides {\n  pkg \"old-fork\" named=\"widget\"\n}\n");
+    let OverrideTarget::Registry { namespace, .. } = &m.overrides[0].target else {
+        panic!("expected OverrideTarget::Registry")
+    };
+    assert_eq!(*namespace, None);
+}
+
+#[test]
+fn s8b_registry_target_missing_named_raises() {
+    // No target form present at all -> ambiguous (namespace= alone never
+    // selects the registry form; `named=` is the discriminator).
+    assert_eq!(
+        doc_err("name \"x\"\noverrides {\n  pkg \"old-fork\" namespace=\"acme\"\n}\n"),
+        "MAN-OVERRIDE-TARGET-AMBIGUOUS"
+    );
+}
+
+#[test]
+fn s8b_registry_target_version_scoped() {
+    let m = pkg(
+        "name \"x\"\noverrides {\n  pkg \"old-fork\" named=\"widget\" namespace=\"acme\" \
+         version=\"1.0.0\"\n}\n",
+    );
+    assert_eq!(m.overrides[0].version, Some(milpa_types::Version::release(1, 0, 0)));
+}
+
+#[test]
+fn s8b_registry_target_round_trips() {
+    let m = pkg(
+        "name \"x\"\noverrides {\n  pkg \"old-fork\" named=\"widget\" namespace=\"acme\" \
+         version=\"1.0.0\"\n}\n",
+    );
+    let out = crate::format::format_manifest(&m);
+    let m2 = pkg(&out);
+    assert_eq!(m.overrides, m2.overrides);
+}
+
+#[test]
+fn s8b_target_ambiguity_two_new_forms_mixed_raises() {
+    assert_eq!(
+        doc_err(&format!(
+            "name \"x\"\noverrides {{\n  pkg \"foo\" oci=\"ghcr.io/a/b\" digest=\"sha256:{}\" \
+             tarball=(url)\"https://example.com/x.tar.gz\"\n}}\n",
+            "a".repeat(64)
+        )),
+        "MAN-OVERRIDE-TARGET-AMBIGUOUS"
+    );
+}
+
+#[test]
+fn s8b_target_ambiguity_old_and_new_form_mixed_raises() {
+    assert_eq!(
+        doc_err(
+            "name \"x\"\noverrides {\n  pkg \"foo\" git=(url)\"https://example.com/foo.git\" \
+             ref=\"main\" named=\"foo\"\n}\n"
+        ),
+        "MAN-OVERRIDE-TARGET-AMBIGUOUS"
+    );
 }

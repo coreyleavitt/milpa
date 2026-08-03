@@ -35,6 +35,10 @@ from milpa.errors import (
     LOCK_KDL_SYNTAX,
     LOCK_PROV_FIELD_ARITY,
     LOCK_PROV_FIELD_MISSING,
+    LOCK_SRC_FIELD_ARITY,
+    LOCK_SRC_FIELD_MISSING,
+    LOCK_SRC_KIND_MISSING,
+    LOCK_SRC_KIND_UNKNOWN,
     LOCK_SUBMODULE_FIELD_INVALID,
     LOCK_PROV_KIND_MISSING,
     LOCK_PROV_KIND_UNKNOWN,
@@ -42,6 +46,7 @@ from milpa.errors import (
     LOCK_VERSION_MISSING,
     LOCK_VERSION_UNSUPPORTED,
     RES_LOCKED_DRIFT,
+    SRC_ID_MALFORMED,
     VERIFY_ALIAS_SYMLINK_MISSING,
     MilpaError,
 )
@@ -70,6 +75,15 @@ from milpa.lockfile import (
 )
 from milpa.predicate import Predicate
 from milpa.registry import AuthorSigned, MilpaVendored, RekorRef
+from milpa.source_id import (
+    GitSourceId,
+    LocalSourceId,
+    MemberSourceId,
+    OciSourceId,
+    RegistrySourceId,
+    TarballSourceId,
+    normalize_source,
+)
 
 # ---------------------------------------------------------------------------
 # Fixture paths
@@ -1280,6 +1294,9 @@ class TestFixture118ByteExact:
             # A5: sibling source — this fixture's real version comes from the
             # fetched package's .nimble (step 2), same as the comment above.
             declared_version_source="nimble",
+            # S5 (rfc-origin-as-identity.md §4.1/§7): the structured on-disk
+            # source_id — normalize_source strips the trailing .git suffix.
+            source_id=normalize_source(GitSourceId(url="https://github.com/example/foo.git")),
         )
         graph = ResolvedGraph(deps=(dep,))
         lf = from_graph(graph, strategy="maxver")
@@ -2588,13 +2605,14 @@ class TestEdgesetToTermsRequiresPredicates:
     def test_no_predicates_gives_empty_dict(self) -> None:
         from milpa.dep_decl import EdgeSet, EdgeSource, NamedRequire
         from milpa.edge_sources import edgeset_to_terms
+        from milpa.registry import Index
 
         es = EdgeSet(
             requires=[NamedRequire(name="stew", constraint_str=">= 0.1.0")],
             src_dir="",
             source=EdgeSource.NIMBLE_FALLBACK,
         )
-        _, _, requires_predicates = edgeset_to_terms(es, {})
+        _, _, requires_predicates = edgeset_to_terms(es, {}, Index())
         assert requires_predicates == {}
 
     def test_predicate_bearing_entry_recorded(self) -> None:
@@ -2605,6 +2623,7 @@ class TestEdgesetToTermsRequiresPredicates:
         """
         from milpa.dep_decl import EdgeSet, EdgeSource, NamedRequire
         from milpa.edge_sources import edgeset_to_terms
+        from milpa.registry import Index
 
         p = Predicate(name="platform", values=("linux",), negated=False)
         es = EdgeSet(
@@ -2612,10 +2631,13 @@ class TestEdgesetToTermsRequiresPredicates:
             src_dir="",
             source=EdgeSource.NIMBLE_FALLBACK,
         )
-        _, _, requires_predicates = edgeset_to_terms(es, {})
-        assert "extra" in requires_predicates
+        _, _, requires_predicates = edgeset_to_terms(es, {}, Index())
+        # S5-rekey (RFC origin-as-identity §4.4): requires_predicates is
+        # keyed by the PubGrub solver-variable string — the canonical
+        # source-id form for an unqualified require against an empty index.
+        assert "pkg+tianguis/extra" in requires_predicates
         # New shape: list of tuples (one per occurrence)
-        assert requires_predicates["extra"] == [(p,)]
+        assert requires_predicates["pkg+tianguis/extra"] == [(p,)]
 
     def test_predicate_same_name_two_branches_accumulates(self) -> None:
         """Same dep name in two when branches → two predicate-tuples in the list.
@@ -2625,6 +2647,7 @@ class TestEdgesetToTermsRequiresPredicates:
         """
         from milpa.dep_decl import EdgeSet, EdgeSource, NamedRequire
         from milpa.edge_sources import edgeset_to_terms
+        from milpa.registry import Index
 
         p_linux = Predicate(name="platform", values=("linux",), negated=False)
         p_mac = Predicate(name="platform", values=("macosx",), negated=False)
@@ -2637,14 +2660,16 @@ class TestEdgesetToTermsRequiresPredicates:
             src_dir="",
             source=EdgeSource.NIMBLE_FALLBACK,
         )
-        dep_terms, requires_names, requires_predicates = edgeset_to_terms(es, {})
+        dep_terms, requires_names, requires_predicates = edgeset_to_terms(es, {}, Index())
+        # S5-rekey: requires_names/requires_predicates are keyed by the
+        # canonical solver-variable string (unqualified require, empty index).
         # Dep appears once in the solver (one term, one requires_name)
-        assert requires_names.count("foo") == 1
+        assert requires_names.count("pkg+tianguis/foo") == 1
         # Both predicate sets are recorded
-        assert "foo" in requires_predicates
-        assert len(requires_predicates["foo"]) == 2
-        assert (p_linux,) in requires_predicates["foo"]
-        assert (p_mac,) in requires_predicates["foo"]
+        assert "pkg+tianguis/foo" in requires_predicates
+        assert len(requires_predicates["pkg+tianguis/foo"]) == 2
+        assert (p_linux,) in requires_predicates["pkg+tianguis/foo"]
+        assert (p_mac,) in requires_predicates["pkg+tianguis/foo"]
 
     def test_cond_requires_in_locked_dep_via_resolved_dep(self) -> None:
         """_locked_from_resolved copies cond_requires from ResolvedDep."""
@@ -3168,6 +3193,191 @@ dep "foo" {{
         lf = parse_lockfile(text)
         dep = lf.deps[0]
         assert dep.aliases == ("alpha", "zebra")
+
+
+# ---------------------------------------------------------------------------
+# S3a-req (RFC origin-as-identity.md §4.7/B3) — format_dep_origin/collapse_notes:
+# the alias-collapse note visible on `milpa show` / the resolve trace.
+# ---------------------------------------------------------------------------
+
+
+class TestFormatDepOrigin:
+    """format_dep_origin — the origin string embedded in a collapse note."""
+
+    def test_git_provenance(self) -> None:
+        from milpa.lockfile import format_dep_origin
+
+        dep = _make_locked_dep_with_aliases()
+        assert format_dep_origin(dep) == "git+https://example.com/foo.git"
+
+    def test_tarball_provenance(self) -> None:
+        from milpa.lockfile import format_dep_origin
+
+        dep = LockedDep(
+            name="foo", identity=_VALID_IDENTITY, version="1.0.0", src_dir="src",
+            requires=(), provenances=(TarballProvenanceRecord(url="https://example.com/foo.tar.gz"),),
+        )
+        assert format_dep_origin(dep) == "tar+https://example.com/foo.tar.gz"
+
+    def test_oci_provenance(self) -> None:
+        from milpa.lockfile import format_dep_origin
+
+        dep = LockedDep(
+            name="foo", identity=_VALID_IDENTITY, version="1.0.0", src_dir="src",
+            requires=(),
+            provenances=(OciProvenanceRecord(registry="ghcr.io", repository="acme/foo", digest="sha256:" + "a" * 64),),
+        )
+        assert format_dep_origin(dep) == "oci+ghcr.io/acme/foo"
+
+    def test_prefers_observed_over_declared(self) -> None:
+        from milpa.lockfile import format_dep_origin
+
+        dep = LockedDep(
+            name="foo", identity=_VALID_IDENTITY, version="1.0.0", src_dir="src",
+            requires=(),
+            provenances=(
+                GitProvenanceRecord(url="https://mirror.example.com/foo.git", origin="declared"),
+                GitProvenanceRecord(url="https://example.com/foo.git", origin="observed"),
+            ),
+        )
+        assert format_dep_origin(dep) == "git+https://example.com/foo.git"
+
+    def test_no_provenance_falls_back_to_name(self) -> None:
+        from milpa.lockfile import format_dep_origin
+
+        dep = LockedDep(
+            name="foo", identity=_VALID_IDENTITY, version="1.0.0", src_dir="src",
+            requires=(), provenances=(),
+        )
+        assert format_dep_origin(dep) == "foo"
+
+
+class TestCollapseNotes:
+    """collapse_notes — one note per alias, shared by resolve() and `milpa show`."""
+
+    def test_empty_when_no_aliases(self) -> None:
+        from milpa.lockfile import collapse_notes
+
+        dep = _make_locked_dep_with_aliases()
+        assert collapse_notes([dep]) == []
+
+    def test_one_note_per_alias(self) -> None:
+        from milpa.lockfile import collapse_notes
+
+        dep = _make_locked_dep_with_aliases(aliases=("bar", "baz"))
+        notes = collapse_notes([dep])
+        assert notes == [
+            "'bar' and 'foo' both name git+https://example.com/foo.git; used 'foo'",
+            "'baz' and 'foo' both name git+https://example.com/foo.git; used 'foo'",
+        ]
+
+    def test_deterministic_order_across_deps(self) -> None:
+        """Notes are ordered by canonical dep name, regardless of input order."""
+        from milpa.lockfile import collapse_notes
+
+        dep_z = _make_locked_dep_with_aliases(name="zzz", aliases=("zzz-alias",))
+        dep_a = _make_locked_dep_with_aliases(name="aaa", aliases=("aaa-alias",))
+        notes = collapse_notes([dep_z, dep_a])
+        assert notes[0].startswith("'aaa-alias'")
+        assert notes[1].startswith("'zzz-alias'")
+
+
+class TestShowDisplaysCollapseNote:
+    """`milpa show` prints the collapse note next to the aliases line
+    (S3a-req, RFC origin-as-identity.md §4.7/B3) — the collapse must be
+    visible from the on-disk lockfile alone, not just from a live resolve."""
+
+    def test_show_prints_note_for_aliased_dep(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from milpa.cli import cmd_show
+
+        dep = _make_locked_dep_with_aliases(name="nimz3", aliases=("z3lib",))
+        lf = Lockfile(deps=(dep,))
+        (tmp_path / "milpa.lock").write_text(format_lockfile(lf), encoding="utf-8")
+
+        ret = cmd_show(tmp_path)
+        assert ret == 0
+        out = capsys.readouterr().out
+        assert "aliases     z3lib" in out
+        assert (
+            "note        'z3lib' and 'nimz3' both name git+https://example.com/foo.git; used 'nimz3'"
+            in out
+        ), f"expected the collapse note in `milpa show` output, got:\n{out}"
+
+    def test_show_no_note_when_no_aliases(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from milpa.cli import cmd_show
+
+        dep = _make_locked_dep_with_aliases()  # no aliases
+        lf = Lockfile(deps=(dep,))
+        (tmp_path / "milpa.lock").write_text(format_lockfile(lf), encoding="utf-8")
+
+        ret = cmd_show(tmp_path)
+        assert ret == 0
+        out = capsys.readouterr().out
+        assert "note" not in out
+
+
+# ---------------------------------------------------------------------------
+# Code-review S2 (control-char injection, defense-in-depth) — `milpa show`'s
+# `_format_provenance` sink must not print a raw control character even if
+# one somehow reaches a `ProvenanceRecord` (e.g. a hand-edited lockfile, or a
+# future caller of `normalize_source` that predates its S2 guard). This is
+# belt-and-suspenders on TOP OF the `normalize_source` rejection (source_id.py)
+# — the primary fix — not a substitute for it.
+# ---------------------------------------------------------------------------
+
+
+class TestFormatProvenanceEscapesControlChars:
+    def test_git_provenance_escapes_control_chars(self) -> None:
+        from milpa.cli import _format_provenance
+
+        evil_url = "https://evil.example/z3\x1b]0;PWNED\x07"
+        prov = GitProvenanceRecord(url=evil_url, ref="main")
+        out = _format_provenance(prov)
+        assert "\x1b" not in out
+        assert "\x07" not in out
+        # The escape sequence must still be legible to a human reader (repr
+        # form), not silently dropped.
+        assert "PWNED" in out
+
+    def test_tarball_provenance_escapes_control_chars(self) -> None:
+        from milpa.cli import _format_provenance
+        from milpa.lockfile import TarballProvenanceRecord
+
+        prov = TarballProvenanceRecord(url="https://evil.example/x\x1b.tar.gz")
+        out = _format_provenance(prov)
+        assert "\x1b" not in out
+
+    def test_local_provenance_escapes_control_chars(self) -> None:
+        from milpa.cli import _format_provenance
+        from milpa.lockfile import LocalProvenanceRecord
+
+        prov = LocalProvenanceRecord(path="deps/foo\x1bbar")
+        out = _format_provenance(prov)
+        assert "\x1b" not in out
+
+    def test_oci_provenance_escapes_control_chars(self) -> None:
+        from milpa.cli import _format_provenance
+        from milpa.lockfile import OciProvenanceRecord
+
+        prov = OciProvenanceRecord(
+            registry="ghcr.io\x1b", repository="x/y", digest="sha256:" + "0" * 64
+        )
+        out = _format_provenance(prov)
+        assert "\x1b" not in out
+
+    def test_ordinary_git_provenance_unaffected_content(self) -> None:
+        """Non-malicious provenance still round-trips its identifying
+        content into the output, just quoted (repr) instead of bare."""
+        from milpa.cli import _format_provenance
+
+        prov = GitProvenanceRecord(url="https://example.com/foo.git", ref="main")
+        out = _format_provenance(prov)
+        assert "https://example.com/foo.git" in out
+        assert "main" in out
 
 
 # ---------------------------------------------------------------------------
@@ -4266,6 +4476,7 @@ def _make_git_locked_dep(
     observed_url: str = "https://github.com/example/repo",
     declared_url: str | None = None,
     tarball_prov: bool = False,
+    namespace: str | None = None,
 ) -> LockedDep:
     """Build a LockedDep with git provenances for strip_dep_pin tests."""
     provs: list = [
@@ -4278,6 +4489,7 @@ def _make_git_locked_dep(
         provs.append(TarballProvenanceRecord(url="https://cdn.example.com/repo.tar.gz", origin="observed"))
     return LockedDep(
         name=name,
+        namespace=namespace,
         identity=identity,
         version="1.0.0",
         src_dir="src",
@@ -4355,6 +4567,61 @@ class TestStripDepPin:
         result = strip_dep_pin(lf, "mylib")
         stripped = next(d for d in result.deps if d.name == "mylib")
         assert stripped.provenances == ()
+
+    # -----------------------------------------------------------------
+    # P4 (namespace-conflation audit): namespace-aware matching.
+    #
+    # Before this fix, `strip_dep_pin` matched (and rebuilt `new_deps` by
+    # filtering) on bare `name` alone. Two locked deps sharing a bare name
+    # in different namespaces meant stripping ONE silently DELETED the
+    # other's entire lockfile entry — the sibling never survived the
+    # `d.name != canonical_name` filter.
+    # -----------------------------------------------------------------
+
+    def test_namespace_param_strips_only_matching_namespace(self) -> None:
+        """Two locked deps share bare name "foo" in different namespaces;
+        stripping ns1's pin must not touch ns2's entry at all."""
+        ns1_identity = "dag-sha256:" + "1" * 64
+        ns2_identity = "dag-sha256:" + "2" * 64
+        dep_ns1 = _make_git_locked_dep("foo", identity=ns1_identity, namespace="ns1")
+        dep_ns2 = _make_git_locked_dep("foo", identity=ns2_identity, namespace="ns2")
+        lf = Lockfile(deps=(dep_ns1, dep_ns2))
+
+        result = strip_dep_pin(lf, "foo", namespace="ns1")
+
+        stripped = next(
+            d for d in result.deps if d.name == "foo" and d.namespace == "ns1"
+        )
+        assert stripped.identity is None
+
+        # The ns2 sibling MUST survive, completely untouched.
+        untouched = next(
+            d for d in result.deps if d.name == "foo" and d.namespace == "ns2"
+        )
+        assert untouched == dep_ns2
+        assert untouched.identity == ns2_identity
+        assert len(result.deps) == 2, (
+            "stripping ns1's pin must not delete the ns2 sibling entry"
+        )
+
+    def test_bare_namespace_none_does_not_match_namespaced_sibling(self) -> None:
+        """An un-namespaced target (namespace=None, the default) must not
+        match — or delete — a same-bare-name dep that IS namespaced."""
+        dep_bare = _make_git_locked_dep("foo", namespace=None)
+        dep_ns1 = _make_git_locked_dep("foo", identity="dag-sha256:" + "3" * 64, namespace="ns1")
+        lf = Lockfile(deps=(dep_bare, dep_ns1))
+
+        result = strip_dep_pin(lf, "foo")  # namespace defaults to None
+
+        stripped = next(
+            d for d in result.deps if d.name == "foo" and d.namespace is None
+        )
+        assert stripped.identity is None
+        untouched = next(
+            d for d in result.deps if d.name == "foo" and d.namespace == "ns1"
+        )
+        assert untouched == dep_ns1
+        assert len(result.deps) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -4524,3 +4791,160 @@ dep "foo" {
         with pytest.raises(MilpaError) as exc_info:
             parse_lockfile(text)
         assert exc_info.value.slug == LOCK_PROV_FIELD_ARITY
+
+
+# ---------------------------------------------------------------------------
+# S5 (rfc-origin-as-identity.md §4.1/§7): structured on-disk `source { … }`
+# node — round-trip for all 6 SourceId kinds, `/`-bearing namespace
+# losslessness, and the LOCK-SRC-* / SRC-ID-MALFORMED parse-error boundary.
+# ---------------------------------------------------------------------------
+
+
+def _dep_with_source(name: str, sid: object, *, identity: str | None = None) -> LockedDep:
+    return LockedDep(
+        name=name,
+        identity=identity if identity is not None else "dag-sha256:" + "a" * 64,
+        version="1.0.0",
+        src_dir="",
+        requires=(),
+        provenances=(),
+        source_id=sid,  # type: ignore[arg-type]
+    )
+
+
+class TestStructuredSourceRoundTrip:
+    """Each of the 6 SourceId kinds serializes to a typed `source { … }`
+    block and parses back to an equal (field-wise) SourceId — no flat-string
+    parse, no information loss."""
+
+    @pytest.mark.parametrize(
+        "sid",
+        [
+            normalize_source(GitSourceId(url="https://github.com/coreyleavitt/nim-z3")),
+            normalize_source(
+                GitSourceId(
+                    url="https://github.com/facebook/react", subpath="packages/react-dom"
+                )
+            ),
+            normalize_source(OciSourceId(registry="ghcr.io", repository="coreyleavitt/softlink")),
+            normalize_source(TarballSourceId(url="https://example.com/dist/pkg-1.4.0.tar.gz")),
+            normalize_source(RegistrySourceId(registry="tianguis", namespace=None, name="softlink")),
+            normalize_source(RegistrySourceId(registry="tianguis", namespace="acme", name="utils")),
+            normalize_source(LocalSourceId(path="relative/path/from/workspace/root")),
+            normalize_source(MemberSourceId(member_name="intonaco")),
+        ],
+        ids=[
+            "git-no-subpath",
+            "git-subpath",
+            "oci",
+            "tarball",
+            "registry-no-namespace",
+            "registry-namespace",
+            "local",
+            "member",
+        ],
+    )
+    def test_round_trips(self, sid: object) -> None:
+        lf = Lockfile(deps=(_dep_with_source("dep", sid),))
+        text = format_lockfile(lf)
+        assert "    source {" in text
+        parsed = parse_lockfile(text)
+        assert parsed.deps[0].source_id == sid
+
+    def test_slash_bearing_namespace_round_trips_losslessly(self) -> None:
+        """RFC §4.1: a host-qualified namespace (e.g. codeberg.org/eris)
+        stores as an ordinary KDL string value — no splitting, no escaping."""
+        sid = normalize_source(
+            RegistrySourceId(registry="tianguis", namespace="codeberg.org/eris", name="eris")
+        )
+        lf = Lockfile(deps=(_dep_with_source("eris", sid),))
+        text = format_lockfile(lf)
+        assert 'namespace "codeberg.org/eris"' in text
+        parsed = parse_lockfile(text)
+        assert parsed.deps[0].source_id == sid
+        assert parsed.deps[0].source_id.namespace == "codeberg.org/eris"  # type: ignore[union-attr]
+
+    def test_git_url_carries_url_type_annotation(self) -> None:
+        """[[kdl_url_convention]]: URL-bearing source fields carry (url)."""
+        sid = normalize_source(GitSourceId(url="https://example.com/foo.git"))
+        lf = Lockfile(deps=(_dep_with_source("foo", sid),))
+        text = format_lockfile(lf)
+        assert 'url (url)"https://example.com/foo"' in text
+
+    def test_source_block_absent_for_none(self) -> None:
+        """Forward-compat: a lockfile predating S5 (no source_id) omits the
+        block entirely — never a sentinel."""
+        dep = LockedDep(
+            name="foo", identity=None, version="0.0.1", src_dir="", requires=(), provenances=()
+        )
+        assert dep.source_id is None
+        text = format_lockfile(Lockfile(deps=(dep,)))
+        assert "source {" not in text
+        parsed = parse_lockfile(text)
+        assert parsed.deps[0].source_id is None
+
+
+class TestStructuredSourceParseErrors:
+    """LOCK-SRC-* structural errors + the SRC-ID-MALFORMED validation
+    boundary (normalize_source, applied at lockfile-parse time too)."""
+
+    def _dep_block(self, source_block: str) -> str:
+        return f"""\
+version 1
+strategy "maxver"
+
+dep "foo" {{
+    {source_block}
+    version "1.0.0"
+    src_dir ""
+    requires
+}}
+"""
+
+    def test_missing_kind_raises_lock_src_kind_missing(self) -> None:
+        text = self._dep_block('source {\n        url "https://example.com/foo.git"\n    }')
+        with pytest.raises(MilpaError) as exc_info:
+            parse_lockfile(text)
+        assert exc_info.value.slug == LOCK_SRC_KIND_MISSING
+
+    def test_unknown_kind_raises_lock_src_kind_unknown(self) -> None:
+        text = self._dep_block('source {\n        kind "wat"\n    }')
+        with pytest.raises(MilpaError) as exc_info:
+            parse_lockfile(text)
+        assert exc_info.value.slug == LOCK_SRC_KIND_UNKNOWN
+
+    def test_missing_required_field_raises_lock_src_field_missing(self) -> None:
+        # git source with no url
+        text = self._dep_block('source {\n        kind "git"\n    }')
+        with pytest.raises(MilpaError) as exc_info:
+            parse_lockfile(text)
+        assert exc_info.value.slug == LOCK_SRC_FIELD_MISSING
+
+    def test_wrong_arity_field_raises_lock_src_field_arity(self) -> None:
+        text = self._dep_block(
+            'source {\n        kind "git" "extra"\n        url "https://example.com/foo.git"\n    }'
+        )
+        with pytest.raises(MilpaError) as exc_info:
+            parse_lockfile(text)
+        assert exc_info.value.slug == LOCK_SRC_FIELD_ARITY
+
+    def test_path_traversal_subpath_raises_src_id_malformed(self) -> None:
+        """normalize_source's subpath escape guard applies at lockfile-parse
+        time too — a poisoned lockfile cannot smuggle a `..`-traversal
+        subpath past the parse boundary."""
+        text = self._dep_block(
+            'source {\n        kind "git"\n        url "https://example.com/foo.git"\n'
+            '        subpath "../../etc"\n    }'
+        )
+        with pytest.raises(MilpaError) as exc_info:
+            parse_lockfile(text)
+        assert exc_info.value.slug == SRC_ID_MALFORMED
+
+    def test_oci_registry_with_slash_raises_src_id_malformed(self) -> None:
+        text = self._dep_block(
+            'source {\n        kind "oci"\n        registry "ghcr.io/nested"\n'
+            '        repository "x"\n    }'
+        )
+        with pytest.raises(MilpaError) as exc_info:
+            parse_lockfile(text)
+        assert exc_info.value.slug == SRC_ID_MALFORMED

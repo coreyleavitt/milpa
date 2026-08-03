@@ -3,6 +3,11 @@ version 1
 strategy "semver"
 
 dep "widget" {
+    source {
+        kind "registry"
+        registry "tianguis"
+        name "widget"
+    }
     identity "dag-sha256:fb180b3b124a26369e14772b749edb6efe364eea90a9d2c2eda9957783614303"
     version "1.5.0"
     src_dir "src"

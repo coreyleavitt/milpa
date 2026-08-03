@@ -3,6 +3,10 @@ version 1
 strategy "maxver"
 
 dep "alpha" {
+    source {
+        kind "member"
+        name "alpha"
+    }
     identity "dag-sha256:e07baf511c99d2d987bd0006b0cce998e0c57fe0509fd72069bced03dd14df8e"
     version "0.0.0"
     src_dir "src"
@@ -15,6 +19,10 @@ dep "alpha" {
 }
 
 dep "beta" {
+    source {
+        kind "member"
+        name "beta"
+    }
     identity "dag-sha256:5794a4876bc12d79cd898a64318b7d84307d9684a87ea99e9782db0bd5285ad8"
     version "0.0.0"
     src_dir "src"
@@ -27,6 +35,10 @@ dep "beta" {
 }
 
 dep "lib-shared" {
+    source {
+        kind "git"
+        url (url)"https://example.com/lib-shared"
+    }
     identity "dag-sha256:a2a162fab4799a401e9e9dc15af51faa6ce170c8d329464ae716b3ddf515da0c"
     version "0.0.0"
     src_dir ""

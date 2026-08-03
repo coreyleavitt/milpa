@@ -3,6 +3,10 @@ version 1
 strategy "maxver"
 
 dep "corelib" {
+    source {
+        kind "git"
+        url (url)"https://example.com/corelib"
+    }
     identity "dag-sha256:3c07925437559e08f7c69f2b2f102934010472764efdff055148c6bcd3f7bab0"
     version "0.0.0"
     src_dir ""
@@ -17,6 +21,10 @@ dep "corelib" {
 }
 
 dep "main-lib2" {
+    source {
+        kind "git"
+        url (url)"https://example.com/main-lib2"
+    }
     identity "dag-sha256:9052841dbb48a642d1defdfad9ea010dcec8d172f8d36c8ad131fd7da97559f9"
     version "0.0.0"
     src_dir ""

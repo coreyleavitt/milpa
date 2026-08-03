@@ -788,6 +788,8 @@ stdout. Does not resolve or fetch.
 >   identity    <algo>:<first-8-hex-chars>
 >   provenance  <transport> <url> @ <ref> (sha <first-8-sha-chars>)
 >   requires    <dep1>, <dep2>
+>   aliases     <alias1>, <alias2>
+>   note        <alias> and <name> both name <origin>; used <name>
 > ```
 >
 > The identity digest is truncated to 8 characters for readability.
@@ -795,6 +797,15 @@ stdout. Does not resolve or fetch.
 > different layout provided identity, provenance, and requires are
 > distinguishable. Machine-readable `show` output format is NOT frozen
 > for spec v1.0.
+>
+> NORMATIVE (RFC origin-as-identity.md §4.7/B3): when a dep has
+> `aliases` (Phase B dedup, or any other §4.7 slot-projection collapse,
+> merged two declared labels into one canonical dep), `show` MUST print
+> one `note` line per alias naming BOTH labels and the origin they
+> share — the collapse MUST be visible, never a silent disappearance.
+> The identical note text is also emitted to stderr at the end of a live
+> `resolve()`/`resolve_workspace()` (the resolve trace), so the collapse
+> is visible even to a caller who never runs `show`.
 
 **Exit codes:** 0 success, 1 failure (no lockfile, parse error).
 
@@ -946,6 +957,16 @@ content hashes. Does not fetch.
 > defaults (no CLI feature overrides at verify time) BEFORE the disk-state
 > check, so the correct slug fires when the lockfile was produced under a
 > different feature selection.
+
+> NORMATIVE (rfc-origin-as-identity.md §7.1 D2/D3, S5): `verify` MUST also
+> run `FROZEN-REGISTRY-ALIAS-UNRESOLVED` (checked first) and
+> `FROZEN-SOURCE-ID-MISMATCH` (declared-AFTER-override) — the SAME SSOT
+> wrapper (`check_source_id_preconditions_standalone` /
+> `check_source_id_preconditions_workspace`) `resolve_frozen`/
+> `resolve_workspace_frozen` call — positioned BEFORE the disk-state check,
+> alongside the active-flags check above (both are manifest-vs-lockfile
+> consistency checks, not disk-vs-lockfile checks). See
+> `spec/resolver-semantics.md` §7.1 conditions 11/12 for the full contract.
 
 **Exit codes:** 0 success (all hashes match), 1 failure (any divergence,
 missing lockfile, or missing `_deps/`).
@@ -1116,6 +1137,19 @@ milpa remove <dep>
 > member-local `milpa.lock` MUST NOT be written. The success message is
 > the same as for single-package `remove`.
 
+> NORMATIVE (namespace-conflation audit): `<dep>` MAY use the `ns/name`
+> slash-shorthand to identify a namespace-qualified dep. Whether `remove`
+> runs standalone or is delegated to from a workspace member directory
+> (S11e above), matching against the manifest's declared deps — both the
+> "is it declared" guard and the actual removal — MUST use the structured
+> `(name, namespace)` identity, never bare `name` alone. A bare `<dep>`
+> argument matches ONLY a dep declared with no namespace; it MUST NOT match
+> (and therefore MUST NOT remove) a same-bare-name dep that IS
+> namespace-qualified, even when exactly one such dep is declared. This
+> applies uniformly to both `remove` entry points so a member-directory
+> invocation cannot conflate two same-bare-name deps declared under
+> different namespaces.
+
 **Exit codes:** 0 success, 1 failure.
 
 **stdout:** none.
@@ -1178,6 +1212,19 @@ milpa update [<dep>]
 > re-resolve path (identical behavior to S11b above). The shared
 > `<ws_root>/milpa.lock` is written; a member-local `milpa.lock` MUST NOT
 > be written.
+
+> NORMATIVE (namespace-conflation audit): `<dep>` MAY use the `ns/name`
+> slash-shorthand to disambiguate a bare name shared by locked deps in
+> different namespaces (this applies identically to `--upgrade <dep>...`
+> on `fetch`/`lock`, which delegates to the same pin-stripping mechanism).
+> Matching against the lockfile — both the "is it locked" guard and the
+> actual pin-strip — MUST use the structured `(name, namespace)` identity,
+> never bare `name` alone: stripping/updating one namespaced dep's pin MUST
+> NOT alter or delete any other locked dep's entry, even one sharing the
+> same bare name under a different namespace. If a BARE `<dep>` argument
+> matches locked deps in 2 or more distinct namespaces, `update` MUST
+> reject with `LOCK-DEP-AMBIGUOUS-NAME` (exit 1) rather than resolving the
+> ambiguity by picking one arbitrarily.
 
 **Exit codes:** 0 success, 1 failure.
 

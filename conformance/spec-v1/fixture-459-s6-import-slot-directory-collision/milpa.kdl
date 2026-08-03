@@ -1,0 +1,15 @@
+// fixture-459: S6 (rfc-origin-as-identity.md §4.6/§10) — the v1
+// directory-slot import floor, RES-IMPORT-COLLISION.
+//
+// The hand-edited milpa.lock (NOT something a real `milpa fetch` would ever
+// produce — BindingResolver already prevents two origins from sharing one
+// label pre-fetch) records TWO distinct origins under the identical name
+// "foo" with DIFFERENT content. The frozen path reconstructs straight off
+// disk with no BindingResolver in the loop, so check_directory_slot_collisions
+// is what catches it — RFC §10 S6 "F4": the floor must cover the frozen path
+// from this slice, not wait for S5.
+name "testapp"
+kind "application"
+deps {
+    foo git=(url)"https://example.com/foo.git" ref="main"
+}

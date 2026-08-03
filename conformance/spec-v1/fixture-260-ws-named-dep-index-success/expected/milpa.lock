@@ -3,6 +3,10 @@ version 1
 strategy "maxver"
 
 dep "member-a" {
+    source {
+        kind "member"
+        name "member-a"
+    }
     identity "dag-sha256:f34341483bb5bbe1e59490c0c9315071dd9346c36f61b6fbf9a1553a29c875af"
     version "0.0.0"
     src_dir ""
@@ -15,6 +19,11 @@ dep "member-a" {
 }
 
 dep "namedlib" {
+    source {
+        kind "registry"
+        registry "tianguis"
+        name "namedlib"
+    }
     identity "dag-sha256:0d9b87a62e98d25767d3f49143475d7c022014cbed779295323c42c8bc462de7"
     version "1.0.0"
     src_dir ""

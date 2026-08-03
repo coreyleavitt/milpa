@@ -3,6 +3,10 @@ version 1
 strategy "maxver"
 
 dep "pkg-a" {
+    source {
+        kind "member"
+        name "pkg-a"
+    }
     identity "dag-sha256:dc534f178fdccdd65b406d86108489c7fd77dc7fe177e2a1414ef23d9d353cf2"
     version "0.0.0"
     src_dir "src"
@@ -15,6 +19,10 @@ dep "pkg-a" {
 }
 
 dep "pkg-b" {
+    source {
+        kind "member"
+        name "pkg-b"
+    }
     identity "dag-sha256:a8ff275c1f87c668282f3b25e29ef83c7f836c6ff69ae0c06daa7bb4a98bd49c"
     version "0.0.0"
     src_dir ""
@@ -27,6 +35,10 @@ dep "pkg-b" {
 }
 
 dep "pkg-c" {
+    source {
+        kind "member"
+        name "pkg-c"
+    }
     identity "dag-sha256:daaf48205b43377e541e6a19b70186efc20d312b96320413cb65efbb8221bd6a"
     version "0.0.0"
     src_dir ""

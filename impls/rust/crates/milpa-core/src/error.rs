@@ -33,6 +33,11 @@ pub enum CoreError {
     /// Raise sites for all five codes are S3b; S1 only wires `TNG-DEPDECL-PARSE-ERROR`
     /// (propagated from `parse_dep_decl` for KDL syntax / structural errors).
     DepDecl(&'static str, String),
+    /// `SourceId` wire-form / grammar failure (`SRC-*`; rfc-origin-as-identity.md
+    /// §4.1, S1). Its own domain (not folded into `Resolver`) because it is a
+    /// pure grammar/parse concern — mirrors Python's dedicated `SRC` errors.md
+    /// section.
+    SourceId(&'static str, String),
     /// S4c: post-fixpoint mutual-exclusion conflict (`RESOLVE-FLAG-CONFLICT`).
     /// Carries structured payload for byte-identity unit tests (RFC #23 §5 risk #3):
     ///   dep, flag_a, flag_b (lexicographic order), sources_a, sources_b
@@ -64,7 +69,8 @@ impl CoreError {
             | CoreError::Tianguis(c, _)
             | CoreError::Frozen(c, _)
             | CoreError::Workspace(c, _)
-            | CoreError::DepDecl(c, _) => c,
+            | CoreError::DepDecl(c, _)
+            | CoreError::SourceId(c, _) => c,
             CoreError::FlagConflict { .. } => "RESOLVE-FLAG-CONFLICT",
             CoreError::RatchetViolation { code, .. } => code,
         }
@@ -80,7 +86,8 @@ impl CoreError {
             | CoreError::Tianguis(_, m)
             | CoreError::Frozen(_, m)
             | CoreError::Workspace(_, m)
-            | CoreError::DepDecl(_, m) => m,
+            | CoreError::DepDecl(_, m)
+            | CoreError::SourceId(_, m) => m,
             CoreError::FlagConflict { .. } => {
                 // The payload fields (dep, flag_a, flag_b, sources_*) carry
                 // all diagnostic info; conformance only checks code(), not message.
@@ -146,6 +153,13 @@ impl CoreError {
             "LOCK-DEP-NAME-INVALID",
             // lockfile src_dir unsafe-char validation (mirrors MAN-SRC-DIR-UNSAFE).
             "LOCK-SRC-DIR-UNSAFE",
+            // LOCK-SRC-* (rfc-origin-as-identity.md §7, S5): the structured
+            // `source { … }` node's own parse errors — mirrors LOCK-PROV-*
+            // 1:1 but kept as distinct slugs (a different node kind).
+            "LOCK-SRC-FIELD-ARITY",
+            "LOCK-SRC-FIELD-MISSING",
+            "LOCK-SRC-KIND-MISSING",
+            "LOCK-SRC-KIND-UNKNOWN",
             "LOCK-FILE-NOT-FOUND",
             "LOCK-FILE-UNREADABLE",
             // verify path (lockfile ⟷ resolved graph) — S13.
@@ -157,6 +171,20 @@ impl CoreError {
             // the enumeration layer. A DISTINCT error class from
             // TNG-NO-SATISFYING-VERSION — fires only when the time-bound
             // itself empties an otherwise-non-empty candidate set.
+            // BindingResolver arbitration (rfc-origin-as-identity.md §4.3) — S2,
+            // wired into the live resolve()/resolve_workspace() path at S3a.
+            // Raised by `binding::BindingResolver::submit` when two transitive
+            // claims disagree on a dep's source-id and no root claim exists to
+            // arbitrate.
+            "RES-BINDING-CONFLICT",
+            // M6 / S5b (rfc-origin-as-identity.md §10 item 12 / B10): a root
+            // `overrides {}` entry naming a dep absent from the FINAL resolved
+            // graph is dead config (typo, or an orphaned override left behind
+            // after the dep it targeted was removed). Warn-only, non-fatal —
+            // same pattern as RES-REGISTRY-SHADOW's default policy. Checked
+            // post-resolve in both `resolve` and `resolve_workspace_inner`
+            // (the workspace path had no equivalent check before this slice).
+            "RES-DEAD-OVERRIDE",
             "RES-EXCLUDE-NEWER-EMPTY",
             // D4 (resolution-semantics RFC §3 Axis D / §6 D-D1/D-D2): a git/
             // url dep is pinned to one resolved commit (no candidate set),
@@ -164,11 +192,28 @@ impl CoreError {
             // than filtering a list — fires unconditionally (no fallback)
             // when the committer date exceeds the bound.
             "RES-EXCLUDE-NEWER-PIN",
+            // S6 (rfc-origin-as-identity.md §4.6): the v1 directory-slot
+            // floor of the import-slot check — lockfile::check_directory_
+            // slot_collisions. CAVEAT (durable, §4.6/G9): a non-firing run
+            // means "no directory-slot collision," NEVER "no import
+            // collision" (a symbol-level collision across two differently-
+            // named slots is unchecked until the S7 SymbolProviderPort).
+            "RES-IMPORT-COLLISION",
             // B3 (resolution-semantics RFC §3 Axis B / §6 D-B2): `--locked`
             // drift guard — identity + provenance based, never version-label.
             "RES-LOCKED-DRIFT",
+            // D3 (rfc-origin-as-identity.md §4.4.1): a `member "<name>"` dep
+            // declared in a single-package (non-workspace) manifest. Raised at
+            // root-seed time in both impls (Python drops silently pre-fix; Rust
+            // pushed an unsatisfiable term → cryptic SOLVE-CONFLICT).
+            "RES-MEMBER-OUTSIDE-WORKSPACE",
             "RES-NO-INDEX",
-            "RES-PROVENANCE-CONFLICT",
+            // Registry-shadow tripwire (rfc-origin-as-identity.md §6.1/§11
+            // D-Fork1) — S3c. Raised by `binding::check_registry_shadow` under
+            // `attestation-policy strict` when a transitive git=/tarball=/oci=
+            // claim's bare name shadows a registry-owned coordinate with no
+            // matching recorded upstream source (default policy: warn only).
+            "RES-REGISTRY-SHADOW",
             // §14.3 (resolver-semantics §14 "root satisfies its own name"):
             // a transitive `Named` claim on the standalone root's own name
             // carries a version constraint the root's own declared version
@@ -195,6 +240,8 @@ impl CoreError {
             "RES-WS-MEMBER-REF-UNKNOWN",
             // S5: named-dep → member auto-coerce constraint check (Breadth-P1c).
             "RES-WS-MEMBER-VERSION-CONSTRAINT",
+            // SourceId wire-form grammar (rfc-origin-as-identity.md §4.1) — S1.
+            "SRC-ID-MALFORMED",
             // tianguis index reader (registry-protocol §2–§4) — S8. The parse-
             // time validators + the resolve-time policy. TNG-BAD-VERSION is in
             // the catalog but unraised by both impls (reserved); not listed here
@@ -239,6 +286,14 @@ impl CoreError {
             // workspace-frozen disqualifications (S11b)
             "FROZEN-MEMBER-NOT-IN-WORKSPACE",
             "FROZEN-MEMBER-IDENTITY-DRIFT",
+            // rfc-origin-as-identity.md §7.1 D2/D3 (S5): checked FIRST —
+            // an unresolved registry alias must never be misreported as a
+            // coordinate mismatch.
+            "FROZEN-REGISTRY-ALIAS-UNRESOLVED",
+            // rfc-origin-as-identity.md §7.1 D2 (S5): normalize_source
+            // (declared-AFTER-override) must equal the lockfile record's
+            // source_id, or frozen/verify fails closed.
+            "FROZEN-SOURCE-ID-MISMATCH",
             // workspace topology (workspace-semantics) — S11a loader. The
             // resolve-time RES-WS-* codes live in the resolver domain; the two
             // workspace-frozen FROZEN-MEMBER-* codes land in S11b.
@@ -272,6 +327,11 @@ impl CoreError {
             "LOCK-DEPDECL-PIN-MISSING",
             // lockfile verb (update/add --mirror): dep absent in the lock.
             "LOCK-DEP-NOT-FOUND",
+            // update/remove given a bare name that is ambiguous across namespaces
+            // (two same-bare-name deps under different namespaces). Python CLI
+            // raises this; the Rust CLI's namespace-aware arg handling is #189,
+            // but the code is registered here to keep the spec↔catalog bijection.
+            "LOCK-DEP-AMBIGUOUS-NAME",
             // DepDecl artifact parse/verify (spec/dep-decl.md §6) — S1 wires
             // TNG-DEPDECL-PARSE-ERROR; remaining four raise sites are S3b.
             "TNG-DEPDECL-PARSE-ERROR",
@@ -401,6 +461,21 @@ impl MilpaError {
             MilpaError::Solver(e) => e.code(),
             MilpaError::Fetch(e) => e.code(),
             MilpaError::Core(e) => e.code(),
+        }
+    }
+
+    /// The human-readable diagnostic message, when available (never
+    /// compared by the conformance harness — for logs and for composing
+    /// nested diagnostics, e.g. `source_id::normalize_source`'s validation
+    /// failures). Only `CoreError` currently exposes a
+    /// message string; the other three domains expose `.code()` only
+    /// (message text is genuinely never conformance-checked), so this
+    /// falls back to the code itself rather than growing a `.message()`
+    /// method on every domain error type for one call site.
+    pub fn message(&self) -> &str {
+        match self {
+            MilpaError::Core(e) => e.message(),
+            other => other.code(),
         }
     }
 

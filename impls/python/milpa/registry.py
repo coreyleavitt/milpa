@@ -214,11 +214,25 @@ class OciIndexProvenance:
     published before this field existed, and on any OCI-published version
     whose publisher genuinely had no git source to record (e.g. a
     local/tarball-sourced publish). Purely additive/informational at the
-    parse layer: absence changes no other behavior. It exists so a consumer
-    (the resolver) can reconcile an OCI-only registry entry against an
-    unrelated transitive ``git=`` reference to the SAME upstream repository —
-    without it, the two are structurally indistinguishable even when they
-    are, in fact, the same package.
+    parse layer: absence changes no other behavior.
+
+    **Audit-only provenance metadata (RFC origin-as-identity §3.2/§6 — S3b
+    re-home).** Under coordinate-is-origin, a ``named`` dep's source-id IS
+    its registry coordinate and a ``git=`` dep's source-id is its own
+    normalized URL — the two are simply *different packages*, never
+    auto-unified by inspecting this field (a registry identity is never
+    silently merged with a look-alike repo by URL comparison; ``overrides {}``
+    is the explicit bridge). ``source_url`` no longer participates in
+    *resolution*/source selection (the reconciliation role this docstring
+    used to describe, ``_validate_transitive_url_against_registry``, is
+    deleted). Its remaining consumer is orthogonal: the pre-fetch
+    registry-shadow dependency-confusion tripwire
+    (``binding.check_registry_shadow``, §6.1) reads it — alongside
+    ``GitIndexProvenance.url`` — purely as a TRUST/audit signal ("does this
+    transitive's claimed source match what the registry recorded this
+    package was published from"), not to pick a source-id. "Which repo was
+    this artifact built from" remains useful for attestation/traceability
+    even where it plays no role in resolution.
     """
 
     registry: str
@@ -763,6 +777,22 @@ def parse_index(text: str) -> Index:
         _validate_no_control_chars(name, "name")
         namespace = _child_scalar(top_node, "namespace") or ""
         _validate_no_control_chars(namespace, "namespace")
+        # rfc-origin-as-identity.md §4.1 S1 proposed applying the FULL
+        # `_validate_safe_name` check (which blanket-rejects any '/') to
+        # `namespace`, matching `name`. NOT applied here — investigation
+        # (during this slice) found it would reject essentially the ENTIRE
+        # real, live tianguis index: every vendored non-milpa-native nimble
+        # package's `namespace` is HOST-QUALIFIED (`"github.com/<user>"`,
+        # `"bitbucket.org/<user>"`, `"codeberg.org/<user>"`, ...) by a
+        # deliberate, load-bearing global-uniqueness convention — real,
+        # legitimate, non-traversal '/' usage, not an injection attempt.
+        # `dep_dir_name` (version.py) already handles a slashed namespace
+        # safely as ordinary nested `_deps/@<namespace>/<name>` directories
+        # (no sandbox escape — Path nesting, not traversal). Flagged back to
+        # the RFC as a blocker: this "gap fix" is folded from a false
+        # premise and needs a resolved design (narrower ".."/absolute-only
+        # guard vs. a `pkg+` grammar rework for '/'-bearing namespaces)
+        # before it can land. See S1's report for the human decision.
         versions, diagnostics = _parse_versions(name, namespace, top_node)
         for diag in diagnostics:
             warnings.warn(diag, stacklevel=2)

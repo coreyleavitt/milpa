@@ -60,6 +60,15 @@ pub struct UrlDep {
     /// package's own manifest/tag (steps 1-3) yield none. `None` when absent
     /// (the common case).
     pub version: Option<Version>,
+    /// `subpath` (rfc-origin-as-identity.md §4.1/S8): the dep lives at this
+    /// location INSIDE the fetched tree, not the repo root. `None` (the
+    /// common case) means the repo root. Threaded into
+    /// `FetchableOrigin::Git.subpath` at source-id construction
+    /// (`binding.rs`); escape-guarded (no `..`, no absolute path) by
+    /// `source_id::normalize_source` at resolve time — the parser itself
+    /// does not validate the string (single validation boundary, mirroring
+    /// `source_id.rs`'s module docs). Mirrors Python's `UrlDep.subpath`.
+    pub subpath: Option<String>,
 }
 
 /// A dep resolved through the tianguis index by name (grammar §3.2 NamedDep).
@@ -135,6 +144,9 @@ pub struct TarballDep {
     pub predicates: Vec<Predicate>,
     /// A3b (§3 Axis A (b) step 4) — see `UrlDep::version` for the rationale.
     pub version: Option<Version>,
+    /// `subpath` (rfc-origin-as-identity.md §4.1/S8) — see `UrlDep::subpath`
+    /// for the full rationale; threaded into `FetchableOrigin::Tarball.subpath`.
+    pub subpath: Option<String>,
 }
 
 /// A workspace-internal member reference (grammar §3.2 MemberDep).
@@ -186,15 +198,17 @@ impl Dep {
     }
 }
 
-/// Discriminated union of override target kinds (S8, RFC #23 §3.3).
+/// Discriminated union of override target kinds (S8/S8b, RFC #23 §3.3 +
+/// rfc-origin-as-identity.md §7 B5 "overrides {} is the sole rebind bridge").
 ///
 /// Exactly one variant per `pkg` rule; zero or multiple forms raise
-/// `MAN-OVERRIDE-TARGET-AMBIGUOUS`.
+/// `MAN-OVERRIDE-TARGET-AMBIGUOUS`. Mirrors Python's `manifest.OverrideTarget`
+/// six-way union function-for-function.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OverrideTarget {
-    /// `pkg "name" git=(url)"..." ref="..."` — git fork.
+    /// `pkg "name" git=(url)"..." ref="..." [subpath="<p>"]` — git fork.
     /// Identity-bearing; CAS-admissible.
-    Git { url: String, git_ref: String },
+    Git { url: String, git_ref: String, subpath: Option<String> },
     /// `pkg "name" local="<relative-path>"` — local filesystem path.
     /// Liveness-only; NOT CAS-admissible; non-reproducible for external consumers.
     /// Resolution wired in S8a.
@@ -203,12 +217,30 @@ pub enum OverrideTarget {
     /// Identity-bearing; NOT CAS-admissible.
     /// Resolution wired in S8b.
     Member { member_name: String },
+    /// `pkg "name" oci="<registry>/<repository>" digest="sha256:..." [subpath="<p>"]`
+    /// (rfc-origin-as-identity.md §7 B5, S8b) — a fixed OCI artifact.
+    /// Identity-bearing; CAS-admissible; resolved as a direct,
+    /// index-independent OCI pull (no first-class manifest `oci=` dep form —
+    /// only this override target).
+    Oci { registry: String, repository: String, digest: String, subpath: Option<String> },
+    /// `pkg "name" tarball=(url)"<URL>" [sha256="<hex>"] [strip_components=<N>]
+    /// [subpath="<p>"]` (rfc-origin-as-identity.md §7 B5, S8b) — mirrors
+    /// `TarballDep` field-for-field. Identity-bearing; CAS-admissible.
+    Tarball { url: String, sha256: Option<String>, strip_components: u32, subpath: Option<String> },
+    /// `pkg "name" named="<registry-name>" [namespace="<ns>"]`
+    /// (rfc-origin-as-identity.md §7 B5, S8b) — redirect a dep TO a tianguis
+    /// registry coordinate (the inverse of the other five forms). No
+    /// `subpath` — a registry entry is already scoped to exactly its
+    /// published subtree. Composes with `Override.version` (D-A3): when set,
+    /// becomes an EXACT `== <version>` constraint on the redirected lookup.
+    Registry { name: String, namespace: Option<String> },
 }
 
-/// A `pkg`-form override (S8 discriminated union, grammar §3.4).
+/// A `pkg`-form override (S8/S8b discriminated union, grammar §3.4 +
+/// rfc-origin-as-identity.md §7 B5).
 ///
-/// `name` is the dep to intercept; `target` is exactly one of
-/// `Git`, `Local`, or `Member`.
+/// `name` is the dep to intercept; `target` is exactly one of the six
+/// `OverrideTarget` variants.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Override {
     pub name: String,
@@ -339,6 +371,13 @@ pub struct Manifest {
     /// resolution policy (`resolution { strategy "..." }`). `None` means no
     /// `resolution { }` node was declared at all.
     pub resolution: Option<Resolution>,
+    /// S7 (rfc-origin-as-identity.md §4.6): the package's own declared Nim
+    /// import symbols, from a top-level `provides { module "x" ... }` block.
+    /// Consumed by `ManifestDeclaredSymbolProvider` (`import_slot.rs`).
+    /// Empty (the default) means this manifest declares no `provides` block.
+    /// Package-only — a workspace root has no `provides` concept (mirrors
+    /// Python's `Manifest.provides`; `WorkspaceManifest` has no such field).
+    pub provides: Vec<String>,
 }
 
 /// A parsed workspace-root `milpa.kdl` (grammar §7). Pure container: member
@@ -543,6 +582,16 @@ const MAN_CODES: &[&str] = &[
     "MAN-OVERRIDE-GIT-MISSING",
     "MAN-OVERRIDE-REF-MISSING",
     "MAN-OVERRIDE-DUPLICATE",
+    // S8b (rfc-origin-as-identity.md §7 B5): the three extended override
+    // target kinds (oci/tarball/named-registry) — mirrors Python's
+    // manifest.py exactly.
+    "MAN-OVERRIDE-OCI-MALFORMED",
+    "MAN-OVERRIDE-DIGEST-MISSING",
+    "MAN-OVERRIDE-NAMED-MISSING",
+    // S7 (rfc-origin-as-identity.md §4.6): the `provides { module "x" }`
+    // manifest block.
+    "MAN-PROVIDES-UNKNOWN-NODE",
+    "MAN-PROVIDES-MODULE-ARITY",
     "MAN-FLAG-CONFLICTS-UNDECLARED",
     "MAN-FLAG-CONFLICTS-SELF",
     "MAN-FLAG-DEFINES-UNSAFE",
@@ -651,7 +700,7 @@ fn children(node: &KdlNode) -> Vec<&KdlNode> {
 }
 
 const PREDICATE_PROPS: &[&str] = &["platform", "arch", "nim", "milpa", "flag"];
-const URL_DEP_PROPS: &[&str] = &["git", "ref", "platform", "arch", "nim", "milpa", "flag", "optional", "version"];
+const URL_DEP_PROPS: &[&str] = &["git", "ref", "platform", "arch", "nim", "milpa", "flag", "optional", "version", "subpath"];
 const FLAG_DECL_PROPS: &[&str] = &["default", "description"];
 const VALID_KINDS: &[&str] = &["library", "application"];
 const VALID_GIT_SCHEMES: &[&str] = &["https", "http", "ssh", "git"];
@@ -682,6 +731,9 @@ const PACKAGE_TOP_LEVEL: &[&str] = &[
     // resolution policy block. First appearance carries only `strategy`;
     // Axis D's `exclude-newer` extends it in a later slice.
     "resolution",
+    // S7 (rfc-origin-as-identity.md §4.6): the package's own declared Nim
+    // import symbols.
+    "provides",
 ];
 const WORKSPACE_TOP_LEVEL: &[&str] = &[
     "workspace",
@@ -1079,6 +1131,7 @@ fn parse_workspace_doc(doc: &KdlDocument) -> Result<Workspace, ManifestError> {
                             format!("duplicate override for {:?}", ov.name),
                         ));
                     }
+                    let ov = finish_override_version(child, ov)?;
                     overrides.push(ov);
                 }
             }
@@ -1277,6 +1330,8 @@ fn parse_manifest_doc(doc: &KdlDocument) -> Result<Manifest, ManifestError> {
     let mut index_history_policy_explicit = false;
     // C3 (rfc-resolution-semantics.md §3 Axis C / §5): resolution { } block.
     let mut resolution: Option<Resolution> = None;
+    // S7 (rfc-origin-as-identity.md §4.6): provides { module "x" } block.
+    let mut provides: Vec<String> = Vec::new();
 
     // S5b: seen_names key is the solver variable (namespace::name or bare name),
     // so two qualified deps with the same bare name but different namespaces
@@ -1391,6 +1446,7 @@ fn parse_manifest_doc(doc: &KdlDocument) -> Result<Manifest, ManifestError> {
                             format!("duplicate override for {:?}", ov.name),
                         ));
                     }
+                    let ov = finish_override_version(child, ov)?;
                     overrides.push(ov);
                 }
             }
@@ -1425,6 +1481,32 @@ fn parse_manifest_doc(doc: &KdlDocument) -> Result<Manifest, ManifestError> {
                         ));
                     }
                     self_mirrors.push(url_arg("top-level mirrors", "mirror", a[0])?);
+                }
+            }
+            "provides" => {
+                // S7 (rfc-origin-as-identity.md §4.6): the package's own
+                // declared Nim import symbols. Each child MUST be named
+                // `module` and carry exactly one string argument.
+                for child in children(node) {
+                    if child.name().value() != "module" {
+                        return Err(err(
+                            "MAN-PROVIDES-UNKNOWN-NODE",
+                            format!(
+                                "unknown node {:?} in 'provides' block (only 'module' is allowed)",
+                                child.name().value()
+                            ),
+                        ));
+                    }
+                    let a = args(child);
+                    let val = a.first().and_then(|e| e.value().as_string());
+                    if a.len() != 1 || val.is_none() {
+                        return Err(err(
+                            "MAN-PROVIDES-MODULE-ARITY",
+                            "'provides.module' takes exactly one positional string argument \
+                             (a Nim-importable module path)",
+                        ));
+                    }
+                    provides.push(val.unwrap().to_string());
                 }
             }
             "attestation-policy" => {
@@ -1608,6 +1690,7 @@ fn parse_manifest_doc(doc: &KdlDocument) -> Result<Manifest, ManifestError> {
         index_history_policy_explicit,
         optional_auto_flags,
         resolution,
+        provides,
     })
 }
 
@@ -2044,6 +2127,13 @@ fn parse_url_dep_inner(node: &KdlNode, dep_nm: &str) -> Result<UrlDep, ManifestE
     // A3b: version= annotation (§3 Axis A (b) step 4).
     let version = parse_dep_version_prop(node, &format!("dep {name:?}"))?;
 
+    // subpath= (rfc-origin-as-identity.md §4.1/S8): dep lives at this
+    // location INSIDE the fetched tree, not the repo root. NOT validated
+    // here — `source_id::normalize_source` is the sole validation boundary
+    // (escape-guard: no `..`, no absolute path); the parser only checks that
+    // a present value is a string.
+    let subpath = parse_subpath_prop(node, &format!("dep {name:?}"))?;
+
     Ok(UrlDep {
         name,
         git,
@@ -2053,7 +2143,33 @@ fn parse_url_dep_inner(node: &KdlNode, dep_nm: &str) -> Result<UrlDep, ManifestE
         flag_requests,
         optional,
         version,
+        subpath,
     })
+}
+
+/// Parse an optional `subpath="<path>"` property, shared by `UrlDep`/
+/// `TarballDep`/override parsing (rfc-origin-as-identity.md §4.1/S8-S8b).
+/// Returns `Ok(None)` when the property is absent; `Err(bad_type_code)` when
+/// present but not a string. `bad_type_code` differs by caller (dep grammar
+/// uses `MAN-DEP-UNKNOWN-PROPS`; override grammar uses
+/// `MAN-OVERRIDE-UNKNOWN-PROPS`) — mirrors Python's inline `subpath=` parsing
+/// in `_parse_url_dep`/`_parse_tarball_dep`/`_parse_overrides_block`.
+fn parse_subpath_prop_coded(
+    node: &KdlNode,
+    context: &str,
+    bad_type_code: &'static str,
+) -> Result<Option<String>, ManifestError> {
+    match prop(node, "subpath") {
+        None => Ok(None),
+        Some(e) => match e.value().as_string() {
+            Some(s) => Ok(Some(s.to_string())),
+            None => Err(err(bad_type_code, format!("{context}: 'subpath=' must be a string"))),
+        },
+    }
+}
+
+fn parse_subpath_prop(node: &KdlNode, context: &str) -> Result<Option<String>, ManifestError> {
+    parse_subpath_prop_coded(node, context, "MAN-DEP-UNKNOWN-PROPS")
 }
 
 #[allow(clippy::type_complexity)]
@@ -2173,7 +2289,7 @@ fn parse_tarball_dep(node: &KdlNode) -> Result<TarballDep, ManifestError> {
 
 fn parse_tarball_dep_inner(node: &KdlNode, dep_nm: &str) -> Result<TarballDep, ManifestError> {
     let name = dep_nm.to_string();
-    let allowed = ["tarball", "sha256", "strip_components", "version"];
+    let allowed = ["tarball", "sha256", "strip_components", "version", "subpath"];
     let extra: Vec<&str> = prop_names(node)
         .into_iter()
         .filter(|p| !allowed.contains(p))
@@ -2226,6 +2342,9 @@ fn parse_tarball_dep_inner(node: &KdlNode, dep_nm: &str) -> Result<TarballDep, M
     };
     // A3b: version= annotation (§3 Axis A (b) step 4).
     let version = parse_dep_version_prop(node, &format!("dep {name:?}"))?;
+    // subpath= (rfc-origin-as-identity.md §4.1/S8) — see UrlDep's subpath
+    // parsing for the full rationale (not validated here).
+    let subpath = parse_subpath_prop(node, &format!("dep {name:?}"))?;
     Ok(TarballDep {
         name,
         url,
@@ -2233,6 +2352,7 @@ fn parse_tarball_dep_inner(node: &KdlNode, dep_nm: &str) -> Result<TarballDep, M
         strip_components,
         predicates: vec![], // Populated by expand_dep_child from when-block.
         version,
+        subpath,
     })
 }
 
@@ -2754,10 +2874,37 @@ fn parse_flag_decl(node: &KdlNode) -> Result<FlagDecl, ManifestError> {
     })
 }
 
-/// Known property keys on a `pkg` override node across all target forms.
+/// Known property keys on a `pkg` override node across all target forms
+/// (S8/S8b, rfc-origin-as-identity.md §7 B5 — the six target kinds).
 /// A3b: `version` is valid on every target form (D-A3 — orthogonal to which
 /// redirect form is chosen; labels that target's step 4).
-const OVERRIDE_KNOWN_PROPS: &[&str] = &["git", "ref", "local", "version"];
+const OVERRIDE_KNOWN_PROPS: &[&str] = &[
+    "git", "ref", "local", "version", "subpath",
+    "oci", "digest", "tarball", "sha256", "strip_components",
+    "named", "namespace",
+];
+
+/// Split an `oci=` override value `<registry>/<repository>` on its FIRST
+/// `/`. Deliberately a small local duplicate of `source_spec::split_oci_target`
+/// (same "first-'/'-is-the-registry-boundary" rule) — `milpa-manifest` is pure
+/// grammar and must not depend on `milpa-core`'s fetchers-adjacent
+/// `source_spec` module (layering; mirrors Python's own local duplicate in
+/// `manifest.py::_split_oci_coordinate`, which documents the identical
+/// rationale).
+fn split_oci_coordinate(token: &str, pkg_name: &str) -> Result<(String, String), ManifestError> {
+    match token.find('/') {
+        Some(pos) if pos > 0 && pos + 1 < token.len() => {
+            Ok((token[..pos].to_string(), token[pos + 1..].to_string()))
+        }
+        _ => Err(err(
+            "MAN-OVERRIDE-OCI-MALFORMED",
+            format!(
+                "override for {pkg_name:?}: 'oci=' must be '<registry>/<repository>' \
+                 (non-empty on both sides of the first '/'); got {token:?}"
+            ),
+        )),
+    }
+}
 
 fn parse_override(node: &KdlNode) -> Result<Override, ManifestError> {
     if node.name().value() != "pkg" {
@@ -2794,6 +2941,9 @@ fn parse_override(node: &KdlNode) -> Result<Override, ManifestError> {
     // Detect which target forms are present.
     let has_git = prop(node, "git").is_some();
     let has_local = prop(node, "local").is_some();
+    let has_oci = prop(node, "oci").is_some();
+    let has_tarball = prop(node, "tarball").is_some();
+    let has_named = prop(node, "named").is_some();
     let child_nodes = children(node);
     let member_children: Vec<_> = child_nodes
         .iter()
@@ -2801,7 +2951,7 @@ fn parse_override(node: &KdlNode) -> Result<Override, ManifestError> {
         .collect();
     let has_member = !member_children.is_empty();
 
-    let target_count = [has_git, has_local, has_member]
+    let target_count = [has_git, has_local, has_member, has_oci, has_tarball, has_named]
         .iter()
         .filter(|&&b| b)
         .count();
@@ -2810,9 +2960,23 @@ fn parse_override(node: &KdlNode) -> Result<Override, ManifestError> {
             "MAN-OVERRIDE-TARGET-AMBIGUOUS",
             format!(
                 "override for {name:?}: exactly one provenance form is required \
-                 (git, local, or member); got {} ({})",
+                 (git, local, member, oci, tarball, or named/registry); got {} ({})",
                 target_count,
                 if target_count == 0 { "none" } else { "multiple forms mixed" }
+            ),
+        ));
+    }
+
+    // subpath= — valid on git/oci/tarball forms only (mirrors SourceId:
+    // Local/Member/Registry carry no subpath concept). Parsed once, here,
+    // since it's shared across those three forms.
+    let subpath = parse_subpath_prop_coded(node, &format!("override for {name:?}"), "MAN-OVERRIDE-UNKNOWN-PROPS")?;
+    if subpath.is_some() && !(has_git || has_oci || has_tarball) {
+        return Err(err(
+            "MAN-OVERRIDE-UNKNOWN-PROPS",
+            format!(
+                "override for {name:?}: 'subpath=' is only valid on the git, oci, \
+                 or tarball override forms"
             ),
         ));
     }
@@ -2837,7 +3001,7 @@ fn parse_override(node: &KdlNode) -> Result<Override, ManifestError> {
                 )
             })?
             .to_string();
-        OverrideTarget::Git { url, git_ref }
+        OverrideTarget::Git { url, git_ref, subpath }
     } else if has_local {
         let local_entry = prop(node, "local").unwrap();
         let path = local_entry
@@ -2852,6 +3016,94 @@ fn parse_override(node: &KdlNode) -> Result<Override, ManifestError> {
             })?
             .to_string();
         OverrideTarget::Local { path }
+    } else if has_oci {
+        let oci_entry = prop(node, "oci").unwrap();
+        let oci_coord = oci_entry
+            .value()
+            .as_string()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                err(
+                    "MAN-OVERRIDE-OCI-MALFORMED",
+                    format!(
+                        "override for {name:?}: 'oci=' must be a non-empty \
+                         '<registry>/<repository>' string"
+                    ),
+                )
+            })?;
+        let (registry, repository) = split_oci_coordinate(oci_coord, &name)?;
+        let digest = prop(node, "digest")
+            .and_then(|e| e.value().as_string())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                err(
+                    "MAN-OVERRIDE-DIGEST-MISSING",
+                    format!(
+                        "override for {name:?}: oci form requires a 'digest=' property \
+                         (sha256:<64-hex>)"
+                    ),
+                )
+            })?
+            .to_string();
+        OverrideTarget::Oci { registry, repository, digest, subpath }
+    } else if has_tarball {
+        let tarball_entry = prop(node, "tarball").unwrap();
+        let url = url_arg(&format!("override {name:?}"), "tarball", tarball_entry)?;
+        if url.is_empty() {
+            return Err(err(
+                "MAN-DEP-TARBALL-URL",
+                format!("override for {name:?}: 'tarball=' URL must not be empty"),
+            ));
+        }
+        let sha256 = match prop(node, "sha256") {
+            None => None,
+            Some(e) => match e.value().as_string() {
+                Some(s) => Some(s.to_string()),
+                None => {
+                    return Err(err(
+                        "MAN-DEP-TARBALL-SHA",
+                        format!("override for {name:?}: 'sha256=' must be a string"),
+                    ));
+                }
+            },
+        };
+        let strip_components = match prop(node, "strip_components") {
+            None => 0u32,
+            Some(e) => match e.value() {
+                KdlValue::Integer(i) if *i >= 0 => u32::try_from(*i).map_err(|_| {
+                    err(
+                        "MAN-DEP-TARBALL-STRIP",
+                        format!("override for {name:?}: 'strip_components=' out of range"),
+                    )
+                })?,
+                _ => {
+                    return Err(err(
+                        "MAN-DEP-TARBALL-STRIP",
+                        format!(
+                            "override for {name:?}: 'strip_components=' must be a \
+                             non-negative integer"
+                        ),
+                    ));
+                }
+            },
+        };
+        OverrideTarget::Tarball { url, sha256, strip_components, subpath }
+    } else if has_named {
+        let named_name = prop(node, "named")
+            .and_then(|e| e.value().as_string())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                err(
+                    "MAN-OVERRIDE-NAMED-MISSING",
+                    format!(
+                        "override for {name:?}: 'named=' must be a non-empty string \
+                         (the registry package name to redirect to)"
+                    ),
+                )
+            })?
+            .to_string();
+        let namespace = prop(node, "namespace").and_then(|e| e.value().as_string()).map(str::to_string);
+        OverrideTarget::Registry { name: named_name, namespace }
     } else {
         // has_member
         let mc = member_children[0];
@@ -2873,11 +3125,25 @@ fn parse_override(node: &KdlNode) -> Result<Override, ManifestError> {
         OverrideTarget::Member { member_name }
     };
 
+    // NOTE: `version=` is intentionally NOT parsed here. It's parsed by the
+    // caller AFTER the duplicate-name check (see `parse_override`/call
+    // sites below) so that a duplicate override name is reported before a
+    // malformed `version=` on the duplicate entry (D5 divergence fix vs.
+    // the Python impl, which orders duplicate-check before version-parse).
+    Ok(Override { name, target, version: None })
+}
+
+/// Parse one `pkg` override node's target form (everything except
+/// `version=`), then the caller checks the duplicate-name invariant, then
+/// calls `finish_override_version` to fill in `version=`. Splitting the
+/// version parse out of `parse_override` itself is what lets the caller's
+/// duplicate-name check run before a malformed `version=` on the *same*
+/// (duplicate) entry would otherwise raise MAN-DEP-VERSION-INVALID first.
+fn finish_override_version(node: &KdlNode, mut ov: Override) -> Result<Override, ManifestError> {
     // A3b: version= annotation on the override rule (§3 Axis A (b) step 4,
     // D-A3) — valid regardless of which target form was selected above.
-    let version = parse_dep_version_prop(node, &format!("override for {name:?}"))?;
-
-    Ok(Override { name, target, version })
+    ov.version = parse_dep_version_prop(node, &format!("override for {:?}", ov.name))?;
+    Ok(ov)
 }
 
 // ---------------------------------------------------------------------------

@@ -1,0 +1,3 @@
+name "react"
+kind "library"
+src_dir ""

@@ -1,0 +1,13 @@
+// fixture-464: S8b (rfc-origin-as-identity.md §7 B5/§10 item 14) — COMPLETE
+// overrides grammar, the TarballTarget kind. The root declares "foo" as a
+// git dep, but the override rebinds it to a tarball source entirely — no
+// mocked-fetches entry exists for the git URL at all, so a fall-through-to-
+// git bug would surface as a fetch-mock-missing failure, not a silent pass.
+name "testapp"
+kind "application"
+deps {
+    foo git=(url)"https://example.com/foo-DO-NOT-FETCH.git" ref="main"
+}
+overrides {
+    pkg "foo" tarball=(url)"https://example.com/foo-real.tar.gz"
+}

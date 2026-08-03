@@ -2796,6 +2796,28 @@ def _execute_verify(
     # Write the pre-authored lockfile into tmp_dir for the disk check below.
     (tmp_dir / "milpa.lock").write_text(lock_text, encoding="utf-8")
 
+    # RFC origin-as-identity.md §7.1 D2/D3 (S5): FROZEN-REGISTRY-ALIAS-
+    # UNRESOLVED (checked first) + FROZEN-SOURCE-ID-MISMATCH (declared-
+    # AFTER-override) — same SSOT wrappers cli.cmd_verify calls, mirrored
+    # here so a conformance fixture can exercise `verify`'s check without
+    # the black-box CLI harness.
+    from milpa.frozen import (
+        check_source_id_preconditions_standalone,
+        check_source_id_preconditions_workspace,
+    )
+
+    try:
+        if isinstance(doc, WorkspaceManifest):
+            _precheck_ws = load_workspace(project_root)
+            check_source_id_preconditions_workspace(_precheck_ws, lockfile.deps)
+        else:
+            assert isinstance(doc, Manifest)
+            check_source_id_preconditions_standalone(doc, lockfile.deps)
+    except MilpaError as e:
+        if fixture.expected_error is not None and e.slug == fixture.expected_error:
+            return ("pass", "")
+        return ("fail", f"verify: source-id precondition raised {e.slug!r} (expected {fixture.expected_error!r})")
+
     # Phase 2: in-process verify.
     # We reproduce cmd_verify's logic in-process rather than calling cmd_verify
     # directly (which would re-load env from os.environ, not the fixture env).
