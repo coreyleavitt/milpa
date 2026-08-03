@@ -215,11 +215,10 @@ class TestOverrideToDifferentCoordinate:
 
 
 # ---------------------------------------------------------------------------
-# S5-rekey (RFC §4.4 deliverable #1) — canonical_for / depkey_for_canonical /
-# canonical_key_for_requirement.  These are landed, tested building blocks
-# for the solver re-key; NOT YET wired into resolve()/resolve_workspace()
-# (Term.package / provider dicts still name-keyed) — see
-# docs/rfc-origin-as-identity.md §4.4 and the S5-rekey handoff.
+# origin-as-identity §4.4 — canonical_for (→ SolverKey) / canonical_key_for_
+# requirement.  DE1 (genericized key): canonical_for returns a SolverKey whose
+# string value is canonical(source_id) and whose .display is the BFS-first
+# DepKey for that origin — this replaces the old canonical→DepKey reverse map.
 # ---------------------------------------------------------------------------
 
 
@@ -228,7 +227,11 @@ class TestCanonicalFor:
         resolver = BindingResolver([Claim(name="foo", source_id=_NIMZ3, is_root=True, claimant="root")])
         from milpa.source_id import canonical
 
-        assert resolver.canonical_for(DepKey(name="foo")) == canonical(_NIMZ3)
+        sk = resolver.canonical_for(DepKey(name="foo"))
+        # A SolverKey IS its canonical string (str-equal) …
+        assert sk == canonical(_NIMZ3)
+        # … and carries its display DepKey inline.
+        assert sk.display == DepKey(name="foo")
 
     def test_unbound_key_raises_milpa_internal(self) -> None:
         resolver = BindingResolver([])
@@ -237,39 +240,36 @@ class TestCanonicalFor:
         assert exc_info.value.slug == "MILPA-INTERNAL"
 
 
-class TestDepkeyForCanonical:
-    def test_returns_none_when_nothing_bound(self) -> None:
-        resolver = BindingResolver([])
-        assert resolver.depkey_for_canonical("git+https://example.com/x") is None
+class TestSolverKeyDisplay:
+    """DE1: the SolverKey's `.display` (BFS-first label for an origin) replaces
+    the deleted canonical→DepKey reverse map."""
 
-    def test_returns_the_bound_depkey(self) -> None:
+    def test_display_is_the_bound_depkey(self) -> None:
         resolver = BindingResolver([Claim(name="foo", source_id=_NIMZ3, is_root=True, claimant="root")])
-        from milpa.source_id import canonical
-
-        assert resolver.depkey_for_canonical(canonical(_NIMZ3)) == DepKey(name="foo")
+        assert resolver.canonical_for(DepKey(name="foo")).display == DepKey(name="foo")
 
     def test_two_labels_one_source_collapse_to_the_first_bound_depkey(self) -> None:
-        """The headline S5-rekey regression: two DIFFERENT root claims
-        ("foo", "bar") that both target the SAME source-id are, from the
-        reverse map's perspective, ONE canonical key — resolved to whichever
-        DepKey was bound FIRST (BFS-first, mirroring Phase B's alias-
-        selection convention), never the second."""
+        """The headline regression: two DIFFERENT root claims ("foo", "bar")
+        that both target the SAME source-id collapse to ONE origin — its
+        SolverKey `.display` is whichever DepKey was bound FIRST (BFS-first,
+        mirroring Phase B's alias-selection convention), never the second,
+        regardless of which label is used to look it up."""
         resolver = BindingResolver(
             [
                 Claim(name="foo", source_id=_NIMZ3, is_root=True, claimant="root"),
                 Claim(name="bar", source_id=_NIMZ3, is_root=True, claimant="root"),
             ]
         )
-        from milpa.source_id import canonical
-
-        assert resolver.depkey_for_canonical(canonical(_NIMZ3)) == DepKey(name="foo")
+        assert resolver.canonical_for(DepKey(name="foo")).display == DepKey(name="foo")
+        # Interning: the SAME origin looked up via the SECOND label still
+        # reports the first-bound display (identical interned SolverKey object).
+        assert resolver.canonical_for(DepKey(name="bar")).display == DepKey(name="foo")
+        assert resolver.canonical_for(DepKey(name="foo")) is resolver.canonical_for(DepKey(name="bar"))
 
     def test_transitive_claim_extends_the_index(self) -> None:
         resolver = BindingResolver([])
-        from milpa.source_id import canonical
-
         resolver.submit(Claim(name="foo", source_id=_NIMZ3, is_root=False, claimant="a@1.0.0"))
-        assert resolver.depkey_for_canonical(canonical(_NIMZ3)) == DepKey(name="foo")
+        assert resolver.canonical_for(DepKey(name="foo")).display == DepKey(name="foo")
 
 
 class TestCanonicalKeyForRequirement:

@@ -57,7 +57,7 @@ from milpa.source_id import (
     format_source_id,
     normalize_source,
 )
-from milpa.version import DepKey
+from milpa.version import DepKey, SolverKey
 
 if TYPE_CHECKING:
     from milpa.manifest import Override
@@ -120,19 +120,19 @@ class BindingResolver:
     def __init__(self, root_claims: Sequence[Claim]) -> None:
         self._bindings: dict[DepKey, SourceId] = {}
         self._root_keys: set[DepKey] = set()
-        # RFC origin-as-identity §4.4 (S5-rekey): a SECOND index over the SAME
-        # authoritative store — canonical(source_id) → the first DepKey ever
-        # bound to it (insertion order == BFS-first, mirroring Phase B's
-        # alias-selection convention). This is the "provider-internal
-        # canonical → DepKey map" §4.4 calls for, kept INSIDE BindingResolver
-        # (not a separately-maintained side-table) so it is always exactly in
-        # sync with `_bindings` — updated atomically in `__init__`/`submit`,
-        # never rebuilt or threaded separately. `dict.setdefault` preserves
-        # the FIRST DepKey for a given canonical string; a second, different
-        # DepKey later bound to the SAME source_id (the "two labels, one
-        # origin" case) does not overwrite it — this is the pre-fetch
-        # collapse the solver re-key exists to realize.
-        self._canonical_index: dict[str, DepKey] = {}
+        # origin-as-identity §4.4 (DE1, genericized key): the intern table for
+        # SolverKeys — canonical(source_id) → the ONE SolverKey the solver uses
+        # for that origin, whose `.display` is the FIRST DepKey ever bound to it
+        # (insertion order == BFS-first, mirroring Phase B's alias-selection
+        # convention). Kept INSIDE BindingResolver (not a separate side-table)
+        # so it stays exactly in sync with `_bindings` — populated atomically in
+        # `__init__`/`submit`, and read by `canonical_for`. Interning here means
+        # every SolverKey the solver ever sees for a given origin is the SAME
+        # object, so `.display` is deterministic: a second, different DepKey
+        # later bound to the SAME source_id (the "two labels, one origin" case)
+        # does not change it — this is the pre-fetch collapse the re-key
+        # realizes. Replaces the old canonical→DepKey reverse map.
+        self._solverkey_index: dict[str, SolverKey] = {}
         for claim in root_claims:
             if not claim.is_root:
                 raise ValueError(
@@ -159,7 +159,7 @@ class BindingResolver:
                 )
             self._bindings[key] = claim.source_id
             self._root_keys.add(key)
-            self._canonical_index.setdefault(canonical(claim.source_id), key)
+            self._intern(canonical(claim.source_id), key)
 
     def submit(self, claim: Claim) -> BindingDecision:
         """Submit a non-root (transitive) claim. Raises ``ValueError`` if
@@ -175,7 +175,7 @@ class BindingResolver:
 
         if existing is None:
             self._bindings[key] = claim.source_id
-            self._canonical_index.setdefault(canonical(claim.source_id), key)
+            self._intern(canonical(claim.source_id), key)
             return BindingDecision(accepted=claim.source_id, outcome=BindOutcome.NEW)
 
         if existing == claim.source_id:
@@ -211,9 +211,26 @@ class BindingResolver:
         dependency-confusion check for a different coordinate)."""
         return key in self._root_keys
 
-    def canonical_for(self, key: DepKey) -> str:
-        """``canonical(source_id_for(key))`` — the string the solver sees for
-        an ALREADY-BOUND ``DepKey`` (RFC §4.4 deliverable #1). Raises
+    def _intern(self, canonical_key: str, key: DepKey) -> SolverKey:
+        """Intern the ``SolverKey`` for an origin string, first-``DepKey``-wins.
+
+        The single mint point for the ``canonical(source_id) → SolverKey`` map:
+        the first ``DepKey`` bound to a given origin fixes that origin's
+        ``.display`` for the whole solve (BFS-first). Idempotent — a later,
+        different ``DepKey`` for the same origin returns the already-interned
+        SolverKey unchanged (the "two labels, one origin" collapse)."""
+        existing = self._solverkey_index.get(canonical_key)
+        if existing is None:
+            existing = SolverKey(canonical_key, key)
+            self._solverkey_index[canonical_key] = existing
+        return existing
+
+    def canonical_for(self, key: DepKey) -> SolverKey:
+        """The ``SolverKey`` the solver sees for an ALREADY-BOUND ``DepKey``
+        (RFC §4.4 deliverable #1). Its string value is
+        ``canonical(source_id_for(key))``; its ``.display`` is the BFS-first
+        label for that origin (the interned first-bound DepKey, which may differ
+        from ``key`` when two labels collapse to one origin). Raises
         ``MilpaError('MILPA-INTERNAL', …)`` if ``key`` has never been bound —
         every caller reaches this only after a root claim (bound at
         ``__init__``) or an accepted ``submit()`` (``NEW``/``DUPLICATE``), so
@@ -227,21 +244,7 @@ class BindingResolver:
                 f"canonical_for({key!r}) has no binding — this is an internal "
                 "milpa bug; please report it",
             )
-        return canonical(sid)
-
-    def depkey_for_canonical(self, canonical_key: str) -> DepKey | None:
-        """Reverse lookup (RFC §4.4): the first ``DepKey`` ever bound to the
-        source-id whose ``canonical()`` form is ``canonical_key`` — the
-        provider-internal "canonical → DepKey" map every non-solver consumer
-        (``is_root_direct``, lock preference, the lockfile writer's slot
-        projection, …) needs, since ``canonical_key`` is no longer a
-        ``DepKey.solver_var()`` string and cannot be decomposed by
-        ``DepKey.from_solver_var``. ``None`` if nothing has bound to this
-        canonical string yet (should not happen for any key the solver
-        itself ever queries, since binding always precedes a Term/candidate
-        referencing it).
-        """
-        return self._canonical_index.get(canonical_key)
+        return self._intern(canonical(sid), key)
 
 
 # ---------------------------------------------------------------------------
@@ -356,7 +359,7 @@ def canonical_key_for_requirement(
     index: "Index | None",
     root_self_name: str | None = None,
     binding_resolver: "BindingResolver | None" = None,
-) -> str:
+) -> SolverKey:
     """The PubGrub solver-variable string a ``requires`` occurrence resolves
     to (RFC §4.4.1 — the normative two-phase design). Used to feed the
     solver ``Term``/provider-dict key BEFORE the corresponding claim is
@@ -422,13 +425,18 @@ def canonical_key_for_requirement(
     upstream, M2 security gate; they only ever reach this function via an
     ALREADY-bound root claim, phase-1 step 1, never the guess).
     """
+    _dk = DepKey(name=name, namespace=namespace)
     if binding_resolver is not None:
-        _dk = DepKey(name=name, namespace=namespace)
         _sid = binding_resolver.source_id_for(_dk)
         if _sid is not None:
-            return canonical(_sid)
+            # Bound: return the interned SolverKey (BFS-first display).
+            return binding_resolver.canonical_for(_dk)
+    # Unbound (first encounter): the kind-default guess. This requirement's
+    # own DepKey IS the first (BFS-first) label for the guessed origin, so it
+    # is the display. When the corresponding claim is later submitted,
+    # canonical_for interns the same origin with the same first-seen display.
     if namespace is None and url is None and root_self_name is not None and name == root_self_name:
-        return canonical(MemberSourceId(member_name=name))
+        return SolverKey(canonical(MemberSourceId(member_name=name)), _dk)
     ov = overrides_by_name.get(name)
     if ov is not None:
         raw = _override_target_to_raw_origin(ov, index)
@@ -437,7 +445,7 @@ def canonical_key_for_requirement(
     else:
         ns = resolved_registry_namespace(name, namespace, index)
         raw = RegistrySourceId(registry=DEFAULT_REGISTRY_ALIAS, namespace=ns, name=name)
-    return canonical(normalize_source(raw))
+    return SolverKey(canonical(normalize_source(raw)), _dk)
 
 
 def reconcile_root_claims(

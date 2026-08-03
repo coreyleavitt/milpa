@@ -42,7 +42,7 @@
 use std::collections::{HashMap, HashSet};
 
 use milpa_manifest::{Dep, Override, OverrideTarget};
-use milpa_types::{DepKey, FetchableOrigin, Provenance, SourceId};
+use milpa_types::{DepKey, FetchableOrigin, Provenance, SolverKey, SourceId};
 
 use crate::error::{CoreError, MilpaError};
 use crate::registry::{BareLookup, Index, Package};
@@ -116,9 +116,11 @@ pub struct BindingResolver {
     /// rebuilt or threaded separately. A second, different `DepKey` later
     /// bound to the SAME source_id (the "two labels, one origin" case) does
     /// not overwrite the first entry — this is the pre-fetch collapse the
-    /// solver re-key exists to realize. Mirrors Python's
-    /// `binding.BindingResolver._canonical_index`.
-    canonical_index: HashMap<String, DepKey>,
+    /// solver re-key exists to realize. DE1: stores the interned `SolverKey`
+    /// (origin string → the one SolverKey the solver uses, whose `.display()`
+    /// is the BFS-first DepKey), replacing the old `canonical → DepKey` reverse
+    /// map. Mirrors Python's `binding.BindingResolver._solverkey_index`.
+    solverkey_index: HashMap<String, SolverKey>,
 }
 
 impl BindingResolver {
@@ -133,7 +135,7 @@ impl BindingResolver {
     pub fn new(root_claims: &[Claim]) -> Self {
         let mut bindings: HashMap<DepKey, SourceId> = HashMap::new();
         let mut root_keys: HashSet<DepKey> = HashSet::new();
-        let mut canonical_index: HashMap<String, DepKey> = HashMap::new();
+        let mut solverkey_index: HashMap<String, SolverKey> = HashMap::new();
         for claim in root_claims {
             assert!(
                 claim.is_root,
@@ -155,9 +157,12 @@ impl BindingResolver {
             }
             bindings.insert(key.clone(), claim.source_id.clone());
             root_keys.insert(key.clone());
-            canonical_index.entry(canonical(&claim.source_id)).or_insert(key);
+            let ck = canonical(&claim.source_id);
+            solverkey_index
+                .entry(ck.clone())
+                .or_insert_with(|| SolverKey::new(ck, key));
         }
-        BindingResolver { bindings, root_keys, canonical_index }
+        BindingResolver { bindings, root_keys, solverkey_index }
     }
 
     /// Submit a non-root (transitive) claim.
@@ -182,9 +187,10 @@ impl BindingResolver {
         match existing {
             None => {
                 self.bindings.insert(key.clone(), claim.source_id.clone());
-                self.canonical_index
-                    .entry(canonical(&claim.source_id))
-                    .or_insert(key);
+                let ck = canonical(&claim.source_id);
+                self.solverkey_index
+                    .entry(ck.clone())
+                    .or_insert_with(|| SolverKey::new(ck, key));
                 Ok(BindingDecision { accepted: claim.source_id.clone(), outcome: BindOutcome::New })
             }
             Some(existing) if existing == claim.source_id => {
@@ -233,8 +239,8 @@ impl BindingResolver {
     /// `submit()` (`New`/`Duplicate`), so an unbound key here is an internal
     /// invariant violation, not a user-facing condition. Mirrors Python's
     /// `binding.BindingResolver.canonical_for`.
-    pub fn canonical_for(&self, key: &DepKey) -> Result<String, MilpaError> {
-        self.bindings.get(key).map(canonical).ok_or_else(|| {
+    pub fn canonical_for(&self, key: &DepKey) -> Result<SolverKey, MilpaError> {
+        let sid = self.bindings.get(key).ok_or_else(|| {
             MilpaError::Core(CoreError::Resolver(
                 "MILPA-INTERNAL",
                 format!(
@@ -242,20 +248,28 @@ impl BindingResolver {
                      please report it"
                 ),
             ))
-        })
+        })?;
+        // The origin was interned (with its BFS-first display) at bind time in
+        // `new`/`submit`; read that interned SolverKey. The `unwrap_or_else`
+        // fallback (this key as display) is defensive — unreached for a bound
+        // key, since binding always populates `solverkey_index`.
+        let ck = canonical(sid);
+        Ok(self
+            .solverkey_index
+            .get(&ck)
+            .cloned()
+            .unwrap_or_else(|| SolverKey::new(ck, key.clone())))
     }
 
-    /// Reverse lookup (RFC §4.4): the first `DepKey` ever bound to the
-    /// source-id whose `canonical()` form is `canonical_key` — the
-    /// provider-internal "canonical → DepKey" map every non-solver consumer
-    /// (`is_root_direct`, lock preference, the lockfile writer's slot
-    /// projection, …) needs, since `canonical_key` is no longer a
-    /// `DepKey::solver_var()` string and cannot be decomposed by
-    /// `DepKey::from_solver_var`. `None` if nothing has bound to this
-    /// canonical string yet. Mirrors Python's
-    /// `binding.BindingResolver.depkey_for_canonical`.
-    pub fn depkey_for_canonical(&self, canonical_key: &str) -> Option<&DepKey> {
-        self.canonical_index.get(canonical_key)
+    /// The BFS-first display `DepKey` for an origin string, read off the
+    /// interned `SolverKey`. `None` for a variable that was never minted as a
+    /// prefixed canonical (a bare/`ns::name`/sentinel string — the caller
+    /// falls back to `DepKey::from_solver_var`, exact for those). This is the
+    /// single projection boundary for a solver variable held only as `&str`
+    /// (DE1: a caller holding the `SolverKey` itself reads `.display()`
+    /// directly and never needs this).
+    pub fn display_for(&self, solver_var: &str) -> Option<&DepKey> {
+        self.solverkey_index.get(solver_var).map(SolverKey::display)
     }
 }
 
@@ -319,17 +333,25 @@ pub fn canonical_key_for_requirement(
     index: &Index,
     root_self_name: Option<&str>,
     binding_resolver: Option<&BindingResolver>,
-) -> Result<String, MilpaError> {
+) -> Result<SolverKey, MilpaError> {
+    let dk = DepKey { name: name.to_string(), namespace: namespace.map(str::to_string) };
     if let Some(br) = binding_resolver {
-        let dk = DepKey { name: name.to_string(), namespace: namespace.map(str::to_string) };
-        if let Some(sid) = br.source_id_for(&dk) {
-            return Ok(canonical(sid));
+        if br.source_id_for(&dk).is_some() {
+            // Bound: return the interned SolverKey (BFS-first display).
+            return br.canonical_for(&dk);
         }
     }
+    // Unbound (first encounter): the kind-default guess. This requirement's
+    // own DepKey IS the first (BFS-first) label for the guessed origin, so it
+    // is the display; when the claim is later submitted, `canonical_for` interns
+    // the same origin with the same first-seen display.
     if namespace.is_none() && url.is_none() {
         if let Some(rsn) = root_self_name {
             if name == rsn {
-                return Ok(canonical(&SourceId::Member { member_name: name.to_string() }));
+                return Ok(SolverKey::new(
+                    canonical(&SourceId::Member { member_name: name.to_string() }),
+                    dk,
+                ));
             }
         }
     }
@@ -344,7 +366,7 @@ pub fn canonical_key_for_requirement(
             }),
         },
     };
-    Ok(canonical(&normalize_source(&raw)?))
+    Ok(SolverKey::new(canonical(&normalize_source(&raw)?), dk))
 }
 
 // ---------------------------------------------------------------------------

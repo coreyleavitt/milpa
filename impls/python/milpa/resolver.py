@@ -153,6 +153,7 @@ from milpa.source_id import (
 )
 from milpa.version import (
     DepKey,
+    SolverKey,
     Strategy,
     Version,
     VersionSet,
@@ -339,10 +340,10 @@ def _version_unknown_constrained_err(
     progress — falls back to the identity projection (``exc.package``/
     ``consumer`` unchanged), matching pre-S5-rekey behavior.
     """
-    _pkg = _depkey_for_solved_name(exc.package, binding_resolver).solver_var() if binding_resolver is not None else exc.package
+    _pkg = _depkey_for_solved_name(exc.package).solver_var() if binding_resolver is not None else exc.package
     _constrainers = [
         (
-            _depkey_for_solved_name(consumer, binding_resolver).solver_var()
+            _depkey_for_solved_name(consumer).solver_var()
             if binding_resolver is not None
             else consumer,
             constraint,
@@ -986,20 +987,20 @@ class _Provider:
         ``BindingResolver``'s job, RFC origin-as-identity §4.3 — a separate
         concern, #193/#192).
 
-        ``package`` is a PubGrub solver-variable string — S5-rekey (RFC
-        origin-as-identity §4.4): for a named/registry dep this is now a
-        BOUND source-id's canonical form, decoded back to a full ``DepKey``
-        (name AND namespace) via ``binding_resolver.depkey_for_canonical``
-        (falling back to the legacy ``DepKey.from_solver_var`` for the eager
-        git/tarball/local/member case, whose term key is still plain
-        ``dep.name``) — checked against ``root_direct_keys`` — a
+        ``package`` is a PubGrub solver variable — RFC origin-as-identity
+        §4.4: for a named/registry dep its string value is a BOUND source-id's
+        canonical form, decoded back to a full ``DepKey`` (name AND namespace)
+        via ``_depkey_for_solved_name`` — a direct read of the ``SolverKey``'s
+        ``.display`` (DE1), with ``DepKey.from_solver_var`` for the
+        identity==label (bare/``ns::name``) case — checked against
+        ``root_direct_keys`` — a
         namespace-aware set (R6 fix). A bare-name-only check would wrongly
         match a namespace-qualified TRANSITIVE dep against an unrelated
         root dep that merely shares the same bare name under a DIFFERENT
         namespace (e.g. root ``ns1::foo`` must NOT make a purely-transitive
         ``ns2::foo`` look root-direct).
         """
-        dk = _depkey_for_solved_name(package, self._binding_resolver)
+        dk = _depkey_for_solved_name(package)
         return dk in self._root_direct_keys
 
     def _bypasses_lock_preference(self, package: str) -> bool:
@@ -1061,13 +1062,13 @@ class _Provider:
         """B2 (resolver-semantics RFC §4 stage 4): the prior lockfile's
         recorded version for ``package``, if one exists and parses.
 
-        ``package`` is a PubGrub solver-variable string — S5-rekey (RFC
-        origin-as-identity §4.4): for a named dep this is now a BOUND
-        source-id's canonical form, decoded via
-        ``binding_resolver.depkey_for_canonical`` (falling back to the
-        legacy ``DepKey.from_solver_var`` for the eager-dep case) so the
-        lookup matches against ``LockedDep.name``/``LockedDep.namespace`` —
-        never a raw ``::`` split or a canonical-string split. Returns
+        ``package`` is a PubGrub solver variable — RFC origin-as-identity
+        §4.4: for a named dep its string value is a BOUND source-id's canonical
+        form, decoded via ``_depkey_for_solved_name`` (the ``SolverKey``'s
+        ``.display``, DE1; ``DepKey.from_solver_var`` for the identity==label
+        case) so the lookup matches against
+        ``LockedDep.name``/``LockedDep.namespace`` — never a raw ``::`` split
+        or a canonical-string split. Returns
         ``None`` when there is no prior lock, the package is new (not in the
         prior lock), its recorded version string doesn't parse (never a hard
         error — a preference miss just falls through to ordinary strategy
@@ -1078,7 +1079,7 @@ class _Provider:
             return None
         if self._bypasses_lock_preference(package):
             return None
-        dk = _depkey_for_solved_name(package, self._binding_resolver)
+        dk = _depkey_for_solved_name(package)
         locked = next(
             (
                 d
@@ -2091,12 +2092,12 @@ def _edgeset_named_requires(
     ``_terms_to_named_reqs`` (which extracted ``(str, VersionSet)`` pairs
     from ``dep_terms``, the SOLVER-facing Term keys). Since a NamedRequire's
     solver-variable Term key is now a BOUND source-id's canonical form (not
-    a ``"ns::name"`` string), it can no longer be decoded back into a
-    ``DepKey`` at ``_on_transitive_named`` time — the callback fires
-    mid-solve, on first discovery, BEFORE the claim is bound, so the
-    canonical string may not resolve via ``depkey_for_canonical`` yet, and a
-    canonical string is not a ``ns::name`` string ``DepKey.from_solver_var``
-    can parse. Extracting directly from the EdgeSet's own ``NamedRequire``
+    a ``"ns::name"`` string), it cannot be decoded from the string alone at
+    ``_on_transitive_named`` time — the callback fires mid-solve, on first
+    discovery, and a canonical string is not a ``ns::name`` string
+    ``DepKey.from_solver_var`` can parse (the ``SolverKey.display`` carries the
+    label, but this callback receives the requirement's own fields, not the
+    key). Extracting directly from the EdgeSet's own ``NamedRequire``
     entries (which still carry the original ``name``/``namespace`` fields)
     avoids that lossy round-trip entirely — the root-cause fix, not a
     reverse-decode workaround.
@@ -2164,7 +2165,7 @@ def _source_id_for_edge_cache(binding_resolver: "BindingResolver", name: str) ->
     canonical-or-legacy decode — SSOT with ``_build_graph``'s equivalent
     decode).
     """
-    dk = _depkey_for_solved_name(name, binding_resolver)
+    dk = _depkey_for_solved_name(name)
     sid = binding_resolver.source_id_for(dk)
     if sid is None:
         raise MilpaError(
@@ -2358,7 +2359,8 @@ def _run_bfs_wave_loop(
                         _local_ov = LocalDep(name=dep_u.name, path=ov.target.path, version=ov.version)
                         if _local_ov.path not in seen_local:
                             seen_local.add(_local_ov.path)
-                            record_discovery(_local_ov.name)
+                            # P6/DE1: canonical SolverKey, not bare name.
+                            record_discovery(binding_resolver.canonical_for(DepKey(name=_local_ov.name)))
                             def _local_ov_worker(
                                 _dep: LocalDep = _local_ov,
                             ) -> tuple[str, object]:
@@ -2512,7 +2514,11 @@ def _run_bfs_wave_loop(
                 if dep_t.url in seen_tarball:
                     continue
                 seen_tarball.add(dep_t.url)
-                record_discovery(dep_t.name)  # Phase B: transitive tarball dep first-enqueue
+                # P6/DE1: record the canonical SolverKey (matches this dep's own
+                # term key), NOT the bare name — else it never matches the
+                # discovery_index and the BFS-first dedup tiebreak degrades to
+                # _LARGE. Bound at __init__ (an override target is a root claim).
+                record_discovery(binding_resolver.canonical_for(DepKey(name=dep_t.name)))
                 def _tarball_worker(
                     _dep: TarballDep = dep_t,
                 ) -> tuple[str, object]:
@@ -2532,7 +2538,8 @@ def _run_bfs_wave_loop(
                 if dep_l.path in seen_local:
                     continue
                 seen_local.add(dep_l.path)
-                record_discovery(dep_l.name)  # Phase B: transitive local dep first-enqueue
+                # P6/DE1: canonical SolverKey, not bare name (see tarball arm).
+                record_discovery(binding_resolver.canonical_for(DepKey(name=dep_l.name)))
                 def _local_worker(
                     _dep: LocalDep = dep_l,
                 ) -> tuple[str, object]:
@@ -2553,7 +2560,8 @@ def _run_bfs_wave_loop(
                 if _oci_ref_o in seen_oci:
                     continue
                 seen_oci.add(_oci_ref_o)
-                record_discovery(dep_o.name)  # Phase B: transitive oci-override dep first-enqueue
+                # P6/DE1: canonical SolverKey, not bare name (see tarball arm).
+                record_discovery(binding_resolver.canonical_for(DepKey(name=dep_o.name)))
                 def _oci_worker(
                     _dep: "_OciOverrideDep" = dep_o,
                 ) -> tuple[str, object]:
@@ -2679,7 +2687,7 @@ def _run_bfs_wave_loop(
                     # string itself (filesystem layout stays name-based,
                     # dep_dir_name SSOT — orthogonal to the solver key).
                     _pkdl = url_dep_paths.get(
-                        _pname, deps_dir / _depkey_for_solved_name(_pname, binding_resolver).name
+                        _pname, deps_dir / _depkey_for_solved_name(_pname).name
                     ) / "milpa.kdl"
                     _pmf: tuple[FlagDecl, ...] = ()
                     _pmanifest = None
@@ -2851,7 +2859,7 @@ def _s4a_run_fixpoint(
             # use dep_dir_name so qualified deps resolve to
             # ``_deps/@ns/bar/milpa.kdl`` rather than the nonexistent
             # ``_deps/ns::bar/milpa.kdl``.
-            _dk_s4b = _depkey_for_solved_name(dep_name_k, binding_resolver)
+            _dk_s4b = _depkey_for_solved_name(dep_name_k)
             kdl_path = deps_dir / dep_dir_name(_dk_s4b.name, _dk_s4b.namespace) / "milpa.kdl"
             if kdl_path.exists():
                 try:
@@ -3292,7 +3300,7 @@ def _s4c_check_flag_conflicts(
         # C1/H2 fix: decompose the solver-var (S5-rekey: a BOUND source-id's
         # canonical form for a named dep) via DepKey so qualified deps
         # resolve to ``_deps/@ns/bar/milpa.kdl``.
-        _dk_s4c = _depkey_for_solved_name(dep_name, provider._binding_resolver)  # type: ignore[attr-defined]
+        _dk_s4c = _depkey_for_solved_name(dep_name)  # type: ignore[attr-defined]
         kdl_path = deps_dir / dep_dir_name(_dk_s4c.name, _dk_s4c.namespace) / "milpa.kdl"
         if not kdl_path.exists():
             continue
@@ -3970,12 +3978,12 @@ def resolve(
         # S5-rekey (RFC origin-as-identity §4.4): project the certificate's
         # PubGrub package strings back to the legacy "ns::name"/bare form —
         # certificate_to_json (solver.py) has no BindingResolver access.
-        cert = _project_solve_success(cert, binding_resolver)
+        cert = _project_solve_success(cert)
     except VersionUnknownConstrained as exc:
         raise _version_unknown_constrained_err(exc, root_authority, binding_resolver) from exc
     except SolverError as exc:
         from milpa.errors import SOLVE_CONFLICT
-        _projected_exc = _project_solver_error(exc, binding_resolver)
+        _projected_exc = _project_solver_error(exc)
         raise MilpaError(
             SOLVE_CONFLICT,
             f"dependency conflict: {_projected_exc}",
@@ -4038,7 +4046,7 @@ def resolve(
         # the shared canonical-or-legacy helper for BOTH the lookup key and
         # the DISPLAY name stored below (attestation-policy warning text
         # must never show the raw canonical string).
-        _dk_disp = _depkey_for_solved_name(_n, binding_resolver)
+        _dk_disp = _depkey_for_solved_name(_n)
         _sid = binding_resolver.source_id_for(_dk_disp)
         if _sid is not None and _sid not in _name_by_source_id:
             _name_by_source_id[_sid] = _dk_disp.solver_var()
@@ -5140,48 +5148,46 @@ def rebuild_deps_view(
 # ---------------------------------------------------------------------------
 
 
-def _depkey_for_solved_name(name: str, binding_resolver: "BindingResolver | None") -> DepKey:
-    """Decode a PubGrub solver-variable string back into a ``DepKey``.
+def _depkey_for_solved_name(name: str) -> DepKey:
+    """The display ``DepKey`` for a solved PubGrub variable.
 
-    S5-rekey (RFC origin-as-identity §4.4): *name* is a BOUND source-id's
-    canonical form for a named/registry dep (``binding_resolver.
-    depkey_for_canonical``), or the plain ``dep.name`` for a git/tarball/
-    local/member dep (those never route through ``DepKey``/``canonical_for``
-    — their term key stays ``dep.name``, see ``_dep_to_term``/root-term
-    construction). ``depkey_for_canonical`` returns ``None`` for the latter
-    case (never registered as a canonical string) — the SAME fallback
-    ``DepKey.from_solver_var`` gave uniformly before S5-rekey. ``binding_resolver
-    is None`` only in the (currently unreachable via any production caller)
-    default-param case; falls back identically.
+    DE1 (RFC origin-as-identity §4.4, genericized key): a bound origin's solver
+    variable is a ``SolverKey`` — a ``str`` whose value is
+    ``canonical(source_id)``, carrying its BFS-first ``.display`` DepKey inline —
+    so decoding is a direct ``.display`` read, with no ``canonical → DepKey``
+    reverse map and no ``binding_resolver`` threading (both deleted).
+
+    The only non-``SolverKey`` variables that reach here are ones whose origin
+    string IS already their label — a bare name, an ``ns::name`` qualified name,
+    or the ``__root__`` sentinel — where ``DepKey.from_solver_var`` is exact by
+    construction. A prefixed canonical string (``git+``/``pkg+``/…) never
+    arrives as a plain ``str``: every such variable is minted as a ``SolverKey``
+    at ``BindingResolver.canonical_for`` / ``canonical_key_for_requirement``.
     """
-    if binding_resolver is not None:
-        dk = binding_resolver.depkey_for_canonical(name)
-        if dk is not None:
-            return dk
+    if isinstance(name, SolverKey):
+        return name.display
     return DepKey.from_solver_var(name)
 
 
-def _project_solve_success(
-    result: "SolveSuccess", binding_resolver: "BindingResolver"
-) -> "SolveSuccess":
+def _project_solve_success(result: "SolveSuccess") -> "SolveSuccess":
     """Project every PubGrub package string in a §5.1 success certificate
-    back to the legacy "ns::name"/bare form (S5-rekey, RFC origin-as-
-    identity §4.4).
+    back to the display "ns::name"/bare form (RFC origin-as-identity §4.4).
 
-    ``certificate_to_json`` (solver.py) is a generic PubGrub serializer with
-    no knowledge of ``BindingResolver`` — deliberately decoupled from
-    resolver-specific admission concerns. The canonical solver-variable
-    string it would otherwise print for a named dep is a SOLVER-INTERNAL
-    representation (mirrors why the lockfile's ``requires`` list needs the
-    same projection, ``_build_graph``'s ``requires=`` construction) — never
-    meant to leak into the user-facing certificate. Rebuilt via
-    ``dataclasses.replace`` since every solver dataclass here is frozen.
+    ``certificate_to_json`` (solver.py) is a generic PubGrub serializer that
+    prints the raw solver variable — for a named/registry dep that is the
+    SOLVER-INTERNAL ``canonical(source_id)`` string (mirrors why the lockfile's
+    ``requires`` list needs the same projection, ``_build_graph``'s
+    ``requires=`` construction), never meant to leak into the user-facing
+    certificate. DE1: each variable is a ``SolverKey`` carrying its display
+    inline, so the projection is a direct ``.display`` read (no
+    ``binding_resolver``). Rebuilt via ``dataclasses.replace`` since every
+    solver dataclass here is frozen.
     """
     import dataclasses
     from milpa.solver import SolveSuccess as _SolveSuccess, WitnessEntry as _WitnessEntry
 
     def _proj(pkg: str) -> str:
-        return _depkey_for_solved_name(pkg, binding_resolver).solver_var()
+        return _depkey_for_solved_name(pkg).solver_var()
 
     new_resolved = tuple((_proj(pkg), ver) for pkg, ver in result.resolved)
     new_witness = tuple(
@@ -5191,13 +5197,11 @@ def _project_solve_success(
     return dataclasses.replace(result, resolved=new_resolved, witness=new_witness)  # type: ignore[return-value]
 
 
-def _project_solver_error(
-    exc: "SolverError", binding_resolver: "BindingResolver"
-) -> "SolverError":
+def _project_solver_error(exc: "SolverError") -> "SolverError":
     """Project every PubGrub package string in a §5.2 failure certificate
-    back to the legacy "ns::name"/bare form (S5-rekey, RFC origin-as-
-    identity §4.4) — the failure-path counterpart to
-    ``_project_solve_success``.
+    back to the display "ns::name"/bare form (RFC origin-as-identity §4.4) —
+    the failure-path counterpart to ``_project_solve_success`` (DE1: reads each
+    ``SolverKey``'s ``.display``, no ``binding_resolver``).
 
     Rebuilds ``exc.chain``/``exc._all_incompats`` (both frozen dataclasses,
     walked bottom-up via ``dataclasses.replace``) and constructs a NEW
@@ -5213,7 +5217,7 @@ def _project_solver_error(
     from milpa.solver import SolverError as _SolverError, Term as _Term
 
     def _proj(pkg: str) -> str:
-        return _depkey_for_solved_name(pkg, binding_resolver).solver_var()
+        return _depkey_for_solved_name(pkg).solver_var()
 
     def _proj_term(t: "_Term") -> "_Term":
         return dataclasses.replace(t, package=_proj(t.package))
@@ -5293,7 +5297,7 @@ def _build_graph(
         # a differently-sourced peer happened to win the BFS canonical
         # tie-break.
         if name in _aliases_map:
-            _alias_dk = _depkey_for_solved_name(name, binding_resolver)
+            _alias_dk = _depkey_for_solved_name(name)
             _run_entry_trust_gate(
                 cand,
                 _alias_dk.name,
@@ -5303,17 +5307,16 @@ def _build_graph(
             continue
 
         # C1 (rfc-resolver-correctness.md): ``name`` here is the PubGrub solver
-        # variable — S5-rekey (RFC origin-as-identity §4.4): for a named/
-        # registry dep this is now the BOUND source-id's canonical form, not a
-        # ``"ns1::bar"`` string, so it must be decoded via
-        # ``binding_resolver.depkey_for_canonical`` (falling back to
-        # ``DepKey.from_solver_var`` for the eager git/tarball/local/member
-        # case, whose term key is still the plain ``dep.name``, never
-        # canonicalized). Decompose into bare name + namespace for
+        # variable — RFC origin-as-identity §4.4: for a named/registry dep its
+        # string value is the BOUND source-id's canonical form, not a
+        # ``"ns1::bar"`` string, so it is decoded via
+        # ``_depkey_for_solved_name`` (the ``SolverKey``'s ``.display``, DE1;
+        # ``DepKey.from_solver_var`` for the identity==label git/tarball/local/
+        # member case). Decompose into bare name + namespace for
         # ``ResolvedDep`` so the lockfile receives the bare name as the dep
         # arg and namespace as a separate child node (never the canonical
         # string, and never ``::``, on disk).
-        _cand_dk = _depkey_for_solved_name(name, binding_resolver)
+        _cand_dk = _depkey_for_solved_name(name)
         _bare_name = _cand_dk.name        # e.g. "bar"
         _namespace = _cand_dk.namespace   # e.g. "ns1" or None
 
@@ -5382,7 +5385,7 @@ def _build_graph(
         # legacy "ns::name"/bare form, same as `requires=` above (lockfile.py
         # applies no separate conversion to CondRequire.name).
         _raw_cond: list[_CondRequire] = [
-            _CondRequire(name=_depkey_for_solved_name(rname, binding_resolver).solver_var(), predicates=preds)
+            _CondRequire(name=_depkey_for_solved_name(rname).solver_var(), predicates=preds)
             for rname, pred_list in cand.requires_predicates.items()
             for preds in pred_list
             if preds
@@ -5437,7 +5440,7 @@ def _build_graph(
             # ``_req_name_to_lockfile`` conversion site (solver_var "ns::name"
             # -> lockfile "ns/name") keeps working unchanged.
             requires=tuple(
-                _depkey_for_solved_name(r, binding_resolver).solver_var()
+                _depkey_for_solved_name(r).solver_var()
                 for r in cand.requires_names
             ),
             # D-lifecycle: full provenances tuple (observed + declared mirrors).
@@ -5461,7 +5464,7 @@ def _build_graph(
             # lexicographic order need not match bare-name lexicographic
             # order.
             aliases=tuple(sorted(
-                _depkey_for_solved_name(a, binding_resolver).name
+                _depkey_for_solved_name(a).name
                 for a in canonical_to_aliases.get(name, [])
             )),
             # C1: carry namespace for qualified named deps.
@@ -6273,12 +6276,12 @@ def resolve_workspace(
         # S5-rekey (RFC origin-as-identity §4.4): project the certificate's
         # PubGrub package strings back to the legacy "ns::name"/bare form —
         # certificate_to_json (solver.py) has no BindingResolver access.
-        cert = _project_solve_success(cert, binding_resolver)
+        cert = _project_solve_success(cert)
     except VersionUnknownConstrained as exc:
         raise _version_unknown_constrained_err(exc, root_authority, binding_resolver) from exc
     except SolverError as exc:
         from milpa.errors import SOLVE_CONFLICT
-        _projected_exc = _project_solver_error(exc, binding_resolver)
+        _projected_exc = _project_solver_error(exc)
         raise MilpaError(
             SOLVE_CONFLICT,
             f"dependency conflict: {_projected_exc}",
@@ -6321,7 +6324,7 @@ def resolve_workspace(
         # S5-rekey: ws_discovery_order holds canonical solver-variable
         # strings for named deps — decode for both the lookup key and the
         # stored DISPLAY name (attestation-policy warning text).
-        _ws_dk_disp = _depkey_for_solved_name(_n, binding_resolver)
+        _ws_dk_disp = _depkey_for_solved_name(_n)
         _sid = binding_resolver.source_id_for(_ws_dk_disp)
         if _sid is not None and _sid not in _ws_name_by_source_id:
             _ws_name_by_source_id[_sid] = _ws_dk_disp.solver_var()

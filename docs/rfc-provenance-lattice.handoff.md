@@ -7,6 +7,61 @@ NEXT: (1) Stage 4 `/code-review docs/rfc-origin-as-identity` (Corey-triggered); 
 S7 tree-scan default, Rust unused-digest warn); (3) S11 amoxtli manual proof (Corey-gated runbook). Loop STOPPED (automatable scope exhausted).
 Build order was RFC §10 (17 numbered items S0–S11).
 
+## ⭐⭐ STAGE 4 FIX-LOOP — DE1 + D3 IN PROGRESS (2026-08-03, latest)
+
+**Baseline committed `9bff49f`** ("feat: origin-as-identity — re-key resolution to canonical(source_id)"):
+the ENTIRE origin-as-identity RFC (impl both impls + 200+ regenerated fixtures + spec) + all 18 code-review
+fixes through Medium + D3, all green. This is the **rollback point** — `git reset --hard 9bff49f` recovers if
+DE1 goes sideways. Two strays left untracked on purpose: `.claude/scheduled_tasks.lock` (runtime lock),
+`BUG-root-authority-kdl-transitive.md` (dogfood bug note). Corey chose "commit green baseline first"; DE1 is
+being ground out UNCOMMITTED on top of it.
+
+**D3 — DONE + green both impls** (in baseline `9bff49f`): new slug `RES-MEMBER-OUTSIDE-WORKSPACE` raised at both
+seed arms (was Python silent-drop / Rust cryptic SOLVE-CONFLICT); dead `eq_sentinel()` removed. Tests py
+`test_d3_member_outside_workspace.py` + rust `resolve_member_dep_in_single_package_manifest_fails_with_coded_error`.
+
+**DE1 — Python HALF COMPLETE + GREEN (uncommitted; patch backup `$CLAUDE_JOB_DIR/tmp/python_de1.patch`).**
+Realization (str-subclass, dramatically lower risk than the reviewer's frozen-dataclass sketch):
+- `SolverKey(str)` in `version.py` — value IS `canonical(source_id)` (so every solver f-string/dict-key/`==`/hash
+  is byte-identical), carries `.display: DepKey` (BFS-first label) as an attribute. `SolverKey.for_depkey` mint helper.
+- `BindingResolver`: `_canonical_index` (reverse map) DELETED → `_solverkey_index` intern table + `_intern()`;
+  `canonical_for` returns the interned SolverKey; `depkey_for_canonical` DELETED.
+- `canonical_key_for_requirement` returns `SolverKey` (bound → `canonical_for`; unbound guess → `SolverKey(canonical, dk)`).
+- `_depkey_for_solved_name(name)` = `name.display if SolverKey else DepKey.from_solver_var(name)` — no `binding_resolver`
+  arg (dropped from all 17 call sites via scoped regex). Proven via probe: NO prefixed (`git+`/`pkg+`/…) canonical
+  string ever reaches it as a plain str; only bare/`ns::name`/`__root__` do (from_solver_var exact).
+- **P6 FIXED** (folded in): transitive tarball/local/oci-override arms (resolver.py ~2516/2536/2557/2362) now
+  `record_discovery(canonical_for(DepKey(name=...)))` not bare name → discovery_index matches, BFS-first tiebreak restored.
+- `_project_solve_success`/`_project_solver_error` de-threaded (binding_resolver param dropped). Stale docstrings refreshed.
+- Tests migrated: `TestDepkeyForCanonical` → `TestSolverKeyDisplay` (asserts `.display` + interning identity).
+- **Full Python suite EXIT:0, 0 failed, 0 fixtures flipped.**
+
+**DE1 — Rust HALF COMPLETE + GREEN (uncommitted).** `SolverKey` newtype added to `milpa-types` (identity-only
+Eq/Hash/Ord, `Deref<str>` + `Borrow<str>` so the `&str`-based `PackageProvider` trait keeps working via deref
+coercion; `Display`/`Debug` match `String` for byte-identical diagnostics; `From<&str>`/`From<String>` for
+bare/`ns::name`/sentinel construction). Threaded as the `pubgrub` package type (`ProviderAdapter::type P = SolverKey`,
+`Priority` `Reverse<SolverKey>`, `solve`/`solve_with_refutation` return `BTreeMap<SolverKey, Version>`,
+`extract_refutation` `DerivationTree<SolverKey,…>`, `Dep.package: SolverKey`). `binding.rs`: `canonical_index`
+(reverse map) → `solverkey_index` intern table; `canonical_for` returns `SolverKey`; `depkey_for_canonical` DELETED;
+`canonical_key_for_requirement` returns `SolverKey`; single `display_for` projection boundary added. Resolver keeps
+its identity-`String` bookkeeping (candidates/requires_names/discovery_order), bridging at solver/String boundaries
+via `.to_string()`/`.as_str()` and projecting display through the single `display_for` boundary (Rust has no
+str-subclass affordance, so full internal-state SolverKey conversion — needed only to drop the last intern-table
+lookup — was disproportionate for zero observable gain; the solver genericization + single boundary is the realization).
+P6 was Python-only (Rust discovery arms already recorded `canonical(&decision.accepted)`, verified). Tests migrated
+(`binding_tests.rs`: `depkey_for_canonical_*` → `solver_key_display_*` / `display_for_*`). **Full workspace GREEN:
+EXIT:0, 0 failed (integration 162, milpa-core 1077, milpa-manifest 247, milpa-solver 55, conformance 19 byte-identical).**
+
+**RFC §4.4/§13 — UPDATED.** §4.4 now leads with the DE1 reversal block (rich `SolverKey`, reverse map deleted,
+Python-str-subclass / Rust-newtype-Deref, cost calculus that flipped); §13 "Genericize PubGrub over a key type"
+flipped from Rejected → Adopted with rationale.
+
+**DE1 + D3 COMPLETE, BOTH IMPLS GREEN, UNCOMMITTED** (on top of baseline `9bff49f`). Python patch backup at
+`$CLAUDE_JOB_DIR/tmp/python_de1.patch`. Nothing committed since the baseline (Corey grinds DE1 uncommitted per plan).
+Residual (not a blocker): Rust threads `binding_resolver` to the single `display_for`/`depkey_for_solved_name`
+projection helper (one boundary, not a scatter) vs Python's zero-lookup `.display` read — an impl-detail difference,
+not a structural asymmetry (both: SolverKey solver key, single projection boundary, byte-identical corpus).
+
 ## ⭐ STAGE 4 — CODE REVIEW (in progress, 2026-08-03)
 
 6 review lenses complete (Python-correctness, Rust-correctness, differential, security, design, spec/coverage).

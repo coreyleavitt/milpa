@@ -301,36 +301,41 @@ fn canonical_for_unbound_key_is_milpa_internal() {
 }
 
 #[test]
-fn depkey_for_canonical_returns_none_when_nothing_bound() {
+fn display_for_returns_none_when_nothing_bound() {
     let resolver = BindingResolver::new(&[]);
-    assert_eq!(resolver.depkey_for_canonical("git+https://example.com/x"), None);
+    assert_eq!(resolver.display_for("git+https://example.com/x"), None);
 }
 
 #[test]
-fn depkey_for_canonical_returns_the_bound_depkey() {
+fn solver_key_display_is_the_bound_depkey() {
     let resolver = BindingResolver::new(&[claim("foo", nimz3(), true, "root")]);
-    assert_eq!(resolver.depkey_for_canonical(&canonical(&nimz3())), Some(&DepKey::bare("foo")));
+    let sk = resolver.canonical_for(&DepKey::bare("foo")).unwrap();
+    // A SolverKey IS its canonical origin string …
+    assert_eq!(sk, canonical(&nimz3()));
+    // … and carries its display DepKey inline.
+    assert_eq!(sk.display(), &DepKey::bare("foo"));
 }
 
 #[test]
-fn depkey_for_canonical_two_labels_one_source_collapse_to_the_first_bound_depkey() {
-    // The headline S5-rekey regression: two DIFFERENT root claims ("foo",
-    // "bar") that both target the SAME source-id are, from the reverse
-    // map's perspective, ONE canonical key — resolved to whichever DepKey
-    // was bound FIRST (BFS-first, mirroring Phase B's alias-selection
-    // convention), never the second.
+fn solver_key_two_labels_one_source_collapse_to_the_first_bound_depkey() {
+    // The headline regression: two DIFFERENT root claims ("foo", "bar") that
+    // both target the SAME source-id collapse to ONE origin — its SolverKey
+    // `.display()` is whichever DepKey was bound FIRST (BFS-first, mirroring
+    // Phase B's alias-selection convention), never the second, regardless of
+    // which label is used to look it up.
     let resolver = BindingResolver::new(&[
         claim("foo", nimz3(), true, "root"),
         claim("bar", nimz3(), true, "root"),
     ]);
-    assert_eq!(resolver.depkey_for_canonical(&canonical(&nimz3())), Some(&DepKey::bare("foo")));
+    assert_eq!(resolver.canonical_for(&DepKey::bare("foo")).unwrap().display(), &DepKey::bare("foo"));
+    assert_eq!(resolver.canonical_for(&DepKey::bare("bar")).unwrap().display(), &DepKey::bare("foo"));
 }
 
 #[test]
-fn depkey_for_canonical_transitive_claim_extends_the_index() {
+fn solver_key_transitive_claim_extends_the_index() {
     let mut resolver = BindingResolver::new(&[]);
     resolver.submit(&claim("foo", nimz3(), false, "a@1.0.0")).unwrap();
-    assert_eq!(resolver.depkey_for_canonical(&canonical(&nimz3())), Some(&DepKey::bare("foo")));
+    assert_eq!(resolver.canonical_for(&DepKey::bare("foo")).unwrap().display(), &DepKey::bare("foo"));
 }
 
 #[test]

@@ -198,6 +198,57 @@ class DepKey:
         return cls(name=s)
 
 
+class SolverKey(str):
+    """The PubGrub solver variable, carrying its display ``DepKey`` inline.
+
+    origin-as-identity RFC §4.4 (DE1, genericized key): the solver keys every
+    variable by ``canonical(source_id)`` — a trust-independent, kind-free
+    origin string.  ``SolverKey`` **is** that string (it subclasses ``str``, so
+    its value is exactly ``canonical(source_id)``), which means it renders,
+    hashes, compares, and serializes identically to the bare canonical string
+    the solver used before — every solver diagnostic f-string, dict key, and
+    ``==`` is byte-for-byte unchanged.
+
+    What it adds is ``display``: the ``DepKey`` (name + optional namespace) this
+    origin should be *labelled* with in user-facing output — the lockfile
+    ``requires`` list, the ``nim.cfg`` search path, the §5 resolution
+    certificate.  ``display`` is BFS-first: the FIRST ``DepKey`` bound to a
+    given origin wins (two labels for one origin collapse to the first-
+    discovered name), so it is deliberately NOT part of identity — two
+    ``SolverKey``s with the same origin string are equal and hash-equal
+    regardless of ``display`` (inherited ``str`` semantics).
+
+    This replaces the origin-as-identity S5-rekey's ``canonical → DepKey``
+    reverse map (``BindingResolver._canonical_index`` / ``depkey_for_canonical``)
+    and the scatter of ``_depkey_for_solved_name(pkg, binding_resolver)``
+    projection call sites: wherever a consumer holds a solver variable, it reads
+    ``pkg.display`` directly — no reverse lookup, no ``binding_resolver``
+    threading.  Interning at the single mint point (``BindingResolver`` /
+    ``SolverKey.for_depkey``) guarantees every instance for one origin is the
+    same object, so ``display`` is deterministic.
+
+    SOLVER-INTERNAL as a *string*: the raw origin value MUST NOT be written to
+    disk (use ``display`` → ``LockedDep.name``/``namespace`` for the lockfile,
+    ``dep_dir_name`` for ``_deps/`` layout).
+    """
+
+    __slots__ = ("display",)
+    display: DepKey
+
+    def __new__(cls, identity: str, display: DepKey) -> "SolverKey":
+        obj = super().__new__(cls, identity)
+        obj.display = display
+        return obj
+
+    @classmethod
+    def for_depkey(cls, key: DepKey) -> "SolverKey":
+        """Mint a ``SolverKey`` whose origin string is the DepKey's own
+        ``solver_var()`` (the identity == label case: git/tarball/local/member
+        deps, and any dep not routed through a ``source_id`` binding).  The
+        ``display`` is the key itself."""
+        return cls(key.solver_var(), key)
+
+
 # ---------------------------------------------------------------------------
 # dep_dir_name — SSOT for _deps/ layout (C1, rfc-resolver-correctness.md)
 # ---------------------------------------------------------------------------

@@ -32,7 +32,7 @@ use milpa_solver::{
     parse_version, solve, solve_with_refutation, vs_to_constraint_str, Dep as SolverDep,
     PackageProvider, RefutationEntry, SolverError, Strategy, VersionSet, VersionSource,
 };
-use milpa_types::{DepKey, EdgeSet, EntryAttestation, FetchableOrigin, FlagRequest, Lockfile, Provenance, ProvenanceRecord, ResolvedDep, ResolvedGraph, SourceId, Timestamp, Version, format_iso8601_timestamp};
+use milpa_types::{DepKey, EdgeSet, EntryAttestation, FetchableOrigin, FlagRequest, Lockfile, Provenance, ProvenanceRecord, ResolvedDep, ResolvedGraph, SolverKey, SourceId, Timestamp, Version, format_iso8601_timestamp};
 
 use crate::binding::{
     canonical_key_for_requirement, check_registry_shadow, reconcile_root_claims, BindOutcome,
@@ -1796,7 +1796,7 @@ impl<'a> ResolveProvider<'a> {
                     let svar = self.binding_resolver.borrow().canonical_for(&DepKey::bare(name.clone()))?;
                     // Axis A (a)/D-A2: full() self-term, never eq(sentinel).
                     root_deps.push(SolverDep::new(svar.clone(), VersionSet::full()));
-                    root_requires.push(svar.clone());
+                    root_requires.push(svar.to_string());
                     self.record_discovery(&svar); // Phase B: root deps in declaration order
                     queue.push(Item::Tarball(t.clone()));
                 }
@@ -1805,7 +1805,7 @@ impl<'a> ResolveProvider<'a> {
                     let svar = self.binding_resolver.borrow().canonical_for(&DepKey::bare(name.clone()))?;
                     // Axis A (a)/D-A2: full() self-term, never eq(sentinel).
                     root_deps.push(SolverDep::new(svar.clone(), VersionSet::full()));
-                    root_requires.push(svar.clone());
+                    root_requires.push(svar.to_string());
                     self.record_discovery(&svar); // Phase B: root deps in declaration order
                     queue.push(Item::Local(l.clone()));
                 }
@@ -1819,7 +1819,7 @@ impl<'a> ResolveProvider<'a> {
                     if let Some(ov) = self.overrides.get(&name) {
                         if let OverrideTarget::Local { path } = &ov.target {
                             root_deps.push(SolverDep::new(svar.clone(), VersionSet::full()));
-                            root_requires.push(svar.clone());
+                            root_requires.push(svar.to_string());
                             self.record_discovery(&svar);
                             queue.push(Item::Local(LocalDep { name, path: path.clone(), predicates: vec![], version: ov.version.clone() }));
                             continue;
@@ -1829,7 +1829,7 @@ impl<'a> ResolveProvider<'a> {
                         if let OverrideTarget::Member { member_name } = &ov.target {
                             let _ = member_name;
                             root_deps.push(SolverDep::new(svar.clone(), VersionSet::full()));
-                            root_requires.push(svar.clone());
+                            root_requires.push(svar.to_string());
                             self.record_discovery(&svar);
                             queue.push(Item::Url(u.clone()));
                             continue;
@@ -1844,7 +1844,7 @@ impl<'a> ResolveProvider<'a> {
                     // causality fix (term built pre-fetch; the real label is
                     // assigned post-fetch), unconditional of override kind.
                     root_deps.push(SolverDep::new(svar.clone(), VersionSet::full()));
-                    root_requires.push(svar.clone());
+                    root_requires.push(svar.to_string());
                     self.record_discovery(&svar); // Phase B: root deps in declaration order
                     queue.push(Item::Url(u.clone()));
                 }
@@ -1879,7 +1879,7 @@ impl<'a> ResolveProvider<'a> {
                     if !n.flag_requests.is_empty() {
                         self.flag_requests_by_name
                             .borrow_mut()
-                            .insert(svar.clone(), n.flag_requests.clone());
+                            .insert(svar.to_string(), n.flag_requests.clone());
                     }
                     if self.overrides.contains_key(&name) {
                         // Override routes a named dep to a URL/local fetch → singleton.
@@ -1889,7 +1889,7 @@ impl<'a> ResolveProvider<'a> {
                             // S8a: LocalTarget override on root NamedDep → local item.
                             OverrideTarget::Local { path } => {
                                 root_deps.push(SolverDep::new(svar.clone(), VersionSet::full()));
-                                root_requires.push(svar.clone());
+                                root_requires.push(svar.to_string());
                                 self.record_discovery(&svar);
                                 queue.push(Item::Local(LocalDep { name, path: path.clone(), predicates: vec![], version: ov.version.clone() }));
                                 continue;
@@ -1915,7 +1915,7 @@ impl<'a> ResolveProvider<'a> {
                     } else {
                         root_deps.push(SolverDep::new(svar.clone(), vs.clone()));
                     }
-                    root_requires.push(svar.clone());
+                    root_requires.push(svar.to_string());
                     self.record_discovery(&svar); // Phase B: root deps in declaration order
                     queue.push(Item::Named {
                         name,
@@ -1989,7 +1989,7 @@ impl<'a> ResolveProvider<'a> {
             let root_self_svar =
                 self.binding_resolver.borrow().canonical_for(&DepKey::bare(name.clone()))?;
             self.store_candidate(Candidate {
-                name: root_self_svar,
+                name: root_self_svar.to_string(),
                 version: root_self_version,
                 // §14.5: no separate identity — the project root is not an
                 // isolated, independently-hashed tree the way a fetched dep
@@ -2185,7 +2185,7 @@ impl<'a> ResolveProvider<'a> {
                     // tarball's full() self-term; justified by "one candidate,
                     // must satisfy floors", not causality — members have no fetch).
                     terms.push(SolverDep::new(svar_coerce.clone(), VersionSet::full()));
-                    requires.push(svar_coerce);
+                    requires.push(svar_coerce.to_string());
                     continue;
                 }
 
@@ -2201,7 +2201,7 @@ impl<'a> ResolveProvider<'a> {
                             let svar = self.binding_resolver.borrow().canonical_for(&DepKey::bare(name.clone()))?;
                             // Axis A (a)/D-A2: full() self-term, never eq(sentinel).
                             terms.push(SolverDep::new(svar.clone(), VersionSet::full()));
-                            requires.push(svar.clone());
+                            requires.push(svar.to_string());
                             self.record_discovery(&svar);
                             queue.push(Item::Local(LocalDep { name: name.clone(), path: path.clone(), predicates: vec![], version: ov.version.clone() }));
                         }
@@ -2209,7 +2209,7 @@ impl<'a> ResolveProvider<'a> {
                             let svar = self.binding_resolver.borrow().canonical_for(&DepKey::bare(name.clone()))?;
                             // Axis A (a)/D-A2: full() self-term, never eq(sentinel).
                             terms.push(SolverDep::new(svar.clone(), VersionSet::full()));
-                            requires.push(svar.clone());
+                            requires.push(svar.to_string());
                             // S8b: member already pre-registered (bound in
                             // `binding_resolver` via the workspace override
                             // reconciliation).  No external queue entry needed;
@@ -2221,7 +2221,7 @@ impl<'a> ResolveProvider<'a> {
                             let svar = self.binding_resolver.borrow().canonical_for(&DepKey::bare(name.clone()))?;
                             // Axis A (a)/D-A2: full() self-term, never eq(sentinel).
                             terms.push(SolverDep::new(svar.clone(), VersionSet::full()));
-                            requires.push(svar.clone());
+                            requires.push(svar.to_string());
                             // Override converts Named→Url at dispatch; constraint is unused.
                             queue.push(Item::Named {
                                 name: name.clone(),
@@ -2243,7 +2243,7 @@ impl<'a> ResolveProvider<'a> {
                         let svar = self.binding_resolver.borrow().canonical_for(&DepKey::bare(name.clone()))?;
                         // Axis A (a)/D-A2: full() self-term, never eq(sentinel).
                         terms.push(SolverDep::new(svar.clone(), VersionSet::full()));
-                        requires.push(svar.clone());
+                        requires.push(svar.to_string());
                         self.record_discovery(&svar);
                         queue.push(Item::Url(u.clone()));
                     }
@@ -2252,7 +2252,7 @@ impl<'a> ResolveProvider<'a> {
                         let svar = self.binding_resolver.borrow().canonical_for(&DepKey::bare(name.clone()))?;
                         // Axis A (a)/D-A2: full() self-term, never eq(sentinel).
                         terms.push(SolverDep::new(svar.clone(), VersionSet::full()));
-                        requires.push(svar.clone());
+                        requires.push(svar.to_string());
                         self.record_discovery(&svar);
                         queue.push(Item::Local(l.clone()));
                     }
@@ -2261,7 +2261,7 @@ impl<'a> ResolveProvider<'a> {
                         let svar = self.binding_resolver.borrow().canonical_for(&DepKey::bare(name.clone()))?;
                         // Axis A (a)/D-A2: full() self-term, never eq(sentinel).
                         terms.push(SolverDep::new(svar.clone(), VersionSet::full()));
-                        requires.push(svar.clone());
+                        requires.push(svar.to_string());
                         self.record_discovery(&svar);
                         queue.push(Item::Tarball(t.clone()));
                     }
@@ -2288,7 +2288,7 @@ impl<'a> ResolveProvider<'a> {
                         };
                         let svar = self.binding_resolver.borrow().canonical_for(&binding_key)?;
                         terms.push(SolverDep::new(svar.clone(), vs.clone()));
-                        requires.push(svar.clone());
+                        requires.push(svar.to_string());
                         self.record_discovery(&svar);
                         // S11 (RFC #23 §3.8): accumulate flag_requests from ALL members
                         // (workspace-wide union). Union via extend — monotone; duplicate
@@ -2297,7 +2297,7 @@ impl<'a> ResolveProvider<'a> {
                         if !n.flag_requests.is_empty() {
                             self.flag_requests_by_name
                                 .borrow_mut()
-                                .entry(svar.clone())
+                                .entry(svar.to_string())
                                 .or_default()
                                 .extend(n.flag_requests.iter().cloned());
                         }
@@ -2320,7 +2320,7 @@ impl<'a> ResolveProvider<'a> {
             let member_svar =
                 self.binding_resolver.borrow().canonical_for(&DepKey::bare(member.name.clone()))?;
             self.store_candidate(Candidate {
-                name: member_svar,
+                name: member_svar.to_string(),
                 // A2c/D-A2: the member's own declared version (milpa.kdl/
                 // .nimble), else the sentinel — computed once above.
                 version: member_versions[&member.name].clone(),
@@ -2356,7 +2356,7 @@ impl<'a> ResolveProvider<'a> {
             let member_root_svar =
                 self.binding_resolver.borrow().canonical_for(&DepKey::bare(member.name.clone()))?;
             root_deps.push(SolverDep::new(member_root_svar.clone(), VersionSet::full()));
-            root_requires.push(member_root_svar);
+            root_requires.push(member_root_svar.to_string());
         }
 
         // S11 (RFC #23 §3.8): workspace-root flags {} — seed workspace-wide active
@@ -2404,7 +2404,7 @@ impl<'a> ResolveProvider<'a> {
                         // Accumulate (union) into flag_requests_by_name.
                         self.flag_requests_by_name
                             .borrow_mut()
-                            .entry(svar_target)
+                            .entry(svar_target.to_string())
                             .or_default()
                             .extend(cpe.flag_requests.iter().cloned());
                     }
@@ -2461,7 +2461,7 @@ impl<'a> ResolveProvider<'a> {
                 let member_identity: String = self
                     .candidates
                     .borrow()
-                    .get(&member_svar_fp)
+                    .get(member_svar_fp.as_str())
                     .and_then(|m| m.values().next())
                     .map(|c| c.identity.clone())
                     .unwrap_or_default();
@@ -2484,7 +2484,7 @@ impl<'a> ResolveProvider<'a> {
                 // dep_identities by this exact key).
                 self.member_manifests
                     .borrow_mut()
-                    .insert(member_svar_fp, member.manifest.clone());
+                    .insert(member_svar_fp.to_string(), member.manifest.clone());
             }
         }
 
@@ -2910,7 +2910,7 @@ impl<'a> ResolveProvider<'a> {
             _ => unreachable!("override_effective_item only returns Tarball/Oci/Named for these targets"),
         };
         root_deps.push(SolverDep::new(svar.clone(), vs));
-        root_requires.push(svar.clone());
+        root_requires.push(svar.to_string());
         self.record_discovery(&svar);
         queue.push(eff);
         Ok(true)
@@ -2981,7 +2981,7 @@ impl<'a> ResolveProvider<'a> {
                             let new_active = compute_dep_active_flags(&manifest.flags, &positive_reqs);
                             // Resolve identity for this dep (H3: key by identity, not dep_name).
                             let dep_identity: String = self.candidates.borrow()
-                                .get(&svar)
+                                .get(svar.as_str())
                                 .and_then(|m| m.values().next())
                                 .map(|c| c.identity.clone())
                                 .unwrap_or_default();
@@ -3051,9 +3051,9 @@ impl<'a> ResolveProvider<'a> {
                                             };
                                             {
                                                 let mut cands = self.candidates.borrow_mut();
-                                                if let Some(version_map) = cands.get_mut(&svar) {
+                                                if let Some(version_map) = cands.get_mut(svar.as_str()) {
                                                     if let Some(cand) = version_map.values_mut().next() {
-                                                        if !cand.requires_names.contains(&sub_svar) {
+                                                        if !cand.requires_names.iter().any(|r| r.as_str() == sub_svar.as_str()) {
                                                             // Axis A (a)/D-A2: full() self-term for
                                                             // url/local/tarball, overridden-named, AND
                                                             // member (A2c) — every one of these dep
@@ -3072,7 +3072,7 @@ impl<'a> ResolveProvider<'a> {
                                                                 }
                                                             };
                                                             cand.deps.push(SolverDep::new(sub_svar.clone(), vs));
-                                                            cand.requires_names.push(sub_svar.clone());
+                                                            cand.requires_names.push(sub_svar.to_string());
                                                         }
                                                     }
                                                 }
@@ -3238,7 +3238,7 @@ impl<'a> ResolveProvider<'a> {
         // (milpa.kdl → .nimble), else the sentinel (version-unknown stays as-is).
         let candidate_version = candidate_label(ex.declared_version.as_ref());
         self.store_candidate(Candidate {
-            name: svar,
+            name: svar.to_string(),
             version: candidate_version,
             identity,
             src_dir: ex.src_dir,
@@ -3334,7 +3334,7 @@ impl<'a> ResolveProvider<'a> {
         // canonical_for is safe to call directly.
         let svar = self.binding_resolver.borrow().canonical_for(&DepKey::bare(dep.name.clone()))?;
         self.store_candidate(Candidate {
-            name: svar,
+            name: svar.to_string(),
             version: candidate_version,
             identity,
             src_dir: ex.src_dir,
@@ -3405,7 +3405,7 @@ impl<'a> ResolveProvider<'a> {
         // canonical_for is safe to call directly.
         let svar = self.binding_resolver.borrow().canonical_for(&DepKey::bare(dep.name.clone()))?;
         self.store_candidate(Candidate {
-            name: svar,
+            name: svar.to_string(),
             version: candidate_version,
             identity,
             src_dir: ex.src_dir,
@@ -3477,7 +3477,7 @@ impl<'a> ResolveProvider<'a> {
         // `BindingResolver::new` before any worker runs.
         let svar = self.binding_resolver.borrow().canonical_for(&DepKey::bare(dep.name.clone()))?;
         self.store_candidate(Candidate {
-            name: svar,
+            name: svar.to_string(),
             version: candidate_version,
             identity,
             src_dir: ex.src_dir,
@@ -3592,7 +3592,7 @@ impl<'a> ResolveProvider<'a> {
             })?;
             self.stubs
                 .borrow_mut()
-                .entry(stub_key)
+                .entry(stub_key.to_string())
                 .or_default()
                 .extend(by_ver);
         }
@@ -3999,7 +3999,7 @@ impl<'a> ResolveProvider<'a> {
                     // §7 B5 "version-scoped overrides"), in which case the
                     // redirect's own (possibly version-scoped) constraint applies
                     // (mirrors Python's `_dep_to_term`'s UrlDep branch).
-                    if !seen_dep_names.contains(&svar_u) {
+                    if !seen_dep_names.contains(svar_u.as_str()) {
                         let vs_u = if let Some(ov) = self.overrides.get(&dep_name) {
                             if let OverrideTarget::Registry { .. } = &ov.target {
                                 match &ov.version {
@@ -4013,8 +4013,8 @@ impl<'a> ResolveProvider<'a> {
                             VersionSet::full()
                         };
                         deps.push(SolverDep::new(svar_u.clone(), vs_u));
-                        requires_names.push(svar_u.clone());
-                        seen_dep_names.insert(svar_u.clone());
+                        requires_names.push(svar_u.to_string());
+                        seen_dep_names.insert(svar_u.to_string());
                     }
                     // ALWAYS enqueue the Item::Url so `gate_only`'s `BindingResolver`
                     // admission sees every distinct provenance. Two URLs that
@@ -4035,7 +4035,7 @@ impl<'a> ResolveProvider<'a> {
                     items.push(Item::Url(url_d));
                     // S4: accumulate predicates if non-empty (do not overwrite).
                     if !u.predicates.is_empty() {
-                        requires_predicates.entry(svar_u).or_default().push(u.predicates.clone());
+                        requires_predicates.entry(svar_u.to_string()).or_default().push(u.predicates.clone());
                     }
                 }
                 RequireEntry::Named(n) => {
@@ -4062,7 +4062,7 @@ impl<'a> ResolveProvider<'a> {
                             Some(&br),
                         )?
                     };
-                    if !seen_dep_names.contains(&solver_var) {
+                    if !seen_dep_names.contains(solver_var.as_str()) {
                         // Override check: a named transitive dep that is itself overridden
                         // is routed through the override URL fetch (§10). Axis A (a)/D-A2:
                         // its self-term is full(), never eq(sentinel) — UNLESS the override
@@ -4110,17 +4110,17 @@ impl<'a> ResolveProvider<'a> {
                         // H2: use solver_var as the key so the solver sees qualified deps
                         // as distinct from bare deps with the same name.
                         deps.push(SolverDep::new(solver_var.clone(), vs.clone()));
-                        requires_names.push(solver_var.clone());
+                        requires_names.push(solver_var.to_string());
                         items.push(Item::Named {
                             name: n.name.clone(),
                             constraint: vs,
                             namespace: n.namespace.clone(), // H2: carry namespace
                         });
-                        seen_dep_names.insert(solver_var.clone());
+                        seen_dep_names.insert(solver_var.to_string());
                     }
                     // S4: accumulate predicates if non-empty (do not overwrite).
                     if !n.predicates.is_empty() {
-                        requires_predicates.entry(solver_var.clone()).or_default().push(n.predicates.clone());
+                        requires_predicates.entry(solver_var.to_string()).or_default().push(n.predicates.clone());
                     }
                 }
             }
@@ -4283,7 +4283,7 @@ impl<'a> ResolveProvider<'a> {
     ///
     /// Returns a map from canonical name → sorted list of aliases, for
     /// `build_graph` to populate `ResolvedDep.aliases` / lockfile emission.
-    fn finalize(&self, solution: &BTreeMap<String, Version>) -> BTreeMap<String, Vec<String>> {
+    fn finalize(&self, solution: &BTreeMap<SolverKey, Version>) -> BTreeMap<String, Vec<String>> {
         // Step 1: materialize (if needed) every solved candidate and group by
         // identity. `dependencies()` must already have been called by the
         // solver for everything in `solution` before it could be included —
@@ -4298,9 +4298,9 @@ impl<'a> ResolveProvider<'a> {
             let Some(c) = self.get_or_materialize(name, version) else {
                 continue;
             };
-            solved_names.push(name.clone());
+            solved_names.push(name.to_string());
             if !c.identity.is_empty() {
-                by_hash.entry(c.identity.clone()).or_default().push(name.clone());
+                by_hash.entry(c.identity.clone()).or_default().push(name.to_string());
             }
         }
 
@@ -4361,10 +4361,10 @@ impl<'a> ResolveProvider<'a> {
         // points at the canonical name in the lockfile's `requires` list.
         let mut cands = self.candidates.borrow_mut();
         for name in &solved_names {
-            if aliases_map.contains_key(name) {
+            if aliases_map.contains_key(name.as_str()) {
                 continue;
             }
-            let Some(version) = solution.get(name) else { continue };
+            let Some(version) = solution.get(name.as_str()) else { continue };
             if let Some(c) = cands.get_mut(name).and_then(|m| m.get_mut(version)) {
                 for r in &mut c.requires_names {
                     if let Some(can) = aliases_map.get(r) {
@@ -4393,7 +4393,7 @@ impl<'a> ResolveProvider<'a> {
     /// resolve failure with no automatic fallback").
     fn build_graph(
         &self,
-        solution: &BTreeMap<String, Version>,
+        solution: &BTreeMap<SolverKey, Version>,
         canonical_aliases: &BTreeMap<String, Vec<String>>,
         entry_trust: Option<&crate::entry_trust::EntryTrustConfig>,
     ) -> Result<ResolvedGraph, MilpaError> {
@@ -4412,7 +4412,7 @@ impl<'a> ResolveProvider<'a> {
             if name == ROOT {
                 continue;
             }
-            let Some(c) = cands.get(name).and_then(|m| m.get(version)) else {
+            let Some(c) = cands.get(name.as_str()).and_then(|m| m.get(version)) else {
                 continue;
             };
             // RFC origin-as-identity §3.3/§4.5 (S4b): a solution entry that
@@ -4423,7 +4423,7 @@ impl<'a> ResolveProvider<'a> {
             // here, so a cross-origin collapse can never be used to bypass
             // strict entry-trust policy merely because a differently-sourced
             // peer happened to win the BFS canonical tie-break.
-            if aliases_map.contains_key(name) {
+            if aliases_map.contains_key(name.as_str()) {
                 if let Some(cfg) = entry_trust {
                     if c.is_registry {
                         let dep_key = depkey_for_solved_name(name, &self.binding_resolver.borrow());
@@ -4451,7 +4451,7 @@ impl<'a> ResolveProvider<'a> {
                 }
                 continue;
             }
-            chosen.insert(name.clone(), c.clone());
+            chosen.insert(name.to_string(), c.clone());
         }
 
         let mut ordered: Vec<String> = Vec::new();
@@ -4602,7 +4602,7 @@ impl<'a> ResolveProvider<'a> {
                         // `solution[alias]`.
                         if let Some(alias_names) = canonical_aliases.get(&c.name) {
                             for alias_name in alias_names {
-                                if let Some(alias_ver) = solution.get(alias_name) {
+                                if let Some(alias_ver) = solution.get(alias_name.as_str()) {
                                     if let Some(alias_prov) = cands
                                         .get(alias_name)
                                         .and_then(|m| m.get(alias_ver))
@@ -4847,7 +4847,7 @@ impl<'a> ResolveProvider<'a> {
                                 )?
                             };
                             additional_requests
-                                .entry(svar_target)
+                                .entry(svar_target.to_string())
                                 .or_default()
                                 .extend(cpe.flag_requests.iter().cloned());
                         }
@@ -4987,7 +4987,7 @@ impl<'a> ResolveProvider<'a> {
                             let mut cands = self.candidates.borrow_mut();
                             if let Some(version_map) = cands.get_mut(target_name) {
                                 if let Some(cand) = version_map.values_mut().next() {
-                                    if !cand.requires_names.contains(&sub_svar) {
+                                    if !cand.requires_names.iter().any(|r| r.as_str() == sub_svar.as_str()) {
                                         // Axis A (a)/D-A2: full() self-term for
                                         // url/local/tarball, overridden-named, AND
                                         // member (A2c) — every one of these dep
@@ -5006,7 +5006,7 @@ impl<'a> ResolveProvider<'a> {
                                             }
                                         };
                                         cand.deps.push(SolverDep::new(sub_svar.clone(), vs));
-                                        cand.requires_names.push(sub_svar.clone());
+                                        cand.requires_names.push(sub_svar.to_string());
                                     }
                                 }
                             }
@@ -5339,7 +5339,7 @@ impl PackageProvider for ResolveProvider<'_> {
 /// after S5-rekey those keys are canonical strings for named/registry deps
 /// and a raw `"::"`-split would silently corrupt them.
 fn depkey_for_solved_name(name: &str, binding_resolver: &BindingResolver) -> DepKey {
-    if let Some(dk) = binding_resolver.depkey_for_canonical(name) {
+    if let Some(dk) = binding_resolver.display_for(name) {
         return dk.clone();
     }
     DepKey::from_solver_var(name)
@@ -6494,11 +6494,11 @@ impl ResolveProvider<'_> {
     /// `resolved`: all packages in the solution (including root) sorted by name.
     /// `witness`: one entry per dep-edge across all resolved packages, sorted
     ///   by (package, satisfied_by) per spec §2.5.1.
-    fn build_success_cert(&self, solution: &BTreeMap<String, Version>) -> SuccessCert {
+    fn build_success_cert(&self, solution: &BTreeMap<SolverKey, Version>) -> SuccessCert {
         // resolved — sorted by package name (BTreeMap iteration is already sorted).
         let resolved: Vec<(String, String)> = solution
             .iter()
-            .map(|(pkg, ver)| (pkg.clone(), ver.to_string()))
+            .map(|(pkg, ver)| (pkg.to_string(), ver.to_string()))
             .collect();
 
         // witness — one entry per dep edge (depender → dep, with constraint).
@@ -6510,7 +6510,7 @@ impl ResolveProvider<'_> {
 
         for (depender, depender_ver) in solution {
             if let Some(c) = cands
-                .get(depender)
+                .get(depender.as_str())
                 .and_then(|m| m.get(depender_ver))
             {
                 for dep in &c.deps {
@@ -6519,13 +6519,13 @@ impl ResolveProvider<'_> {
                         continue;
                     };
                     let cstr = vs_to_constraint_str(&dep.constraint);
-                    let key = (dep.package.clone(), cstr.clone(), depender.clone());
+                    let key = (dep.package.to_string(), cstr.clone(), depender.to_string());
                     if seen.insert(key) {
                         entries.push(WitnessEntry {
-                            package: dep.package.clone(),
+                            package: dep.package.to_string(),
                             version: dep_ver.to_string(),
                             constraint: cstr,
-                            satisfied_by: depender.clone(),
+                            satisfied_by: depender.to_string(),
                         });
                     }
                 }
@@ -6585,7 +6585,7 @@ impl ResolveProvider<'_> {
         refutation
             .into_iter()
             .map(|e| RefutationEntry {
-                package: if e.package == ROOT { e.package } else { depkey_for_solved_name(&e.package, &br).solver_var() },
+                package: if e.package == ROOT { e.package } else { SolverKey::for_depkey(depkey_for_solved_name(&e.package, &br)) },
                 constraint: e.constraint,
             })
             .collect()

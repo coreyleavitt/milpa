@@ -183,6 +183,153 @@ impl DepKey {
     }
 }
 
+/// The PubGrub solver variable, carrying its display `DepKey` inline
+/// (origin-as-identity RFC §4.4, DE1 — genericized key).
+///
+/// The solver keys every variable by `canonical(source_id)` — a trust-
+/// independent, kind-free origin string. `SolverKey`'s `identity` IS that
+/// string, and it `Deref`s / `Borrow`s to `&str`, so it renders, hashes,
+/// compares, and serializes identically to the bare `String` the solver used
+/// before (every diagnostic `{}`/`{:?}`, map key, and `==` is byte-for-byte
+/// unchanged — the `PackageProvider` trait stays `&str`-based via deref
+/// coercion). Equality/hash/ordering are on `identity` ALONE.
+///
+/// What it adds is `display`: the `DepKey` this origin should be *labelled*
+/// with in user-facing output (lockfile `requires`, `nim.cfg` search path, the
+/// §5 certificate). `display` is BFS-first (the first `DepKey` bound to an
+/// origin wins; two labels for one origin collapse to the first-discovered
+/// name), so it is deliberately NOT part of identity. This replaces the
+/// `canonical → DepKey` reverse map (`BindingResolver::canonical_index` /
+/// `depkey_for_canonical`) and the `depkey_for_solved_name` projection scatter:
+/// a consumer holding a `SolverKey` reads `.display()` directly.
+#[derive(Clone)]
+pub struct SolverKey {
+    identity: String,
+    display: DepKey,
+}
+
+impl SolverKey {
+    /// Mint a `SolverKey` from an explicit origin string and its display label.
+    pub fn new(identity: impl Into<String>, display: DepKey) -> Self {
+        SolverKey { identity: identity.into(), display }
+    }
+
+    /// Mint a `SolverKey` whose origin string is the DepKey's own
+    /// `solver_var()` (the identity == label case: git/tarball/local/member
+    /// deps and any variable not routed through a `source_id` binding).
+    pub fn for_depkey(key: DepKey) -> Self {
+        SolverKey { identity: key.solver_var(), display: key }
+    }
+
+    /// The origin string (`canonical(source_id)`), i.e. the solver variable.
+    pub fn as_str(&self) -> &str {
+        &self.identity
+    }
+
+    /// The BFS-first display `DepKey` for this origin.
+    pub fn display(&self) -> &DepKey {
+        &self.display
+    }
+}
+
+// Identity-only equality/ordering/hashing: two SolverKeys for the same origin
+// are equal regardless of their display label.
+impl PartialEq for SolverKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.identity == other.identity
+    }
+}
+impl Eq for SolverKey {}
+impl std::hash::Hash for SolverKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.identity.hash(state);
+    }
+}
+impl PartialOrd for SolverKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for SolverKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.identity.cmp(&other.identity)
+    }
+}
+
+// Deref/Borrow to the origin string so `&SolverKey` coerces to `&str` (the
+// `PackageProvider` trait, format args) and `HashMap<SolverKey, _>` can be
+// queried with a plain `&str` key.
+impl std::ops::Deref for SolverKey {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.identity
+    }
+}
+impl std::borrow::Borrow<str> for SolverKey {
+    fn borrow(&self) -> &str {
+        &self.identity
+    }
+}
+impl AsRef<str> for SolverKey {
+    fn as_ref(&self) -> &str {
+        &self.identity
+    }
+}
+
+// Byte-identical rendering: Display == the origin string; Debug == a String's
+// Debug (quoted), so any `{:?}` diagnostic is unchanged from the pre-DE1 String.
+impl std::fmt::Display for SolverKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.identity)
+    }
+}
+impl std::fmt::Debug for SolverKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.identity, f)
+    }
+}
+
+// Ergonomic comparisons against string literals (e.g. the `__root__` sentinel).
+impl PartialEq<str> for SolverKey {
+    fn eq(&self, other: &str) -> bool {
+        self.identity == other
+    }
+}
+impl PartialEq<&str> for SolverKey {
+    fn eq(&self, other: &&str) -> bool {
+        self.identity == *other
+    }
+}
+impl PartialEq<String> for SolverKey {
+    fn eq(&self, other: &String) -> bool {
+        &self.identity == other
+    }
+}
+impl PartialEq<SolverKey> for str {
+    fn eq(&self, other: &SolverKey) -> bool {
+        self == other.identity
+    }
+}
+
+// Construction from a plain string. CONVENTION: use ONLY for a variable whose
+// origin string IS its own label — a bare name, an `ns::name` qualified name,
+// or the `__root__`/test sentinel — where `from_solver_var` recovers the
+// display exactly. A prefixed `canonical(source_id)` string (`git+`/`pkg+`/…)
+// MUST be minted with its real display via `SolverKey::new` /
+// `BindingResolver::canonical_for` / `canonical_key_for_requirement`, never
+// through these (`from_solver_var` would mis-split the prefix).
+impl From<&str> for SolverKey {
+    fn from(s: &str) -> Self {
+        SolverKey { identity: s.to_string(), display: DepKey::from_solver_var(s) }
+    }
+}
+impl From<String> for SolverKey {
+    fn from(s: String) -> Self {
+        let display = DepKey::from_solver_var(&s);
+        SolverKey { identity: s, display }
+    }
+}
+
 /// Canonical `_deps/` directory entry name for a dep (C1, rfc-resolver-correctness.md).
 ///
 /// Bare dep (`namespace=None`): `"<name>"` → `_deps/<name>`.

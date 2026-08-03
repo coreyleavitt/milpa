@@ -557,14 +557,37 @@ same name was overridden"). The dead-override diagnostic (B10, S5b) reuses it.
 The value the grouping key maps to is now a `SourceId` instead of a bare label;
 the namespace machinery (H2 qualified deps) is otherwise untouched.
 
-### 4.4 The solver — untouched
+### 4.4 The solver — genericized key (DE1, reverses the original "untouched")
 
-`Term.package` stays `str`, fed `canonical(source_id)` instead of `solver_var`.
-`solver.py`'s `Term`/`Incompatibility`/`PackageProvider`/certificate code is
-unchanged. The provider's candidate/stub dicts are re-keyed from `name` to
+> **DE1 (2026-08-03, code-review reversal).** The original design below kept the
+> solver variable a bare `str` and reconstructed the display `DepKey` at every
+> emission site through a `canonical → DepKey` reverse map
+> (`BindingResolver._canonical_index` / `depkey_for_canonical`). The stage-4
+> review found this pushed the two-phase complexity out to ~58 (Python) / ~17
+> (Rust) scattered projection call sites, each threading `binding_resolver`, and
+> was the root of a latent bug class (P6: a projection site recording a bare name
+> instead of the canonical key). The decision was **reversed**: the solver
+> variable is now a rich **`SolverKey`** — its string value is
+> `canonical(source_id)` (so it hashes, compares, and renders byte-identically to
+> the old bare string; the solver, its diagnostics, and every fixture are
+> unchanged), carrying its **BFS-first display `DepKey` inline** (`.display`).
+> Emission reads `.display` directly; the reverse map is deleted. In Python
+> `SolverKey` subclasses `str` (zero blast radius — the trick that made the
+> reversal cheap). In Rust it is a newtype with `Deref<str>` + `Borrow<str>`
+> (identity-only `Eq`/`Hash`/`Ord`), threaded as the `pubgrub` package type
+> `type P = SolverKey`; the resolver keeps its identity-`String` bookkeeping and
+> reads display through a single intern-table boundary
+> (`BindingResolver::display_for`) since Rust has no `str`-subclass affordance.
+> The cost calculus that flipped: the 58-site projection scatter + reverse-map +
+> P6 bug-class cost more than carrying display on the key. Interning at the mint
+> point (`BindingResolver`) makes `.display` deterministic (first label wins).
+
+`Term.package` is fed `canonical(source_id)` instead of `solver_var`. The
+provider's candidate/stub dicts are re-keyed from `name` to
 `canonical(source_id)` — **uniformly, for every dep kind. There is no
 kind-conditional keying** (no "git/tarball/local stays name-keyed"); the solver
-variable of *every* resolved node is `canonical(source_id)`.
+variable of *every* resolved node is `canonical(source_id)` (now carried as a
+`SolverKey`, per DE1 above).
 
 #### 4.4.1 Two phases: name-resolution vs. identity-canonicalization (round-3, normative)
 
@@ -1337,8 +1360,14 @@ the solver variable does not, by itself, touch that control-flow path. Therefore
   (§3.2) — a hybrid registry+direct model (cargo/uv) — and borrows only Go/uv's
   *representation* discipline (native struct + structured on-disk; no flat
   parse-back string). See §11 "Decided (round 2.5)".
-- **Genericize PubGrub over a key type.** Rejected in §4.4: large, risky diff for
-  zero behavioral gain; the solver is already agnostic to what its `str` denotes.
+- **Genericize PubGrub over a key type.** Initially rejected as a large, risky
+  diff for zero behavioral gain — then **adopted** (DE1, code-review reversal;
+  see §4.4). The key became a rich `SolverKey` that still IS its canonical string
+  (so the solver stays agnostic and every fixture is byte-identical) but carries
+  its display `DepKey` inline, deleting the reverse map + the 58-site projection
+  scatter that the bare-`str` key forced. What made the reversal cheap was
+  realizing the key can carry display without changing the solver's behavior
+  (Python: subclass `str`; Rust: newtype with `Deref<str>`).
 
 ## 14. Relationship to adjacent in-flight work
 

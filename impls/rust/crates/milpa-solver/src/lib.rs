@@ -9,7 +9,7 @@
 //! `milpa/solver.py`'s version layer. The PubGrub `solve()` loop + conflict
 //! narration follow in S7 (wired per the S0(b) decision to `pubgrub` 0.4.0).
 
-use milpa_types::{PreId, Version};
+use milpa_types::{PreId, SolverKey, Version};
 
 /// Version-selection strategy (resolver-semantics §4.2/§4.3). `Maxver` is the
 /// default; `Minver` locks to the floor; `Semver` stays within the constraint
@@ -903,12 +903,12 @@ use std::collections::BTreeMap;
 /// requires.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Dep {
-    pub package: String,
+    pub package: SolverKey,
     pub constraint: VersionSet,
 }
 
 impl Dep {
-    pub fn new(package: impl Into<String>, constraint: VersionSet) -> Self {
+    pub fn new(package: impl Into<SolverKey>, constraint: VersionSet) -> Self {
         Dep {
             package: package.into(),
             constraint,
@@ -991,7 +991,7 @@ pub trait PackageProvider {
 /// §5.2 failure certificate's `refutation` array.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefutationEntry {
-    pub package: String,
+    pub package: SolverKey,
     pub constraint: String,
 }
 
@@ -1008,9 +1008,9 @@ pub fn solve<P: PackageProvider>(
     root: &str,
     root_version: Version,
     strategy: Strategy,
-) -> Result<BTreeMap<String, Version>, SolverError> {
+) -> Result<BTreeMap<SolverKey, Version>, SolverError> {
     let adapter = ProviderAdapter::new(provider, strategy);
-    match pubgrub::resolve(&adapter, root.to_string(), root_version) {
+    match pubgrub::resolve(&adapter, SolverKey::from(root), root_version) {
         Ok(selected) => Ok(selected.into_iter().collect()),
         // A4: `choose_version` raised this at a version-unknown package's own
         // (last-scheduled) decision point, before returning any candidate —
@@ -1048,9 +1048,9 @@ pub fn solve_with_refutation<P: PackageProvider>(
     root: &str,
     root_version: Version,
     strategy: Strategy,
-) -> Result<BTreeMap<String, Version>, (SolverError, Vec<RefutationEntry>)> {
+) -> Result<BTreeMap<SolverKey, Version>, (SolverError, Vec<RefutationEntry>)> {
     let adapter = ProviderAdapter::new(provider, strategy);
-    match pubgrub::resolve(&adapter, root.to_string(), root_version) {
+    match pubgrub::resolve(&adapter, SolverKey::from(root), root_version) {
         Ok(selected) => Ok(selected.into_iter().collect()),
         // A4: not a SOLVE-CONFLICT — no refutation to extract (mirrors how a
         // non-solver MilpaError failure carries an empty FailureCert).
@@ -1081,13 +1081,13 @@ pub fn solve_with_refutation<P: PackageProvider>(
 /// tree only as transitive declarants, e.g. `left`/`right` in fixture-128, not
 /// `shared`) are excluded from the refutation.
 fn extract_refutation(
-    tree: &pubgrub::DerivationTree<String, VersionSet, String>,
+    tree: &pubgrub::DerivationTree<SolverKey, VersionSet, String>,
 ) -> Vec<RefutationEntry> {
     use pubgrub::{DerivationTree, External};
     use std::collections::BTreeMap;
 
     // pkg → list of (constraint_str, VersionSet) pairs seen in the tree.
-    let mut by_pkg: BTreeMap<String, Vec<(String, VersionSet)>> = BTreeMap::new();
+    let mut by_pkg: BTreeMap<SolverKey, Vec<(String, VersionSet)>> = BTreeMap::new();
     let mut stack = vec![tree];
 
     while let Some(node) = stack.pop() {
@@ -1151,7 +1151,7 @@ enum ProviderError {
     /// contributed — never just the first (the amoxtli incident floored two
     /// packages at once).
     VersionUnknownConstrained {
-        package: String,
+        package: SolverKey,
         constrainers: Vec<(String, String)>,
     },
 }
@@ -1227,7 +1227,7 @@ impl<'a, P: PackageProvider> ProviderAdapter<'a, P> {
 }
 
 impl<P: PackageProvider> pubgrub::DependencyProvider for ProviderAdapter<'_, P> {
-    type P = String;
+    type P = SolverKey;
     type V = Version;
     type VS = VersionSet;
     type M = String;
@@ -1243,7 +1243,7 @@ impl<P: PackageProvider> pubgrub::DependencyProvider for ProviderAdapter<'_, P> 
     // partial-solution assignments in that exact insertion order; alphabetical
     // name is now only the LAST-resort tie-break, for providers with no
     // declaration-order concept (every package ties at `usize::MAX`).
-    type Priority = (bool, Reverse<usize>, Reverse<String>);
+    type Priority = (bool, Reverse<usize>, Reverse<SolverKey>);
     type Err = ProviderError;
 
     fn prioritize(
@@ -1277,7 +1277,7 @@ impl<P: PackageProvider> pubgrub::DependencyProvider for ProviderAdapter<'_, P> 
             let constrainers: Vec<(String, String)> = self
                 .constrainers
                 .borrow()
-                .get(package)
+                .get(package.as_str())
                 .map(|m| m.iter().map(|(c, s)| (c.clone(), s.clone())).collect())
                 .unwrap_or_default();
             return Err(ProviderError::VersionUnknownConstrained {
@@ -1313,7 +1313,7 @@ impl<P: PackageProvider> pubgrub::DependencyProvider for ProviderAdapter<'_, P> 
         // packages here: a package depending on another twice intersects the
         // constraints (the solver treats both as simultaneous requirements). A
         // BTreeMap also makes the emitted order deterministic.
-        let mut merged: BTreeMap<String, VersionSet> = BTreeMap::new();
+        let mut merged: BTreeMap<SolverKey, VersionSet> = BTreeMap::new();
         for dep in self.provider.dependencies(package, version) {
             merged
                 .entry(dep.package)
@@ -1338,10 +1338,10 @@ impl<P: PackageProvider> pubgrub::DependencyProvider for ProviderAdapter<'_, P> 
         {
             let mut constrainers = self.constrainers.borrow_mut();
             let mut consumer_targets = self.consumer_targets.borrow_mut();
-            if let Some(prev_targets) = consumer_targets.remove(package) {
+            if let Some(prev_targets) = consumer_targets.remove(package.as_str()) {
                 for prev_target in prev_targets {
                     if let Some(m) = constrainers.get_mut(&prev_target) {
-                        m.remove(package);
+                        m.remove(package.as_str());
                     }
                 }
             }
@@ -1352,13 +1352,13 @@ impl<P: PackageProvider> pubgrub::DependencyProvider for ProviderAdapter<'_, P> 
                 }
                 let cstr = vs_to_constraint_str(vs);
                 constrainers
-                    .entry(target.clone())
+                    .entry(target.to_string())
                     .or_default()
-                    .insert(package.clone(), cstr);
-                current_targets.push(target.clone());
+                    .insert(package.to_string(), cstr);
+                current_targets.push(target.to_string());
             }
             if !current_targets.is_empty() {
-                consumer_targets.insert(package.clone(), current_targets);
+                consumer_targets.insert(package.to_string(), current_targets);
             }
         }
         Ok(pubgrub::Dependencies::Available(
@@ -1446,7 +1446,7 @@ pub enum SolverError {
     /// names every `(consumer, constraint)` pair that contributed — never
     /// just the first (the amoxtli incident floored two packages at once).
     VersionUnknownConstrained {
-        package: String,
+        package: SolverKey,
         constrainers: Vec<(String, String)>,
     },
 }
@@ -1704,7 +1704,7 @@ mod tests {
         deps_map.insert(
             ("__root__".to_string(), v(0, 0, 1)),
             vec![Dep {
-                package: "direct".to_string(),
+                package: "direct".into(),
                 constraint: VersionSet::full(),
             }],
         );
@@ -1712,7 +1712,7 @@ mod tests {
             deps_map.insert(
                 ("direct".to_string(), ver),
                 vec![Dep {
-                    package: "transitive".to_string(),
+                    package: "transitive".into(),
                     constraint: VersionSet::full(),
                 }],
             );
@@ -1746,7 +1746,7 @@ mod tests {
         deps_map.insert(
             ("__root__".to_string(), v(0, 0, 1)),
             vec![Dep {
-                package: "dep".to_string(),
+                package: "dep".into(),
                 constraint: VersionSet::full(),
             }],
         );
@@ -2252,10 +2252,10 @@ mod tests {
         )
     }
 
-    fn solution(pairs: &[(&str, Version)]) -> BTreeMap<String, Version> {
+    fn solution(pairs: &[(&str, Version)]) -> BTreeMap<SolverKey, Version> {
         pairs
             .iter()
-            .map(|(p, v)| (p.to_string(), v.clone()))
+            .map(|(p, v)| (SolverKey::from(*p), v.clone()))
             .collect()
     }
 
