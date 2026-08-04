@@ -51,8 +51,8 @@ A conformant implementation of this spec MUST:
    optional-scalar robustness posture instead (a malformed value surfaces as
    absent, no collapse diagnostic, no hard error — §3.2). Layer 2
    enforcement over the parsed attestation record — the `entry-trust` gate —
-   is a separate normative surface (§3.2, "gate lands separately"); the
-   append-only consumer ratchet's own enforcement over every lattice row,
+   is specified in this document (§3.6); the append-only consumer ratchet's
+   own enforcement over every lattice row,
    including `attestation`, `rekor`, and `attestation-epoch`, is live (§3.5;
    `rfc-registry-append-only.md`'s A2/A5/A6 slices landed it).
 7. Treat unknown provenance `kind` values as forward-compat: skip the
@@ -77,12 +77,12 @@ An `index.kdl` document is a flat sequence of top-level nodes. The parser
 recognises two kinds of top-level node:
 
 - `schema_version <int>` — optional schema-version declaration (§2).
-- `attestation-epoch "<string>"` — optional, opaque epoch identifier
-  (`rfc-per-entry-attestation.md` open question 2). Set-once under the
-  append-only ratchet's root-field class (§3.5.1); absent means no epoch has
-  been established. Not itself a trust or verification primitive — it is a
-  marker the ratchet (§3.5) and the future post-epoch attestation mandate
-  key off of.
+- `attestation-epoch "<string>"` — optional, opaque epoch identifier.
+  Set-once under the append-only ratchet's root-field class (§3.5.1); absent
+  means no epoch has been established. Not itself a trust or verification
+  primitive — it is informational metadata tracked by the ratchet (§3.5);
+  the per-entry attestation mandate's own epoch boundary (§3.6) is governed
+  by a separate epoch-commitment mechanism, not by this field's value.
 - `package "<name>" { … }` — a named-package entry (§3).
 
 All other top-level nodes MUST be silently skipped (forward-compat).
@@ -279,10 +279,11 @@ the version was published.
 > observed history; a `value → value′` change or a `value → absent`
 > regression on an already-published entry is a ratchet violation (§3.5.1).
 > `published_at` is also the anchor for the publication watermark (§3.5.4)
-> — the append-only ratchet's backdating check. Per Part 2's epoch mandate
-> (`rfc-per-entry-attestation.md` open question 2), `published_at` becomes
-> REQUIRED on post-epoch entries once the attestation epoch ships; that
-> requirement is not yet in force as of this amendment.
+> — the append-only ratchet's backdating check. It is informational metadata
+> only: the per-entry attestation mandate's epoch boundary (§3.6) is decided
+> by the epoch-commitment mechanism's set membership, never by this field's
+> value, so `published_at` carries no mandatory-presence requirement tied to
+> that gate (`docs/rfc-attestation-v1-normative.md`).
 
 #### Per-entry attestation record (`attestation` / `signed_by` / `rekor` / `bundle`)
 
@@ -357,10 +358,9 @@ version "<semver>" {
 > cross-impl signature change at the version-node parse boundary (both
 > impls' version-node parsers are pure functions today); callers thread the
 > diagnostics to the warning channel. This clause specifies the parse-time
-> contract only. It does NOT specify a policy gate over the result — no
-> gate exists at this spec layer; enforcement (`entry-trust`) is specified
-> separately and lands with a later slice of `rfc-per-entry-attestation.md`
-> (§3.4 intro).
+> contract only; it does not itself specify the policy gate over the
+> result — enforcement (`entry-trust`) is specified in this document at
+> §3.6.
 
 > NORMATIVE (subject binding — requirement on bundle producers and the
 > future verifier, not this parser): once a bundle exists at the address the
@@ -376,27 +376,20 @@ version "<semver>" {
 > signer never made for that coordinate. Binding both coordinates makes one
 > bundle vouch for exactly one `(namespace, name, version)`, which is the
 > attribution claim this record exists to carry. This clause is a
-> requirement on what a conformant bundle must contain; it does not itself
-> verify anything — no verifier is specified by this document. Verification
-> (subject-binding checks, cryptographic checks, and the `entry-trust`
-> policy gate) is specified separately and lands with a later slice of
-> `rfc-per-entry-attestation.md`; nothing in this section implies that gate
-> exists yet.
+> requirement on what a conformant bundle must contain; the verifier that
+> checks it (subject-binding checks, cryptographic checks, and the
+> `entry-trust` policy gate) is specified in this document at §3.6.
 
 > NOTE: `EntryAttestation` records the CLAIM only. Whether the claim is
 > cryptographically true is a question this section does not answer — see
 > `spec/lockfile-schema.md` §3.9 for the same claim-not-outcome framing at
-> the lockfile layer, and `rfc-per-entry-attestation.md` for the verifier
-> design (not yet part of any spec surface).
+> the lockfile layer, and §3.6 of this document for the verifier design.
 
 > NOTE: This subsection **inverts** the prior "parsed and ignored"
 > forward-compat treatment of `attestation`, `signed_by`, and `rekor`
 > (formerly tolerate-and-ignore metadata; see item 6 of "Normative surface"
-> above). Both reference impls conform to the tolerate-and-ignore behavior
-> as of this spec amendment; the parse-to-typed behavior specified here is
-> the target for `rfc-per-entry-attestation.md`'s P2 slice. A spec amendment
-> preceding the implementation that satisfies it is expected RFC-flow
-> sequencing, not a spec/impl mismatch bug.
+> above). Both reference implementations parse these fields into the typed
+> `EntryAttestation` record specified here.
 
 **`attestation`** (child node, string, optional) — see the tagged record
 above. MAY be absent on legacy entries (parses as `IndexVersion.attestation
@@ -430,10 +423,10 @@ when an attestation record is present. Fields:
 **`bundle`** (child node, `sha256=` property, optional) — the delivery
 integrity pin for the per-entry attestation bundle: the sha256 hex digest of
 the bundle BYTES (not of the bundle's semantic content), folded into
-`EntryAttestation.bundle_pin`. Expected absent during the claim-only window
-that precedes `rfc-per-entry-attestation.md`'s bundle-delivery slice — a
-present `attestation` with no `bundle` pin is a well-formed, ordinary claim;
-a future verifier reports this state as bundle-unavailable, not malformed.
+`EntryAttestation.bundle_pin`. Legitimately absent on an entry that has not
+been backfilled with a bundle — a present `attestation` with no `bundle`
+pin is a well-formed, ordinary claim; the entry-trust gate (§3.6) reports
+this state as bundle-unavailable, not malformed.
 
 > NORMATIVE: `bundle`'s `sha256=` property, when present, MUST be exactly 64
 > lowercase hexadecimal characters. A malformed value MUST normalize to
@@ -721,14 +714,11 @@ to the per-entry attestation record in §3.2 (`attestation`, `signed_by`,
 covers document integrity only and has no dependency on §3.2's per-entry
 fields. Layer 2 — the per-entry attribution gate (`entry-trust`) that
 verifies and enforces the `EntryAttestation` record that §3.2 types — is
-specified and enforced, but in a SEPARATE document, `rfc-per-entry-
-attestation.md` §4-§5, not in this document: that RFC owns the verifier,
-the policy gate, and the `TNG-ENTRY-{UNATTESTED,BUNDLE-MISSING,BUNDLE-PIN-
-MISMATCH,BUNDLE-MALFORMED,DIGEST-MISMATCH,SUBJECT-MISMATCH,SIGNATURE-
-INVALID,SIGNER-MISMATCH}` slug family (`errors.md`), all live in both
-implementations as of the RFC's P3a slice. §3.4.0's policy-axis table
-below is the cross-reference between the two documents — this section
-merely records the document boundary, not an absence of the gate.
+specified and enforced **in this document, at §3.6**: §3.6 owns the
+verifier, the policy gate, and the `TNG-ENTRY-{UNATTESTED,BUNDLE-MISSING,
+BUNDLE-PIN-MISMATCH,BUNDLE-MALFORMED,DIGEST-MISMATCH,SUBJECT-MISMATCH,
+SIGNATURE-INVALID,SIGNER-MISMATCH}` slug family (`errors.md`). §3.4.0's
+policy-axis table below is the cross-reference between the two axes.
 
 #### 3.4.0  Generic policy-axis model
 
@@ -1188,7 +1178,7 @@ fields, each tagged with its own order kind:
 | Root field | Order kind | Legal transitions |
 |---|---|---|
 | `schema_version` (§2) | **ordinal-non-decreasing** (plain integer `≤` — its own tag, NOT `attestation-monotone`) | increase is legal (schema evolution); decrease is a violation. `absent` ≡ the spec default (`1`, §2) within this order — removing an explicit `schema_version 2` node is a decrease, not an unclassified state. A candidate declaring a schema *newer than this consumer understands* never reaches the ratchet at all: `TNG-SCHEMA-UNKNOWN` aborts at parse time, unconditionally (§2); the increase-legal row is live only within the consumer's parseable range. |
-| `attestation-epoch` (`rfc-per-entry-attestation.md` open question 2) | **set-once** (the same tag as the entry table's `Frozen` row) | `absent → E` is legal exactly once; any change thereafter is a violation. Set-once, not merely non-decreasing: *raising* the epoch reclassifies every published entry as pre-epoch/legacy and nullifies the attestation mandate while staying technically non-decreasing. |
+| `attestation-epoch` | **set-once** (the same tag as the entry table's `Frozen` row) | `absent → E` is legal exactly once; any change thereafter is a violation. Set-once, not merely non-decreasing: *raising* the epoch reclassifies every published entry as pre-epoch/legacy and nullifies the attestation mandate while staying technically non-decreasing. |
 
 Violations attributed to the reserved root key raise `TNG-INDEX-ROOT-MUTATED`
 (§3.5.3; lands with implementation slice). Ownership follows the
@@ -1666,16 +1656,17 @@ was necessarily published after the baseline was established.
 
 Two scope caveats: the watermark is **per-consumer** — a TOFU/first-contact
 consumer has no baseline and gets no backdate protection from this
-mechanism — and an entry that simply **omits** `published_at` dodges the
-check entirely. Closing the omission dodge requires `published_at` to be
-mandatory on post-epoch entries, which is Part 2's epoch mandate
-(`rfc-per-entry-attestation.md` open question 2); that dependency is
-recorded here so this section's baseline semantics are not later weakened
-in a way that breaks it. The backdating check itself
-(a `TNG-ENTRY-BACKDATED`-class check) is out of scope for this section —
-it lands with Part 2's P3 slice, where entry-level policy machinery exists;
-this section guarantees only the baseline semantics (the watermark
-definition above) that make that check possible.
+mechanism — and an entry that simply **omits** `published_at` dodges this
+section's check entirely. `published_at` is informational metadata only:
+the per-entry attestation mandate's own epoch boundary (§3.6) is decided by
+the epoch-commitment mechanism's set membership, never by this field's
+value or its presence, so the mandate's correctness does not depend on
+closing that omission dodge here. Whether a dedicated
+`TNG-ENTRY-BACKDATED`-class check is built on top of this watermark, as a
+distinct, non-epoch-boundary chronological-consistency audit, is a
+disposition settled in `docs/rfc-attestation-v1-normative.md`; this section
+guarantees only the baseline semantics (the watermark definition above)
+such a check would consume.
 
 ---
 
