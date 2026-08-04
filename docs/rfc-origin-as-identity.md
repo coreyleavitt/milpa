@@ -95,13 +95,52 @@ cannot.
 
 ## 3. The model
 
+> **AMENDMENT (2026-08-03, DE2-ref) — reverses "ref/digest EXCLUDED".** The
+> original model below made a git/oci/tarball source-id *URL-only*, excluding the
+> ref/tag/digest on the theory that "they are VERSIONS, not the origin." That is
+> wrong for a **direct** dep: a git commit (or a branch, or a non-semver tag)
+> does not live in a version lattice, so it cannot be selected as a version — it
+> is a **source pin**. Excluding it left the `BindingResolver` blind to
+> ref-disagreement: two claims for the same URL at different commits looked
+> *identical* to the binding, so it never arbitrated, and the downstream fetch
+> silently picked one — differently in each impl (the amoxtli / #194 divergence:
+> a root `nkdl ref=62bacf7` pin was silently ignored in favour of a transitive's
+> `f42588456`).
+>
+> **Correction: the ref/digest is part of the source-id of a DIRECT dep.** Not a
+> version, not a separate identity axis — the *pin*. A registry dep's source-id
+> stays version-independent (the coordinate spans all versions; the registry does
+> version-selection); a **direct** dep's source-id is a specific pinned source
+> (`origin + ref/digest`), because a `git=`/`oci=`/`tarball=` declaration *is* one
+> exact source, not a version range. This asymmetry is honest — a registry is a
+> version *source*, a git pin is a version.
+>
+> Everything then falls out of machinery that already exists, with **no new
+> arbitration mechanism**: unification stays **name-based** (`BindingResolver`
+> maps `DepKey → source-id`), so a bare `requires "nkdl"` still unifies with a
+> root pin via the *name*. A transitive claim on the same origin at a *different*
+> ref is now a **disagreeing** claim → `LOST_TO_ROOT` (the root/override pin wins,
+> Cargo `[patch]`); two *transitive* pins disagreeing with no root arbiter →
+> `RES-BINDING-CONFLICT` ("declare it at the root to resolve"). Rejected: (b1) ref
+> as its own identity axis — makes two commits of one repo two graph nodes sharing
+> one name (collision) you then special-case away; (b2) Go-style pseudo-versions —
+> elegant and maximally uniform, but machinery for *commit-range / branch-tracking*
+> semantics milpa's exact-pin ecosystem does not use (and it drags in commit-
+> timestamp fetching + semver-vs-pseudo ordering edge cases). milpa is Cargo-shaped
+> (hybrid registry + direct); Cargo's git `SourceId` carries the `GitReference` and
+> conflicting revs on one source error — that is the model. **Breaking change** to
+> the canonical form and the lockfile (pre-v1 — fine). Supersedes the "ref/digest
+> EXCLUDED" line below and reframes #194 from "arbitrate a winner" to "implement
+> this." See §4.1.
+
 Separate the three namespaces; give each its own layer:
 
 ```
-solver variable   = source-id = a version-independent origin (+ optional subpath)
+solver variable   = source-id = the pinned source
                     origin ∈ { git url | oci coord | tarball url | local path | registry coord | member }
-                    ref / tag / digest EXCLUDED (they are VERSIONS, not the origin)
-                    ("origin" names the whole source-id, per §3.1 — never "identity")
+                    DIRECT deps (git/oci/tarball): source-id INCLUDES the ref/digest — it is the PIN
+                    REGISTRY/member deps: version-independent coordinate (version-selected separately)
+                    (see the DE2-ref amendment above; "origin" names the source-id, per §3.1 — never "identity")
 
 overrides {}      = explicit source replacement            ← the bridge (= Cargo [patch] / Go replace)
 
@@ -201,20 +240,36 @@ hand-maintained `kind: str` discriminator):
 ```python
 # milpa/source_id.py  (new module — the single source of truth for origin identity)
 
+# DE2-ref amendment (§3): a DIRECT dep's source-id includes its PIN
+# (ref/digest). Two claims for one origin at different pins are DISAGREEING
+# claims, arbitrated by BindingResolver (root/override wins; two transitive
+# pins with no root arbiter → RES-BINDING-CONFLICT). Unification stays
+# name-based, so a bare `requires "x"` still binds to a root pin via the name.
+
 @dataclass(frozen=True)
 class GitSourceId:
-    url: str                      # ALWAYS normalized (see 4.2); no ref/commit
+    url: str                      # ALWAYS normalized (see 4.2)
+    ref: str | None = None        # the PINNED ref (branch/tag/sha) AS DECLARED;
+                                  #   None = default branch. Part of the source pin
+                                  #   (DE2-ref). Compared as-declared pre-fetch — the
+                                  #   binding is pure; the lockfile records the
+                                  #   RESOLVED commit as provenance. (Normalizing
+                                  #   equivalent refs — a tag vs the sha it points to —
+                                  #   via `git ls-remote` is a possible future
+                                  #   precision refinement, out of scope here.)
     subpath: str | None = None    # normalized posix; None = repo root
 
 @dataclass(frozen=True)
 class OciSourceId:
     registry: str
-    repository: str               # no digest/tag
+    repository: str
+    digest: str | None = None     # the PINNED digest (DE2-ref); part of the pin
     subpath: str | None = None
 
 @dataclass(frozen=True)
 class TarballSourceId:
-    url: str                      # each distinct URL is a distinct source
+    url: str                      # each distinct URL is a distinct source (the URL
+                                  #   IS the pin — a specific archive)
     subpath: str | None = None
 
 @dataclass(frozen=True)
