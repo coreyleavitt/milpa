@@ -278,7 +278,7 @@ class TestIndexTrustRoundTrip:
         assert "index-trust\n" not in out
         reparsed = parse_manifest(out)
         assert reparsed.index_trust_policy_explicit is False
-        assert reparsed.index_trust_policy == "warn"
+        assert reparsed.index_trust_policy == "strict"
 
     def test_explicit_warn_round_trips_as_explicit(self) -> None:
         """index-trust "warn" (matching the default value) must still round-trip
@@ -1440,7 +1440,7 @@ class TestFormatWorkspaceManifest:
         reparsed = parse_workspace_or_manifest(out)
         assert isinstance(reparsed, WorkspaceManifest)
         assert reparsed.index_trust_policy_explicit is False
-        assert reparsed.index_trust_policy == "warn"
+        assert reparsed.index_trust_policy == "strict"
 
     def test_index_trust_survives_add_member_rewrite(self) -> None:
         """A workspace-root "strict" policy must survive a simulated

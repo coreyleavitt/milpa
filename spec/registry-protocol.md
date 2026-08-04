@@ -886,15 +886,23 @@ prose.
 >
 > | Axis | Manifest node(s) | Env var | Default | Member-error slug | Normative home |
 > |---|---|---|---|---|---|
-> | `index-trust` | `index-trust`, `index-trust-signer`, `index-trust-bundle` | `MILPA_INDEX_TRUST` | `warn` | `WS-INDEX-TRUST-ON-MEMBER` | §3.4.5 / §3.4.7 (this document) |
-> | `entry-trust` | `entry-trust` | `MILPA_ENTRY_TRUST` | `warn` | `WS-ENTRY-TRUST-ON-MEMBER` | §3.6 (this document) |
+> | `index-trust` | `index-trust`, `index-trust-signer`, `index-trust-bundle` | `MILPA_INDEX_TRUST` | `strict` | `WS-INDEX-TRUST-ON-MEMBER` | §3.4.5 / §3.4.7 (this document) |
+> | `entry-trust` | `entry-trust` | `MILPA_ENTRY_TRUST` | `strict` | `WS-ENTRY-TRUST-ON-MEMBER` | §3.6 (this document) |
 > | `index-history` | `index-history` | `MILPA_INDEX_HISTORY` | `warn` | `WS-INDEX-HISTORY-ON-MEMBER` | §3.5.2 (this document) |
 >
 > This table is the SSOT for which axes exist and their identifying
 > parameters. Each row's "Normative home" is where the axis's
 > policy-specific behavior (what a verification failure means, what
 > remediation looks like) is actually specified; this section specifies
-> only the shared authority mechanics.
+> only the shared authority mechanics. **`index-trust` and `entry-trust`
+> default to `strict` in v1** (RFC `rfc-attestation-v1-normative.md` D1/D4);
+> `index-history` deliberately stays `warn` — it is a §3 non-goal (§8c
+> residual), not an oversight, and the asymmetry is intentional (D11):
+> `index-trust` has no epoch-grace exemption, so it is unconditionally
+> authenticated before `entry-trust`'s own epoch classification can be
+> trusted, while `index-history`'s append-only ratchet is a distinct,
+> separately-scoped guarantee (D18: it becomes a hard co-requirement only
+> when an epoch commitment is armed, not a default flip).
 
 #### 3.4.1  When the gate fires
 
@@ -1116,8 +1124,8 @@ key. Failure MUST raise `TNG-INDEX-SIGNATURE-INVALID`.
 >
 > | Policy value | Behaviour on any verification failure |
 > |---|---|
-> | `warn` (default) | Resolve proceeds; MUST emit exactly one warning to stderr per unique index URL per invocation, including the applicable `TNG-INDEX-*` slug as the machine-readable signal. Exit code remains 0. |
-> | `strict` | Hard fail; MUST raise the appropriate `TNG-INDEX-*` error and exit 1. |
+> | `warn` | Resolve proceeds; MUST emit exactly one warning to stderr per unique index URL per invocation, including the applicable `TNG-INDEX-*` slug as the machine-readable signal. Exit code remains 0. |
+> | `strict` (default, v1) | Hard fail; MUST raise the appropriate `TNG-INDEX-*` error and exit 1. |
 > | `off` | Gate is skipped entirely; no bundle is fetched or verified. |
 
 > NORMATIVE: Under `warn`, the warning MUST include the applicable `TNG-INDEX-*`
@@ -1137,11 +1145,16 @@ key. Failure MUST raise `TNG-INDEX-SIGNATURE-INVALID`.
 > NORMATIVE (effective policy — instantiates §3.4.0): `index-trust` is an
 > instantiation of the generic policy-axis model (§3.4.0) with manifest node
 > `index-trust`, environment variable `MILPA_INDEX_TRUST`, and default
-> `warn`. §3.4.0's rules 1–2 (manifest `off` is unconditional and
-> manifest-only; otherwise `max(manifest_policy or "warn", env_policy)`)
-> apply verbatim. Rule 3 is this axis's CLI-flag escalation: if
-> `--require-attested-index` is given, the effective policy is `strict`
-> (unless §3.4.0 rule 1 applies; the flag MUST NOT set or clear `off`).
+> `strict` (v1; RFC `rfc-attestation-v1-normative.md` D4). §3.4.0's rules 1–2
+> (manifest `off` is unconditional and manifest-only; otherwise
+> `max(manifest_policy or "strict", env_policy)`) apply verbatim. Rule 3 is
+> this axis's CLI-flag escalation: if `--require-attested-index` is given,
+> the effective policy is `strict` (unless §3.4.0 rule 1 applies; the flag
+> MUST NOT set or clear `off`). Unlike `entry-trust` (§3.6), `index-trust`
+> has no epoch-grace exemption (D11): a registry that never publishes an
+> `index.kdl.bundle` hard-fails under the `strict` default with no
+> degraded-warn fallback; the only opt-out is the explicit manifest
+> `index-trust "warn"`/`"off"`.
 
 #### 3.4.6  Per-URL signer resolution
 
@@ -1178,7 +1191,7 @@ root-only rule generalizes.
 >   `kind`, so declaring them does not trigger the deps/kind rejection).
 >
 > The effective policy for a workspace invocation is simply the root's own
-> `index-trust` value (default `warn` if the node is absent) — per §3.4.0
+> `index-trust` value (default `strict` if the node is absent) — per §3.4.0
 > there is no merge, and no other manifest contributes to it. Consequently a
 > workspace HAS a manifest-level path to an effective `off`: declare
 > `index-trust "off"` on the workspace root.

@@ -243,8 +243,9 @@ fn show_index_trust_at_workspace_root_propagates_ws_index_trust_on_member() {
 }
 
 /// Sanity companion: `show --index-trust` outside any milpa project dir (no
-/// manifest at all) MUST remain graceful — exit 0, default `warn` — this is
-/// the one case RD-M1 intentionally keeps swallowed (MAN-NO-MANIFEST).
+/// manifest at all) MUST remain graceful — exit 0, default `strict` (S4,
+/// RFC attestation-v1-normative.md D4) — this is the one case RD-M1
+/// intentionally keeps swallowed (MAN-NO-MANIFEST).
 #[test]
 fn show_index_trust_outside_project_dir_stays_graceful() {
     let tmp = tempfile::TempDir::new().unwrap();

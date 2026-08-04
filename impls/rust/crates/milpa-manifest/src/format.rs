@@ -777,11 +777,13 @@ mod tests {
             spec_version_explicit: false,
             version: None,
             attestation_policy: crate::TrustPolicy::Warn,
-            index_trust_policy: crate::TrustPolicy::Warn,
+            // S4 (RFC attestation-v1-normative.md): index-trust + entry-trust
+            // defaults flipped warn -> strict; index-history stays warn.
+            index_trust_policy: crate::TrustPolicy::Strict,
             index_trust_signer: None,
             index_trust_bundle: None,
             index_trust_policy_explicit: false,
-            entry_trust_policy: crate::TrustPolicy::Warn,
+            entry_trust_policy: crate::TrustPolicy::Strict,
             entry_trust_policy_explicit: false,
             index_history_policy: crate::TrustPolicy::Warn,
             index_history_policy_explicit: false,
@@ -1417,7 +1419,7 @@ mod tests {
                 "https://github.com/acme/reg/.github/workflows/publish.yaml@refs/heads/main".into(),
             ),
             index_trust_bundle: Some("file:///etc/milpa/trust-bundle.json".into()),
-            entry_trust_policy: crate::TrustPolicy::Warn,
+            entry_trust_policy: crate::TrustPolicy::Strict, // S4 default (undeclared axis)
             entry_trust_policy_explicit: false,
             index_history_policy: crate::TrustPolicy::Warn,
             index_history_policy_explicit: false,

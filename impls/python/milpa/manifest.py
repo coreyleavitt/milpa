@@ -723,7 +723,7 @@ class Manifest:
     attestation_policy: TrustPolicy = "warn"
     optional_auto_flags: frozenset[str] = frozenset()  # S7: not serialized
     # S5 (RFC registry-trust-federation §6.4): whole-index attestation gate policy.
-    index_trust_policy: TrustPolicy = "warn"
+    index_trust_policy: TrustPolicy = "strict"
     """Effective index-trust policy parsed from ``index-trust`` node; defaults to ``'warn'``."""
     index_trust_signer: str | None = None
     """Expected SubjectAltName override from ``index-trust-signer`` node (RFC §3.2)."""
@@ -740,7 +740,7 @@ class Manifest:
     # posture) but simpler — no signer/bundle sub-fields, since the expected
     # signer is derived per-kind from the entry itself or the already-resolved
     # Layer-1 vendor-bot identity (§5), never a separate override.
-    entry_trust_policy: TrustPolicy = "warn"
+    entry_trust_policy: TrustPolicy = "strict"
     """Effective entry-trust policy parsed from ``entry-trust`` node; defaults to ``'warn'``."""
     entry_trust_policy_explicit: bool = False
     """``True`` iff the source declared an ``entry-trust`` node (absent-stays-absent
@@ -806,7 +806,7 @@ class WorkspaceManifest:
     flags: tuple["FlagDecl", ...] = ()  # S11: workspace-root flags (§3.8)
     # S5 (RFC registry-trust-federation §6.4a): whole-index attestation gate,
     # declared ONLY on the resolution root.
-    index_trust_policy: TrustPolicy = "warn"
+    index_trust_policy: TrustPolicy = "strict"
     """Effective index-trust policy for the whole workspace; defaults to ``'warn'``."""
     index_trust_signer: str | None = None
     """Expected SubjectAltName override from ``index-trust-signer`` node."""
@@ -821,7 +821,7 @@ class WorkspaceManifest:
     # resolution root — same root-authority model as index-trust.  A member
     # manifest declaring it raises ``WS-ENTRY-TRUST-ON-MEMBER`` at workspace-load
     # time (``workspace.py``, not this module).
-    entry_trust_policy: TrustPolicy = "warn"
+    entry_trust_policy: TrustPolicy = "strict"
     """Effective entry-trust policy for the whole workspace; defaults to ``'warn'``."""
     entry_trust_policy_explicit: bool = False
     """``True`` iff the source declared an ``entry-trust`` node (absent-stays-absent
@@ -1273,12 +1273,12 @@ def _parse_manifest_doc(doc: KdlDocument) -> Manifest:
     version: Version | None = None
     attestation_policy: TrustPolicy = "warn"
     # S5: index-trust nodes (RFC registry-trust-federation §6.4)
-    index_trust_policy: TrustPolicy = "warn"
+    index_trust_policy: TrustPolicy = "strict"
     index_trust_signer: str | None = None
     index_trust_bundle: str | None = None
     index_trust_policy_explicit: bool = False
     # P3a: entry-trust node (RFC per-entry-attestation.md §4)
-    entry_trust_policy: TrustPolicy = "warn"
+    entry_trust_policy: TrustPolicy = "strict"
     entry_trust_policy_explicit: bool = False
     # A2c: index-history node (RFC registry-append-only.md §2)
     index_history_policy: TrustPolicy = "warn"
@@ -1564,12 +1564,12 @@ def _parse_workspace_doc(doc: KdlDocument) -> WorkspaceManifest:
     # S5 (RFC registry-trust-federation §6.4a): index-trust is a root-authority
     # field — legal ONLY on the workspace root (this function).  Members that
     # declare it raise WS-INDEX-TRUST-ON-MEMBER in workspace.py at load time.
-    ws_index_trust_policy: TrustPolicy = "warn"
+    ws_index_trust_policy: TrustPolicy = "strict"
     ws_index_trust_signer: str | None = None
     ws_index_trust_bundle: str | None = None
     ws_index_trust_policy_explicit: bool = False
     # P3a (RFC per-entry-attestation.md §4): same root-authority model.
-    ws_entry_trust_policy: TrustPolicy = "warn"
+    ws_entry_trust_policy: TrustPolicy = "strict"
     ws_entry_trust_policy_explicit: bool = False
     # A2c (RFC registry-append-only.md §2): same root-authority model.
     ws_index_history_policy: TrustPolicy = "warn"

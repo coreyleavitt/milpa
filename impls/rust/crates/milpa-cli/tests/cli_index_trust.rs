@@ -8,7 +8,7 @@
 //!
 //!   (1) manifest `index-trust "strict"` + mock sig-invalid
 //!       → exit 1, TNG-INDEX-SIGNATURE-INVALID
-//!   (2) manifest warn (default) + mock sig-invalid
+//!   (2) manifest warn (explicit; S4 default is strict) + mock sig-invalid
 //!       → exit 0, warning line with TNG-INDEX-SIGNATURE-INVALID
 //!   (3) manifest `index-trust "off"` + MILPA_INDEX_TRUST=strict + mock sig-invalid
 //!       → exit 0  (off wins; gate is silent)
@@ -150,7 +150,7 @@ fn strict_manifest_sig_invalid_exits_one_with_slug() {
 }
 
 // ---------------------------------------------------------------------------
-// Scenario 2: manifest warn (default) + sig-invalid → exit 0, warning with slug
+// Scenario 2: manifest warn (explicit) + sig-invalid → exit 0, warning with slug
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -162,7 +162,7 @@ fn warn_manifest_sig_invalid_exits_zero_with_warning() {
     std::fs::create_dir_all(&proj).unwrap();
     std::fs::create_dir_all(&idx_dir).unwrap();
 
-    write_manifest(&proj, None); // default = warn
+    write_manifest(&proj, Some("warn")); // explicit warn (S4 flipped the default to strict)
     let index_url = write_index(&idx_dir);
 
     let (code, stderr) = run_fetch(
@@ -241,7 +241,7 @@ fn env_off_is_noop_floor_manifest_warn_still_fires() {
     std::fs::create_dir_all(&proj).unwrap();
     std::fs::create_dir_all(&idx_dir).unwrap();
 
-    write_manifest(&proj, None); // manifest = warn (default)
+    write_manifest(&proj, Some("warn")); // explicit manifest warn (S4 flipped the default to strict)
     let index_url = write_index(&idx_dir);
 
     let (code, stderr) = run_fetch(
@@ -284,7 +284,7 @@ fn require_attested_index_flag_escalates_warn_to_strict() {
     std::fs::create_dir_all(&proj).unwrap();
     std::fs::create_dir_all(&idx_dir).unwrap();
 
-    write_manifest(&proj, None); // manifest = warn; flag must escalate to strict
+    write_manifest(&proj, Some("warn")); // explicit warn; flag must escalate to strict (S4: default is now strict)
     let index_url = write_index(&idx_dir);
 
     let (code, stderr) = run_fetch(

@@ -361,10 +361,11 @@ class TestShowIndexTrustManifestPolicy:
             f"M2: policy line must not say 'warn'; output:\n{out}"
         )
 
-    def test_no_manifest_shows_warn_default(
+    def test_no_manifest_shows_strict_default(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        """No manifest in project_dir → show --index-trust reports warn (default)."""
+        """No manifest in project_dir → show --index-trust reports strict
+        (S4 flipped default, RFC attestation-v1-normative.md D4)."""
         project_dir = tmp_path / "empty"
         project_dir.mkdir()
 
@@ -372,8 +373,8 @@ class TestShowIndexTrustManifestPolicy:
         ret = cmd_show_index_trust(project_dir)
         assert ret == 0
         out = capsys.readouterr().out
-        assert "warn" in out, (
-            f"no manifest → default policy must be warn:\n{out}"
+        assert "strict" in out, (
+            f"no manifest → default policy must be strict:\n{out}"
         )
 
     def test_broken_manifest_hard_fails_not_swallowed(
@@ -545,12 +546,13 @@ class TestShowIndexTrustWorkspacePolicy:
             f"M4: 'strict' must be on the policy: line; policy line={policy_line!r}"
         )
 
-    def test_workspace_root_declares_nothing_shown_as_warn_default(
+    def test_workspace_root_declares_nothing_shown_as_strict_default(
         self,
         tmp_path: Path,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
-        """Workspace root with no index-trust node → show reports 'warn' (default)."""
+        """Workspace root with no index-trust node → show reports 'strict'
+        (S4 flipped default, RFC attestation-v1-normative.md D4)."""
         project_dir = tmp_path / "ws"
         project_dir.mkdir()
         (project_dir / "milpa.kdl").write_text(
@@ -568,7 +570,7 @@ class TestShowIndexTrustWorkspacePolicy:
             (l for l in capsys.readouterr().out.splitlines() if l.startswith("policy:")),
             "",
         )
-        assert "warn" in policy_line
+        assert "strict" in policy_line
 
     def test_workspace_root_signer_and_bundle_resolve_from_root(
         self,
@@ -714,7 +716,9 @@ class TestShowIndexTrustMemberIllegalDeclaration:
         tmp_path: Path,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
-        """Genuinely no manifest / not in a project → still degrades to warn, no crash."""
+        """Genuinely no manifest / not in a project → still degrades to the
+        flipped 'strict' default (S4, RFC attestation-v1-normative.md D4),
+        no crash."""
         empty_dir = tmp_path / "empty"
         empty_dir.mkdir()
 
@@ -725,7 +729,7 @@ class TestShowIndexTrustMemberIllegalDeclaration:
             (l for l in capsys.readouterr().out.splitlines() if l.startswith("policy:")),
             "",
         )
-        assert "warn" in policy_line
+        assert "strict" in policy_line
 
 
 # ---------------------------------------------------------------------------

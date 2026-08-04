@@ -2029,10 +2029,11 @@ class TestTopLevelNodeDispatch:
         m = parse_manifest('name "x"\nindex-trust "off"\n')
         assert m.index_trust_policy == "off"
 
-    def test_index_trust_default_is_warn(self) -> None:
-        """When absent, ``index_trust_policy`` defaults to ``'warn'``."""
+    def test_index_trust_default_is_strict(self) -> None:
+        """S4 (RFC attestation-v1-normative.md D4): when absent,
+        ``index_trust_policy`` defaults to ``'strict'``."""
         m = parse_manifest('name "x"\n')
-        assert m.index_trust_policy == "warn"
+        assert m.index_trust_policy == "strict"
 
     def test_index_trust_rejects_invalid_value(self) -> None:
         """``index-trust \"enable\"`` → MAN-UNKNOWN-TOP-LEVEL."""
@@ -2340,12 +2341,13 @@ class TestWorkspaceManifestParse:
         assert isinstance(result, WorkspaceManifest)
         assert result.index_trust_policy == "strict"
 
-    def test_workspace_root_index_trust_defaults_warn(self) -> None:
-        """Workspace root with no index-trust node defaults to 'warn'."""
+    def test_workspace_root_index_trust_defaults_strict(self) -> None:
+        """S4 (RFC attestation-v1-normative.md D4): workspace root with no
+        index-trust node defaults to 'strict'."""
         text = 'workspace {\n    member "pkgA"\n}\n'
         result = parse_workspace_or_manifest(text)
         assert isinstance(result, WorkspaceManifest)
-        assert result.index_trust_policy == "warn"
+        assert result.index_trust_policy == "strict"
 
     def test_workspace_root_index_trust_signer_parsed(self) -> None:
         """Workspace root may declare index-trust-signer as a top-level node."""

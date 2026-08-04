@@ -388,7 +388,7 @@ pub struct Manifest {
 /// S11 (RFC #23 §3.8): workspace root may carry a `flags {}` block whose
 /// default-true activations apply workspace-wide. Reuses `FlagDecl` (SSOT —
 /// no parallel flag type).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Workspace {
     pub members: Vec<String>,
     pub overrides: Vec<Override>,
@@ -399,8 +399,8 @@ pub struct Workspace {
     /// S8 (RFC registry-trust-federation §6.4a, spec §3.4.7 root-authority model):
     /// the workspace root IS the resolution root for index-trust purposes, so it
     /// — and ONLY it — may declare `index-trust` / `index-trust-signer` /
-    /// `index-trust-bundle`. Defaults to `Warn` when the node is absent (same
-    /// default as the package-manifest field). No merge across members: this
+    /// `index-trust-bundle`. Defaults to `Strict` when the node is absent (S4;
+    /// same default as the package-manifest field). No merge across members: this
     /// single value IS the effective policy for the whole workspace invocation.
     pub index_trust_policy: TrustPolicy,
     /// S8: expected SubjectAltName override from the workspace-root
@@ -439,6 +439,31 @@ pub struct Workspace {
     /// resolution policy — see `Manifest::resolution` for the field's
     /// semantics; identical here, just declared on the workspace root.
     pub resolution: Option<Resolution>,
+}
+
+impl Default for Workspace {
+    /// Hand-written (not derived) so the trust-policy defaults match the parse
+    /// defaults exactly (SSOT): S4 flipped `index-trust`/`entry-trust` to
+    /// `Strict`, while `index-history` stays `Warn`. A derived `Default` would
+    /// use `TrustPolicy::default()` for all three, silently disagreeing with
+    /// what parsing an absent node yields.
+    fn default() -> Self {
+        Self {
+            members: Vec::new(),
+            overrides: Vec::new(),
+            flags: Vec::new(),
+            name: None,
+            index_trust_policy: TrustPolicy::Strict,
+            index_trust_signer: None,
+            index_trust_bundle: None,
+            index_trust_policy_explicit: false,
+            entry_trust_policy: TrustPolicy::Strict,
+            entry_trust_policy_explicit: false,
+            index_history_policy: TrustPolicy::Warn,
+            index_history_policy_explicit: false,
+            resolution: None,
+        }
+    }
 }
 
 /// The two disjoint manifest roles (grammar §1). Detected by the presence of a
@@ -1039,12 +1064,12 @@ fn parse_workspace_doc(doc: &KdlDocument) -> Result<Workspace, ManifestError> {
     let mut ws_flags: Vec<FlagDecl> = Vec::new();
     let mut ws_name: Option<String> = None;
     // S8 (RFC registry-trust-federation §6.4a): root-authority index-trust fields.
-    let mut ws_index_trust_policy = TrustPolicy::Warn;
+    let mut ws_index_trust_policy = TrustPolicy::Strict;
     let mut ws_index_trust_signer: Option<String> = None;
     let mut ws_index_trust_bundle: Option<String> = None;
     let mut ws_index_trust_policy_explicit = false;
     // P3a (RFC per-entry-attestation.md §4): root-authority entry-trust field.
-    let mut ws_entry_trust_policy = TrustPolicy::Warn;
+    let mut ws_entry_trust_policy = TrustPolicy::Strict;
     let mut ws_entry_trust_policy_explicit = false;
     // A3 (rfc-registry-append-only.md §2): root-authority index-history field.
     let mut ws_index_history_policy = TrustPolicy::Warn;
@@ -1318,12 +1343,12 @@ fn parse_manifest_doc(doc: &KdlDocument) -> Result<Manifest, ManifestError> {
     // A1: top-level package `version` field (§3 Axis A (b) step 1).
     let mut version: Option<Version> = None;
     let mut attestation_policy = TrustPolicy::Warn;
-    let mut index_trust_policy = TrustPolicy::Warn;
+    let mut index_trust_policy = TrustPolicy::Strict;
     let mut index_trust_signer: Option<String> = None;
     let mut index_trust_bundle: Option<String> = None;
     let mut index_trust_policy_explicit = false;
     // P3a (RFC per-entry-attestation.md §4): entry-trust node.
-    let mut entry_trust_policy = TrustPolicy::Warn;
+    let mut entry_trust_policy = TrustPolicy::Strict;
     let mut entry_trust_policy_explicit = false;
     // A3 (rfc-registry-append-only.md §2): index-history node.
     let mut index_history_policy = TrustPolicy::Warn;

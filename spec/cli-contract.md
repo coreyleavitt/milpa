@@ -884,7 +884,7 @@ index cache, not a project directory).
 > workspace ROOT manifest. `show --index-trust` MUST resolve the effective
 > policy from that single root value (no merge across members): if the
 > current directory is a workspace member or root, find the workspace root
-> and read its `index-trust` value (default `warn` if absent); otherwise read
+> and read its `index-trust` value (default `strict` if absent); otherwise read
 > the standalone package manifest's value.
 
 > NOTE: `signer:`, `issuer:`, and `subject-sha256:` are extracted from the

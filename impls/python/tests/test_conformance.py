@@ -431,10 +431,25 @@ def _fixture_entry_trust_config(fixture_dir: Path, doc: object) -> "object | Non
           ``bundle`` pin resolves as ``TNG-ENTRY-BUNDLE-MISSING``/unfetchable
           — the correct behaviour for a fixture that doesn't ship bundles).
 
-    Returns ``None`` when the fixture declares NEITHER a manifest
-    ``entry-trust`` field NOR ``MILPA_ENTRY_TRUST`` — the gate stays
-    unconfigured (disabled) so the hundreds of pre-existing named-dep
-    fixtures that predate P3a are completely unaffected.
+    Returns ``None`` ONLY when the fixture provides no parsed manifest at
+    all (``doc`` is neither a ``Manifest`` nor a ``WorkspaceManifest`` — a
+    synthetic unit-test call) AND no ``MILPA_ENTRY_TRUST`` override — there
+    is then no policy to construct a gate from.
+
+    S4 (RFC attestation-v1-normative.md §6, Feas-C1 carve-out fix): once a
+    real manifest is parsed, ``entry_trust_policy`` ALWAYS carries a
+    concrete value — the explicit ``entry-trust`` node, or the flipped
+    ``"strict"`` default when the node is absent — so the gate is now
+    constructed unconditionally for every fixture with a manifest,
+    regardless of whether ``entry-trust`` was explicitly declared. Before
+    this fix, non-explicit fixtures were keyed on
+    ``entry_trust_policy_explicit`` and skipped the gate entirely, so
+    flipping the default constant alone would have left every pre-existing
+    named-dep fixture exercising NOTHING — "corpus green" would have passed
+    without ever running the new strict default. This is safe: a fixture
+    with no ``attestation-epoch-commitment`` classifies every entry as
+    pre-epoch ⇒ warn-equivalent under strict (D1), so the newly-enabled
+    gate does not spuriously fail pre-existing fixtures — it just now runs.
     """
     from milpa.entry_bundle_store import FileEntryBundleStore
     from milpa.entry_trust import (
@@ -454,12 +469,14 @@ def _fixture_entry_trust_config(fixture_dir: Path, doc: object) -> "object | Non
     env_policy = env_vars.get("MILPA_ENTRY_TRUST", "").strip() or None
 
     manifest_policy = None
-    manifest_explicit = False
     if isinstance(doc, (Manifest, WorkspaceManifest)):
         manifest_policy = doc.entry_trust_policy
-        manifest_explicit = doc.entry_trust_policy_explicit
 
-    if env_policy is None and not manifest_explicit:
+    # S4 carve-out fix: skip the gate only when there is truly no policy
+    # signal at all (no parsed manifest AND no env override). A real
+    # manifest always yields a concrete policy (explicit or the flipped
+    # default), so the gate is built whenever `doc` is a real manifest.
+    if env_policy is None and manifest_policy is None:
         return None
 
     policy = effective_trust_policy(manifest_policy, flag=False, env_override=env_policy)

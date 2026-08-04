@@ -543,10 +543,11 @@ class TestWorkspaceRootIndexTrustAuthority:
         assert loaded.workspace_manifest.index_trust_signer == signer
         assert loaded.workspace_manifest.index_trust_bundle == bundle
 
-    def test_root_declares_nothing_defaults_warn(self, tmp_path: Path) -> None:
+    def test_root_declares_nothing_defaults_strict(self, tmp_path: Path) -> None:
+        """S4 (RFC attestation-v1-normative.md D4): flipped default is 'strict'."""
         _write_workspace_root_with_index_trust(tmp_path)
         loaded = load_workspace(tmp_path)
-        assert loaded.workspace_manifest.index_trust_policy == "warn"
+        assert loaded.workspace_manifest.index_trust_policy == "strict"
 
 
 class TestWorkspaceMemberIndexTrustRejected:

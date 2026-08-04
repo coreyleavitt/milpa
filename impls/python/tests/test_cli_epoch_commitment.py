@@ -111,7 +111,15 @@ def test_unarmed_index_computes_unarmed_status(tmp_path: Path, monkeypatch: pyte
 def test_armed_valid_computes_armed_status(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     project_dir = tmp_path / "project"
     project_dir.mkdir()
-    _write_project(project_dir, _MINIMAL_MILPA_KDL + 'index-trust "warn"\n')
+    # S4 (RFC attestation-v1-normative.md D1): entry-trust now defaults to
+    # strict, so an armed commitment triggers D18's index-history co-
+    # requirement; pin index-history "strict" to isolate the epoch-status
+    # computation this test actually exercises (see test_d18_armed_all_strict_is_ok
+    # for the co-requirement's own dedicated coverage).
+    _write_project(
+        project_dir,
+        _MINIMAL_MILPA_KDL + 'index-trust "warn"\nindex-history "strict"\n',
+    )
     idx_url = _write_local_index(tmp_path, armed=True)
     _base_env(monkeypatch, tmp_path, idx_url)
     monkeypatch.setenv("MILPA_INDEX_EPOCH_MOCK_VERIFIER", "trusted")

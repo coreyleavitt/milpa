@@ -72,13 +72,13 @@ class TestBuildEntryTrust:
         env = _make_minimal_env()
         assert _build_entry_trust(env, project_dir) is None
 
-    def test_no_manifest_field_and_no_env_disables_gate(
+    def test_no_manifest_field_and_no_env_builds_strict_gate(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Default (no entry-trust anywhere): effective policy is 'warn', not 'off' —
-        so the config IS built (entry-trust defaults to warn, unlike index-trust
-        which the CLI treats as absent when unconfigured); this proves the
-        default-warn axis is live, not silently disabled."""
+        """Default (no entry-trust anywhere): effective policy is 'strict', not
+        'off' — so the config IS built (S4, RFC attestation-v1-normative.md D1:
+        entry-trust defaults to strict, unlike index-history which stays warn);
+        this proves the flipped default is live, not silently disabled."""
         project_dir = tmp_path / "project"
         project_dir.mkdir()
         _write_project(project_dir)
@@ -88,7 +88,7 @@ class TestBuildEntryTrust:
         env = _make_minimal_env()
         config = _build_entry_trust(env, project_dir)
         assert config is not None
-        assert config.policy == "warn"
+        assert config.policy == "strict"
 
     def test_manifest_strict_builds_strict_config(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -418,6 +418,11 @@ class TestAcquisitionActuallyAttempted:
         (project_dir / "milpa.kdl").write_text(
             'name "myapp"\n'
             'kind "application"\n'
+            # S4 (RFC attestation-v1-normative.md D4): index-trust now defaults
+            # to strict too, and this synthetic index.kdl ships no whole-index
+            # bundle; pin index-trust "warn" to isolate the entry-trust axis
+            # this test actually exercises.
+            'index-trust "warn"\n'
             'entry-trust "strict"\n'
             "deps {\n"
             '    bar ">= 2.0.0"\n'
@@ -584,6 +589,11 @@ def _setup_verb_project(
     (project_dir / "milpa.kdl").write_text(
         'name "myapp"\n'
         'kind "application"\n'
+        # S4 (RFC attestation-v1-normative.md D4): index-trust now defaults to
+        # strict too, and this synthetic index.kdl ships no whole-index
+        # bundle; pin index-trust "warn" to isolate the entry-trust axis
+        # these tests actually exercise.
+        'index-trust "warn"\n'
         f'entry-trust "{policy}"\n'
         f'{index_history_line}'
         "deps {\n"
@@ -767,9 +777,11 @@ class TestLoadManifestEntryTrustPolicyManifestErrors:
             _load_manifest_entry_trust_policy(project_dir)
         assert exc_info.value.slug == "MAN-KDL-SYNTAX"
 
-    def test_genuinely_absent_manifest_still_degrades_to_warn(self, tmp_path: Path) -> None:
+    def test_genuinely_absent_manifest_still_degrades_to_strict(self, tmp_path: Path) -> None:
+        """S4 (RFC attestation-v1-normative.md D1): a genuinely-absent manifest
+        degrades to the flipped 'strict' default, not 'warn'."""
         project_dir = tmp_path / "project"
         project_dir.mkdir()
 
         from milpa.cli import _load_manifest_entry_trust_policy
-        assert _load_manifest_entry_trust_policy(project_dir) == "warn"
+        assert _load_manifest_entry_trust_policy(project_dir) == "strict"

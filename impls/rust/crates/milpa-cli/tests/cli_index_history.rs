@@ -4,9 +4,15 @@
 //! Each test spawns the real `milpa` binary via `std::process::Command`,
 //! mirroring `crates/milpa-cli/tests/cli_index_trust.rs`'s isolation
 //! discipline (fresh `XDG_CACHE_HOME`/`MILPA_CACHE_DIR` per test, MILPA_*
-//! env vars cleared before each run). `MILPA_INDEX_TRUST=off` is set in
-//! most tests to isolate the index-history axis from index-trust (both are
-//! independently gated per registry-protocol §3.4.0).
+//! env vars cleared before each run). `index-trust "off"` is declared
+//! directly in the manifest (not via `MILPA_INDEX_TRUST=off`) to isolate
+//! the index-history axis from index-trust (both are independently gated
+//! per registry-protocol §3.4.0): S4 (RFC attestation-v1-normative.md
+//! D4/D1) flipped index-trust's own default to `strict`, and per the SSOT
+//! authority model (`registry-protocol.md §3.4.0`) `off` is a manifest-only,
+//! auditable opt-out — an env-var `MILPA_INDEX_TRUST=off` is a no-op floor
+//! that CANNOT weaken a manifest default of `strict`, so only a manifest
+//! declaration actually disables the gate.
 
 use std::path::Path;
 use std::process::Command;
@@ -19,7 +25,7 @@ fn write_manifest(dir: &Path, index_history: Option<&str>) {
         .unwrap_or_default();
     std::fs::write(
         dir.join("milpa.kdl"),
-        format!("name \"app\"\nkind \"application\"{policy_line}\n"),
+        format!("name \"app\"\nkind \"application\"\nindex-trust \"off\"{policy_line}\n"),
     )
     .expect("write milpa.kdl");
 }

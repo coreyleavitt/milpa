@@ -875,7 +875,7 @@ def _load_manifest_trust_fields(
             wm.index_trust_bundle,
         ),
         lambda m: (str(m.index_trust_policy), m.index_trust_signer, m.index_trust_bundle),
-        ("warn", None, None),
+        ("strict", None, None),
     )
 
 
@@ -1065,7 +1065,7 @@ def _load_manifest_entry_trust_policy(project_dir: Path) -> str:
         project_dir,
         lambda wm: wm.entry_trust_policy,
         lambda m: m.entry_trust_policy,
-        "warn",
+        "strict",
     )
 
 

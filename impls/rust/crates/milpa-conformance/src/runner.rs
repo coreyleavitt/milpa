@@ -571,7 +571,6 @@ impl Target for MilpaTarget {
                         let entry_trust = fixture_entry_trust_config(
                             &fx.dir,
                             Some(ws_doc.entry_trust_policy.clone()),
-                            ws_doc.entry_trust_policy_explicit,
                         )?;
                         // D6 (resolution-semantics RFC §3 Axis D): the EFFECTIVE
                         // exclude-newer bound — cmd-token > the workspace root's own
@@ -663,7 +662,6 @@ impl Target for MilpaTarget {
                 let entry_trust = fixture_entry_trust_config(
                     &fx.dir,
                     Some(manifest.entry_trust_policy.clone()),
-                    manifest.entry_trust_policy_explicit,
                 )?;
 
                 // D6 (resolution-semantics RFC §3 Axis D): the EFFECTIVE
@@ -2410,8 +2408,8 @@ fn fixture_epoch_commitment_status(
 /// fixture env-var contract both runners share:
 ///
 /// - `entry-trust "<policy>"` (manifest field) — base policy, passed in via
-///   `manifest_policy` / `manifest_explicit` (read from the parsed
-///   manifest/workspace-root exactly as production does).
+///   `manifest_policy` (read from the parsed manifest/workspace-root exactly
+///   as production does).
 /// - `MILPA_ENTRY_TRUST` — env override for the policy (fixture `env` file).
 /// - `MILPA_ENTRY_TRUST_MOCK_MAP` — JSON object: subject coordinate string
 ///   (`"pkg:tianguis/<ns>/<name>@<version>"`) -> one of `{trusted,
@@ -2423,13 +2421,27 @@ fn fixture_epoch_commitment_status(
 ///   bundle store (every attested entry with a `bundle` pin resolves as
 ///   `TNG-ENTRY-BUNDLE-MISSING`/unfetchable).
 ///
-/// Returns `None` when the fixture declares NEITHER a manifest `entry-trust`
-/// field NOR `MILPA_ENTRY_TRUST` — the gate stays unconfigured (disabled) so
-/// pre-existing named-dep fixtures that predate P3a are unaffected.
+/// Returns `None` ONLY when the fixture provides no manifest policy at all
+/// (`manifest_policy` is `None` — a synthetic unit-test call with no parsed
+/// manifest) AND no `MILPA_ENTRY_TRUST` override — there is then no policy
+/// to construct a gate from.
+///
+/// S4 (RFC attestation-v1-normative.md §6, Feas-C1 carve-out fix): the two
+/// real call sites always pass `Some(manifest.entry_trust_policy)` — a
+/// parsed manifest's `entry_trust_policy` ALWAYS carries a concrete value
+/// (the explicit `entry-trust` node, or the flipped `"strict"` default when
+/// absent). So the gate is now built unconditionally whenever a manifest was
+/// parsed, regardless of whether `entry-trust` was explicitly declared.
+/// Before this fix, non-explicit fixtures were keyed on the (now-removed)
+/// `manifest_explicit` flag and skipped the gate entirely, so flipping the
+/// default constant alone would have left every pre-existing named-dep
+/// fixture exercising NOTHING. This is safe: a fixture with no
+/// `attestation-epoch-commitment` classifies every entry as pre-epoch ⇒
+/// warn-equivalent under strict (D1), so the newly-enabled gate does not
+/// spuriously fail pre-existing fixtures — it just now runs.
 fn fixture_entry_trust_config(
     fixture_dir: &Path,
     manifest_policy: Option<milpa_core::TrustPolicy>,
-    manifest_explicit: bool,
 ) -> Result<Option<milpa_core::EntryTrustConfig>, String> {
     use milpa_core::entry_trust::{MockEntryVerifier, VerifierOutcome};
     use milpa_core::index_trust::{TrustBundle, DEFAULT_INDEX_SIGNER};
@@ -2447,7 +2459,7 @@ fn fixture_entry_trust_config(
         _ => None,
     });
 
-    if env_policy.is_none() && !manifest_explicit {
+    if env_policy.is_none() && manifest_policy.is_none() {
         return Ok(None);
     }
 
@@ -3661,7 +3673,7 @@ mod tests {
             "MILPA_ENTRY_TRUST=strict\nMILPA_ENTRY_TRUST_MOCK_DEFAULT=bogus-value\n",
         )
         .unwrap();
-        let result = fixture_entry_trust_config(tmp.path(), None, false);
+        let result = fixture_entry_trust_config(tmp.path(), None);
         assert!(result.is_err(), "unrecognized MOCK_DEFAULT must error, not fail-open");
     }
 
@@ -3673,7 +3685,7 @@ mod tests {
             "MILPA_ENTRY_TRUST=strict\nMILPA_ENTRY_TRUST_MOCK_DEFAULT=unattested\n",
         )
         .unwrap();
-        let result = fixture_entry_trust_config(tmp.path(), None, false);
+        let result = fixture_entry_trust_config(tmp.path(), None);
         assert!(result.is_err(), "gate-only value must be rejected by the mock-verifier seam");
     }
 
@@ -3685,7 +3697,7 @@ mod tests {
             "MILPA_ENTRY_TRUST=strict\nMILPA_ENTRY_TRUST_MOCK_DEFAULT=signature-invalid\n",
         )
         .unwrap();
-        let result = fixture_entry_trust_config(tmp.path(), None, false);
+        let result = fixture_entry_trust_config(tmp.path(), None);
         match result {
             Ok(Some(_)) => {}
             Ok(None) => panic!("expected an active gate (Some), got None"),
@@ -3701,7 +3713,7 @@ mod tests {
             "MILPA_ENTRY_TRUST=strict\nMILPA_ENTRY_TRUST_MOCK_MAP={\"pkg:tianguis/ns1/bar@1.0.0\": \"bundle-missing\"}\n",
         )
         .unwrap();
-        let result = fixture_entry_trust_config(tmp.path(), None, false);
+        let result = fixture_entry_trust_config(tmp.path(), None);
         assert!(result.is_err(), "gate-only value in MOCK_MAP must be rejected");
     }
 }

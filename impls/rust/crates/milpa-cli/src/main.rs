@@ -810,14 +810,15 @@ fn cmd_verify(
     // the function uses the default-true flag closure as the seed.
     //
     // Also capture the manifest's index_trust fields for the dep_decl edge check below.
-    let mut verify_index_policy = milpa_manifest::TrustPolicy::Warn;
+    let mut verify_index_policy = milpa_manifest::TrustPolicy::Strict;
     let mut verify_index_signer: Option<String> = None;
     let mut verify_index_bundle: Option<String> = None;
     // P3a (RFC per-entry-attestation.md §7): captured alongside the index-trust
     // fields for the offline entry-attestation reverify below.
-    let mut verify_entry_trust_policy = milpa_manifest::TrustPolicy::Warn;
+    let mut verify_entry_trust_policy = milpa_manifest::TrustPolicy::Strict;
     // A3 (rfc-registry-append-only.md §2): captured alongside the other
     // policy axes for the dep_decl edge check's maybe_index() call below.
+    // index-history stays warn (§3 non-goal, D18) even under the S4 flip.
     let mut verify_index_history_policy = milpa_manifest::TrustPolicy::Warn;
     match discover_manifest(dir) {
         Ok(milpa_manifest::ManifestDoc::Package(ref manifest)) => {
@@ -3201,7 +3202,7 @@ fn resolve_index_trust_fields(
             m.index_trust_bundle.clone(),
         )),
         Err(e) if e.code() == "MAN-NO-MANIFEST" => {
-            Ok((milpa_manifest::TrustPolicy::Warn, None, None))
+            Ok((milpa_manifest::TrustPolicy::Strict, None, None))
         }
         Err(e) => Err(e),
     }
@@ -7161,12 +7162,13 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn resolve_index_trust_fields_returns_warn_for_missing_manifest() {
+    fn resolve_index_trust_fields_returns_strict_for_missing_manifest() {
         // No milpa.kdl in an empty temp dir → the ONE graceful case
-        // (MAN-NO-MANIFEST) → (Warn, None, None).
+        // (MAN-NO-MANIFEST) → (Strict, None, None). S4 (RFC
+        // attestation-v1-normative.md D4) flipped the default.
         let tmp = tempfile::tempdir().unwrap();
         let (policy, signer, bundle) = resolve_index_trust_fields(tmp.path()).unwrap();
-        assert_eq!(policy, milpa_manifest::TrustPolicy::Warn, "missing manifest must default to Warn");
+        assert_eq!(policy, milpa_manifest::TrustPolicy::Strict, "missing manifest must default to Strict");
         assert!(signer.is_none(), "signer must be None for missing manifest");
         assert!(bundle.is_none(), "bundle must be None for missing manifest");
     }

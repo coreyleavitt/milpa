@@ -451,15 +451,16 @@ fn loads_a_valid_two_member_workspace() {
 use milpa_manifest::TrustPolicy;
 
 /// No index-trust anywhere (root or member) → the workspace's effective
-/// policy defaults to Warn, same as the package-manifest field default.
+/// policy defaults to Strict (S4), same as the package-manifest field default.
 #[test]
-fn workspace_no_index_trust_anywhere_defaults_to_warn() {
+fn workspace_no_index_trust_anywhere_defaults_to_strict() {
+    // S4 (RFC attestation-v1-normative.md): index-trust default flipped warn -> strict.
     let tmp = workspace_dir(
         "workspace {\n    member \"sub\"\n}\n",
         &[("sub", Some("name \"sub\"\n"))],
     );
     let ws = load_workspace(tmp.path()).unwrap();
-    assert_eq!(ws.index_trust_policy, TrustPolicy::Warn);
+    assert_eq!(ws.index_trust_policy, TrustPolicy::Strict);
     assert_eq!(ws.index_trust_signer, None);
     assert_eq!(ws.index_trust_bundle, None);
 }
@@ -518,9 +519,10 @@ fn member_declaring_index_trust_is_ws_index_trust_on_member() {
     assert_eq!(result.code(), "WS-INDEX-TRUST-ON-MEMBER");
 }
 
-/// A member declaring `index-trust "warn"` — the SAME as the default value —
-/// still errors: the rule is about WHERE the field is declared, not what
-/// value it holds (spec §3.4.7 member-declaration-error clause).
+/// A member declaring `index-trust "warn"` (a harmless-looking value; since
+/// S4 the default is `strict`, so this is not even the default) still errors:
+/// the rule is about WHERE the field is declared, not what value it holds
+/// (spec §3.4.7 member-declaration-error clause).
 #[test]
 fn member_declaring_index_trust_warn_default_value_is_still_ws_index_trust_on_member() {
     let tmp = workspace_dir(
@@ -584,9 +586,9 @@ fn member_declaring_entry_trust_is_ws_entry_trust_on_member() {
     assert_eq!(result.code(), "WS-ENTRY-TRUST-ON-MEMBER");
 }
 
-/// A member declaring `entry-trust "warn"` — the SAME as the default
-/// value — still errors: the rule is about WHERE the field is declared,
-/// not what value it holds.
+/// A member declaring `entry-trust "warn"` (a harmless-looking value; since
+/// S4 the default is `strict`, so this is not even the default) still errors:
+/// the rule is about WHERE the field is declared, not what value it holds.
 #[test]
 fn member_declaring_entry_trust_warn_default_value_is_still_ws_entry_trust_on_member() {
     let tmp = workspace_dir(

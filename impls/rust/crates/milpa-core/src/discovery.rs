@@ -190,11 +190,11 @@ pub fn manifest_from_nimble(nm: &NimbleManifest, name: &str) -> Manifest {
         // precedence chain that reads `.nimble` as an adapter is Axis A2).
         version: None,
         attestation_policy: milpa_manifest::TrustPolicy::Warn,
-        index_trust_policy: milpa_manifest::TrustPolicy::Warn,
+        index_trust_policy: milpa_manifest::TrustPolicy::Strict,
         index_trust_signer: None,
         index_trust_bundle: None,
         index_trust_policy_explicit: false,
-        entry_trust_policy: milpa_manifest::TrustPolicy::Warn,
+        entry_trust_policy: milpa_manifest::TrustPolicy::Strict,
         entry_trust_policy_explicit: false,
         index_history_policy: milpa_manifest::TrustPolicy::Warn,
         index_history_policy_explicit: false,

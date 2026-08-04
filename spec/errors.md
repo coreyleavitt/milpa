@@ -1561,7 +1561,7 @@ file alone without cross-referencing the RFC for the numbering itself:
 
 The selected registry entry carries no per-entry attestation record — absent, of an unrecognized `attestation` kind, or structurally invalid (e.g. `"author-signed"` with no `signed_by`), all of which conservatively collapse to unattested at index-parse time (registry-protocol §3.2).
 
-**Triggered:** `evaluate_entry_attestation` in `entry_trust.py`, stage 0 of the `entry-trust` gate pipeline (RFC `rfc-per-entry-attestation.md` §5), when the selected `IndexVersion.attestation` is `None`. Fires at the selection step (post-solve, per selected registry-resolved dep — §3), never at candidate enumeration. Under `warn` (the default) this is a warning; under `strict` it is a hard failure.
+**Triggered:** `evaluate_entry_attestation` in `entry_trust.py`, stage 0 of the `entry-trust` gate pipeline (RFC `rfc-per-entry-attestation.md` §5), when the selected `IndexVersion.attestation` is `None`. Fires at the selection step (post-solve, per selected registry-resolved dep — §3), never at candidate enumeration. Under `strict` (the default, v1) this is a hard failure — except for a pre-epoch entry under an armed epoch commitment, which stays warn-equivalent (D1); under `warn` this is always a warning.
 
 ### `TNG-ENTRY-BUNDLE-MISSING`
 
@@ -1716,7 +1716,7 @@ The locked `dep_decl` pin no longer matches the current index pointer for a dep 
 
 A workspace member manifest declares `entry-trust`. entry-trust is a workspace-ROOT policy (RFC `rfc-per-entry-attestation.md` §4) — one shared resolve graph, one trust posture — so only the resolution root (the workspace root manifest) may declare it.
 
-**Triggered:** every workspace-construction path (loading a workspace from disk, from an in-memory manifest, or with a proposed member-manifest override for a pending mutation) iterates workspace member manifests and finds that one declares `entry-trust` — including an explicit `entry-trust "warn"` that matches the default value. This check fires at workspace-construction time, mirroring `WS-INDEX-TRUST-ON-MEMBER`'s check for the sibling index-trust axis. The error context includes the offending member's path. The fix is to move the declaration to the workspace root manifest.
+**Triggered:** every workspace-construction path (loading a workspace from disk, from an in-memory manifest, or with a proposed member-manifest override for a pending mutation) iterates workspace member manifests and finds that one declares `entry-trust` — including an explicit `entry-trust "strict"` that matches the default value. This check fires at workspace-construction time, mirroring `WS-INDEX-TRUST-ON-MEMBER`'s check for the sibling index-trust axis. The error context includes the offending member's path. The fix is to move the declaration to the workspace root manifest.
 
 ### `WS-INDEX-HISTORY-ON-MEMBER`
 
@@ -1728,7 +1728,7 @@ A workspace member manifest declares `index-history`. index-history is a workspa
 
 A workspace member manifest declares `index-trust`, `index-trust-signer`, or `index-trust-bundle`. index-trust is a workspace-ROOT policy — the registry index is a process-global, workspace-shared resource, so only the resolution root (the workspace root manifest) may declare trust policy.
 
-**Triggered:** every workspace-construction path (loading a workspace from disk, from an in-memory manifest, or with a proposed member-manifest override for a pending mutation) iterates workspace member manifests and finds that one declares any of the three index-trust nodes — including an explicit `index-trust "warn"` that matches the default value. This check fires at workspace-construction time, BEFORE any index fetch. The error context includes the offending member's path. The fix is to move the declaration to the workspace root manifest.
+**Triggered:** every workspace-construction path (loading a workspace from disk, from an in-memory manifest, or with a proposed member-manifest override for a pending mutation) iterates workspace member manifests and finds that one declares any of the three index-trust nodes — including an explicit `index-trust "strict"` that matches the default value. This check fires at workspace-construction time, BEFORE any index fetch. The error context includes the offending member's path. The fix is to move the declaration to the workspace root manifest.
 
 ### `WS-MEMBER-DIR-MISSING`
 
