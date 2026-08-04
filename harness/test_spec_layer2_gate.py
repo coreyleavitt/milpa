@@ -273,5 +273,132 @@ class TestLayer2GateNormativeSurface(unittest.TestCase):
         )
 
 
+class TestLayer2VerificationAlgorithm(unittest.TestCase):
+    """S3 (RFC `docs/rfc-attestation-v1-normative.md` §6 slice S3, R4 cont.,
+    D3): the per-step verification-algorithm detail extending §3.6.2's stage
+    table — placed at a new §3.6.2a, mirroring §3.4.4's role for the
+    whole-index axis. Does not re-test §3.6.2's stage table/slug mapping
+    (already pinned above) or §3.3a's shared invariants — only the NEW
+    per-step crypto prose and the reconciled stage-5-7 ordering text."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.raw = _REGISTRY_PROTOCOL.read_text(encoding="utf-8")
+        cls.text = _flow_join(cls.raw)
+
+    def _algorithm_body(self) -> str:
+        return _flow_join(_section(self.raw, r"3\.6\.2a"))
+
+    def test_algorithm_subsection_heading_exists(self) -> None:
+        self.assertRegex(
+            self.raw,
+            re.compile(
+                r"^####\s+3\.6\.2a\s+.*[Vv]erification algorithm", re.MULTILINE
+            ),
+            "expected a §3.6.2a per-bundle verification algorithm heading",
+        )
+
+    def test_algorithm_nested_under_section_3_6(self) -> None:
+        body_36 = _flow_join(_section(self.raw, r"###\s+3\.6\s"))
+        self.assertIn(
+            "3.6.2a",
+            body_36,
+            msg="§3.6.2a must be nested inside §3.6, not a sibling top-level section",
+        )
+
+    # -- element 2: leaf-cert caveat (D3), carried forward from §3.4.4 -------
+
+    def test_leaf_cert_caveat_wording(self) -> None:
+        body = self._algorithm_body()
+        self.assertIn("not_before", body)
+        self.assertIn("integratedTime", body)
+        self.assertIn("leaf", body.lower())
+        self.assertIn(
+            "bounds-checked",
+            body,
+            msg="expected the leaf-window bounds-checked-against-integratedTime caveat",
+        )
+
+    def test_leaf_cert_caveat_states_guarantee_not_stronger_claim(self) -> None:
+        body = self._algorithm_body()
+        self.assertIn(
+            "stronger claim",
+            body,
+            msg="expected the D3 caveat to explicitly disclaim the stronger "
+            "whole-chain-at-integratedTime reading",
+        )
+
+    # -- element 3: DSSE envelope signature -----------------------------------
+
+    def test_dsse_envelope_signature_step_present(self) -> None:
+        body = self._algorithm_body()
+        self.assertIn("DSSE envelope signature", body)
+
+    # -- element 4: Rekor inclusion, offline + non-normative impl note -------
+
+    def test_rekor_inclusion_offline_present(self) -> None:
+        body = self._algorithm_body()
+        self.assertIn("Rekor inclusion proof", body)
+        self.assertIn("offline", body)
+
+    def test_rekor_adapter_is_non_normative_impl_note(self) -> None:
+        body = self._algorithm_body()
+        self.assertIn("rekor_adapter", body)
+        self.assertIn("IMPL NOTE", body)
+        self.assertIn("non-normative", body)
+
+    # -- element 1: subject-binding before crypto, referenced not restated --
+
+    def test_algorithm_orders_subject_binding_before_stage_5(self) -> None:
+        body = self._algorithm_body()
+        self.assertIn("BEFORE stage 5", body)
+
+    # -- stage 5-7 ordering reconciliation ------------------------------------
+
+    def test_signer_mismatch_precedence_over_rekor_and_dsse_stated(self) -> None:
+        body = self._algorithm_body()
+        self.assertIn(
+            "signer-identity policy before it evaluates Rekor inclusion",
+            body,
+            msg="expected the reconciled ordering guarantee: signer-identity "
+            "policy is evaluated (and can fail) before Rekor inclusion or "
+            "the DSSE envelope signature",
+        )
+
+    def test_signer_mismatch_precedence_does_not_extend_to_cert_chain(self) -> None:
+        body = self._algorithm_body()
+        self.assertIn(
+            "does NOT extend to the certificate-chain-validity portion",
+            body,
+            msg="expected the honest carve-out: a cert-chain failure is "
+            "evaluated, and reported, before the signer-identity policy "
+            "is ever reached",
+        )
+
+    def test_call_site_recording_mechanism_referenced(self) -> None:
+        body = self._algorithm_body()
+        self.assertIn("_RecordingPolicy", body)
+        self.assertIn("call-site", body)
+
+    def test_algorithm_does_not_reintroduce_epoch_as_pipeline_step(self) -> None:
+        body = self._algorithm_body()
+        self.assertIn(
+            "not a numbered step of this per-bundle",
+            body,
+            msg="expected the D14 reaffirmation: epoch classification is not "
+            "a post-crypto step of the per-bundle pipeline",
+        )
+
+    # -- element 5: no-revocation residual, NORMATIVE NOTE --------------------
+
+    def test_no_revocation_normative_note_present(self) -> None:
+        body = self._algorithm_body()
+        self.assertIn("NORMATIVE NOTE", body)
+        self.assertIn("no revocation", body.lower())
+        self.assertIn("verifies", body)
+        self.assertIn("forever", body)
+        self.assertIn("intrinsic to the keyless model", body)
+
+
 if __name__ == "__main__":
     unittest.main()

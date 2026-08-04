@@ -2071,6 +2071,128 @@ verified vendor-bot identity; no freshness stage).
 > absent would let an attacker's statement vouch for the expected subject
 > merely by padding an unrelated second entry into the list.
 
+#### 3.6.2a  Per-bundle verification algorithm
+
+This subsection states the concrete algorithm behind stages 3–7 of §3.6.2's
+table — the level of detail a clean-room implementation needs without
+inventing behavior, mirroring §3.4.4's role for the whole-index axis. It
+does not restate §3.3a's shared invariants (parse-before-crypto, TOCTOU,
+delegate-not-hand-roll, first-failing-stage-wins, subject-binding-precedes-
+crypto) or §3.6.2's stage table and slug mapping; it fills in the
+crypto-library mechanics those already-normative rules leave implicit.
+
+> NORMATIVE (stages 3–4 precede stage 5 — pointer, not a restatement):
+> §3.6.2's table and its subject-binding-precedes-crypto instantiation
+> already require the statement's subject digest to equal the candidate's
+> `content_hash` (scheme-agnostic hex extraction) and `subject[0].name` to
+> equal `pkg:tianguis/<namespace>/<name>@<version>`, with `subject`
+> cardinality exactly 1 (D3). Both checks run, and both MUST pass, BEFORE
+> stage 5 begins. The remainder of this subsection assumes that ordering
+> and details only stages 5–7.
+
+**Stage 5 — Fulcio certificate chain.** The certificate chain MUST be
+validated against the embedded Fulcio trust root at the leaf certificate's
+own `not_before`, with only the leaf certificate's validity window
+bounds-checked against the Rekor SET `integratedTime` — the same caveat
+§3.4.4 step 4 carries for the whole-index axis (D3), stated here rather
+than left implicit: this is NOT "the whole chain is validated as of
+`integratedTime`," which would be a stronger claim than a conformant
+delegated Sigstore client (`sigstore-python`, `sigstore-rs`) actually
+makes (`rfc-attestation-verifier.md §4` gap-3). A certificate now-expired
+by wall-clock but valid within its own `not_before`/`not_after` window at
+`integratedTime` MUST verify successfully; `TNG-ENTRY-SIGNATURE-INVALID`
+is raised only when the leaf was not valid at `integratedTime`.
+
+**Stage 5 (continued) — DSSE envelope signature.** The envelope signature
+MUST be verified against the leaf certificate's public key. A conformant
+delegated Sigstore client evaluates this check as part of the same
+combined verification call that performs stage 5's certificate-chain
+validation, stage 6's signer-identity policy, and stage 7's Rekor
+inclusion proof (see the stage-ordering clause below); its failure is
+reported as `TNG-ENTRY-SIGNATURE-INVALID`, sharing the slug with the
+certificate-chain and Rekor-inclusion failures per §3.6.2's table.
+
+**Stage 6 — signer-identity policy.** The certificate's SubjectAltName
+MUST match the expected signer (§3.3a's per-axis derivation: the entry's
+own claimed `signed_by` for `AuthorSigned`, or Layer 1's verified
+vendor-bot identity for `MilpaVendored`). A mismatch MUST raise
+`TNG-ENTRY-SIGNER-MISMATCH`, distinguished from stage 5/7's
+`TNG-ENTRY-SIGNATURE-INVALID` by CALL-SITE recording of whether the
+identity-policy check itself raised — never by inspecting exception
+message text (mirrors §3.4.4 step 5's failure-slug-mapping clause; the
+reference mechanism is a policy wrapper — `entry_trust.py`'s
+`_RecordingPolicy`, the same pattern as `index_trust.py`'s
+`_RecordingPolicy` for Layer 1 — that sets a flag if and only if the
+identity-policy check itself raises; this is the reference mechanism, not
+the only conformant one).
+
+**Stage 7 — Rekor inclusion proof, offline.** The bundle's inclusion proof
+and signed entry timestamp MUST verify against the embedded Rekor public
+key without any live Rekor network access — §3.3a's delegate-not-hand-roll
+rule applies verbatim. Failure MUST raise `TNG-ENTRY-SIGNATURE-INVALID`.
+
+> IMPL NOTE (non-normative): the Rust reference implementation's offline
+> Rekor inclusion-proof verification is bridged through a dedicated
+> `rekor_adapter` module standing in for inclusion-proof support that
+> `sigstore-rs`'s public high-level verifier does not yet expose
+> end-to-end. This is an implementation-strategy detail of one reference
+> impl, not a normative requirement — a conformant implementation MAY
+> perform stage 7 however its chosen Sigstore client exposes offline
+> inclusion-proof verification.
+
+> NORMATIVE (stages 5–7 ordering — what is actually guaranteed): §3.6.2's
+> table lists certificate-chain-and-DSSE-signature (stage 5),
+> signer-identity policy (stage 6), and Rekor inclusion (stage 7) as an
+> ordered list, with first-failing-stage-wins precedence (§3.3a). A
+> conformant delegated Sigstore client does not literally evaluate these
+> three checks in that textual order — `sigstore-python`'s combined
+> verification call evaluates certificate-chain validity first, then the
+> signer-identity policy, then Rekor inclusion, then the DSSE envelope
+> signature last — but because the certificate-chain, DSSE-signature, and
+> Rekor-inclusion failures all share the SAME `TNG-ENTRY-SIGNATURE-INVALID`
+> outcome, this internal reordering is unobservable in the reported result
+> (§3.3a's NOTE: what is normative is the observable outcome, not the
+> internal control flow). The one distinction that IS observable —
+> `TNG-ENTRY-SIGNER-MISMATCH` versus `TNG-ENTRY-SIGNATURE-INVALID` — IS
+> guaranteed in the stage-6-before-{5,7} order the table states: a
+> conformant delegated Sigstore client evaluates the signer-identity
+> policy before it evaluates Rekor inclusion or the DSSE envelope
+> signature, so a signer mismatch is reported even when the bundle would
+> ALSO have failed Rekor inclusion or DSSE-signature verification. This
+> guarantee does NOT extend to the certificate-chain-validity portion of
+> stage 5: a chain that fails to validate against the trust root is
+> evaluated, and fails, before the signer-identity policy is reached at
+> all, so a certificate-chain failure is reported as
+> `TNG-ENTRY-SIGNATURE-INVALID` even when the (unreached) signer check
+> would also have failed — consistent with stage 5 preceding stage 6. An
+> implementation MUST NOT assert `TNG-ENTRY-SIGNER-MISMATCH` from anything
+> other than the identity-policy check itself having raised (the
+> call-site recording mechanism above); it MUST NOT attempt to
+> independently re-order or re-run stages 5–7 to force a different
+> precedence than its delegated Sigstore client provides.
+
+> NORMATIVE (epoch classification is not a step in this pipeline — D14):
+> `EpochMembership` is read from the index-scoped `EpochCommitmentStatus`
+> (§3.4.8) before candidate selection begins, as a stage-0-adjacent "is an
+> attestation mandated at all" gate (§3.6.3) — it is not a numbered step
+> of this per-bundle cryptographic pipeline, and it does not run after
+> stage 7. This subsection's stage numbers (5, 6, 7) are the same stage
+> numbers §3.6.2's table and `errors.md`'s `TNG-ENTRY-*` reference already
+> use; nothing here introduces a competing "stage 5."
+
+> NORMATIVE NOTE (no revocation — residual, carried into the normative
+> surface per D3): keyless Sigstore verification has no revocation
+> mechanism. An offline verification of a bundle that was validly signed
+> at its `integratedTime` verifies successfully forever, even after the
+> signer's OIDC identity is later compromised or its authorization is
+> withdrawn — this is intrinsic to the keyless model, not a defect in this
+> algorithm. A conformant implementation MUST NOT attempt to compensate by
+> adding an ad-hoc revocation check outside this algorithm (that would
+> itself be hand-rolled cryptographic policy, forbidden by §3.3a's
+> delegate-not-hand-roll rule); the residual is accepted and stated here
+> so a spec-only clean-room implementer — who does not read design-history
+> RFCs — is not left to discover it independently.
+
 #### 3.6.3  `EntryGateOutcome` — the gate's return shape
 
 > NORMATIVE (one composed diagnostic, not independently-threaded fields —
