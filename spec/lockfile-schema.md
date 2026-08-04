@@ -749,14 +749,22 @@ dep "widget" {
 > (KDL 2.0 unknown-node forward-compat skip) and continues; the dep
 > resolves exactly as it would have with no attestation claim recorded.
 
-> NOTE: This subsection (P1 of `rfc-per-entry-attestation.md`) specifies
-> the schema only; no parser or emitter populates it yet — that lands with
-> the RFC's P2 slice, with zero cryptographic verification ever run at lock
-> time. Until a later slice adds the `entry-trust` gate and its verifier,
-> `milpa show` and the frozen path render this block, once populated, as an
-> **unverified claim** (e.g. "claims author-signed by X") rather than a
-> verified fact. The wording upgrade at that point changes presentation
-> only — this schema does not change.
+> NOTE (D12, `rfc-attestation-v1-normative.md` §6 S5, R8): the `entry-trust`
+> gate and its verifier now exist and run at `fetch`/`lock`/`verify` time —
+> but this schema still records only the **claim**, never a verification
+> outcome (`lockfile-schema.md` §3.9's own rule, unchanged). Correspondingly,
+> `milpa show` reading a **pre-existing lockfile from a separate, cold
+> invocation** renders this block as an unverified claim (e.g. "claims
+> author-signed by X") **permanently**, not as a stage this presentation
+> will later "upgrade" past. Inferring "verified" from the CURRENT effective
+> policy shape would reintroduce the exact claim/outcome conflation this
+> section forbids, and would misrender under set-once-epoch time travel: an
+> entry locked pre-arming (correctly `warn` at lock time) would wrongly read
+> "verified" once the registry's epoch is later armed. "Verified" wording
+> is emitted ONLY by `fetch`/`lock`/`verify`'s own same-invocation summary,
+> immediately after cryptographic verification genuinely ran in THAT
+> process (`milpa verify`'s `entry-trust: N attestation(s) verified this
+> run` line) — never inferred later, and never by `show`.
 
 ### 3.10  `source` block (S5, `rfc-origin-as-identity.md` §4.1/§7)
 

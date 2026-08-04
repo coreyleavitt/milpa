@@ -213,10 +213,13 @@ fn run(args: &[String]) -> Result<i32, MilpaError> {
 
     match cli.verb.as_str() {
         "show" => {
-            // `--index-trust` flag on `show`: describe cached bundle claims.
-            // spec/cli-contract.md §5.3a.
+            // `--index-trust` / `--entry-trust` flags on `show`: describe
+            // cached bundle / epoch-commitment claims. spec/cli-contract.md
+            // §5.3a.
             if cli.rest.iter().any(|a| a == "--index-trust") {
                 cmd_show_index_trust(dir)
+            } else if cli.rest.iter().any(|a| a == "--entry-trust") {
+                cmd_show_entry_trust(dir)
             } else {
                 cmd_show(dir)
             }
@@ -783,6 +786,62 @@ fn cmd_show_index_trust(dir: &Path) -> Result<i32, MilpaError> {
     Ok(0)
 }
 
+/// Resolve the effective entry-trust policy's MANIFEST input the SAME way
+/// the entry-trust gate does (root-authority model — for a workspace, ONLY
+/// the root's value, no merge across members, mirroring
+/// [`resolve_index_trust_fields`]'s discipline for index-trust). Falls back
+/// to `Strict` ONLY for the genuine "no manifest here" case
+/// (`MAN-NO-MANIFEST`); any other discovery/load failure propagates.
+fn resolve_entry_trust_policy(dir: &Path) -> Result<milpa_manifest::TrustPolicy, MilpaError> {
+    match discover_manifest(dir) {
+        Ok(milpa_manifest::ManifestDoc::Workspace(_)) => {
+            let ws = load_workspace(dir)?;
+            Ok(ws.entry_trust_policy.clone())
+        }
+        Ok(milpa_manifest::ManifestDoc::Package(ref m)) => Ok(m.entry_trust_policy.clone()),
+        Err(e) if e.code() == "MAN-NO-MANIFEST" => Ok(milpa_manifest::TrustPolicy::Strict),
+        Err(e) => Err(e),
+    }
+}
+
+/// `milpa show --entry-trust` — print entry-trust observability: effective
+/// policy + the claimed epoch-commitment arming state (RFC
+/// attestation-v1-normative.md §6 S5 — minimal `show --entry-trust` parity
+/// with `show --index-trust`'s convention, R8/R10).
+///
+/// CLAIMS ONLY — no cryptographic verification is performed (mirrors
+/// [`cmd_show_index_trust`]'s discipline): the epoch-commitment row reports
+/// whether the CACHED index text carries an `attestation-epoch-commitment`
+/// pointer, not whether it composed-verifies. Composed verification is
+/// `fetch`/`lock`/`verify`'s job; this command is a passive audit view.
+///
+/// The effective policy is computed the SAME way [`build_entry_trust_gate`]
+/// computes it (manifest + `MILPA_ENTRY_TRUST`, flag always `false` — `show`
+/// has no `--require-attested-entries`-equivalent flag of its own, matching
+/// [`cmd_show_index_trust`]'s `flag=false`).
+///
+/// spec/cli-contract.md §5.3a (S5 entry-trust addendum).
+fn cmd_show_entry_trust(dir: &Path) -> Result<i32, MilpaError> {
+    use milpa_core::entry_trust::format_entry_trust_info;
+    use milpa_core::index_cache::read_cached_epoch_commitment_pointer;
+
+    let manifest_policy = resolve_entry_trust_policy(dir)?;
+    let env_override = read_env_entry_trust_policy();
+    let effective_policy = effective_trust_policy(&manifest_policy, false, env_override.as_ref());
+    let policy_str = match effective_policy {
+        milpa_manifest::TrustPolicy::Strict => "strict",
+        milpa_manifest::TrustPolicy::Warn => "warn",
+        milpa_manifest::TrustPolicy::Off => "off",
+    };
+
+    let index_url = index_url_from_env();
+    let pointer = read_cached_epoch_commitment_pointer(&index_url, &index_cache_dir());
+
+    let output = format_entry_trust_info(policy_str, &index_url, pointer.as_deref());
+    print!("{output}");
+    Ok(0)
+}
+
 /// `milpa verify` — confirm `_deps/` matches the lockfile (stderr report).
 ///
 /// `require_attested_metadata` is the parsed CLI flag (already ORed with the
@@ -893,6 +952,19 @@ fn cmd_verify(
     // attestation bundle — the offline post-incident audit path (Part-1 §7.5).
     // A tampered/invalid cached bundle fails verify under strict (warns under
     // warn). Never fetches; independent of the online dep_decl edge check below.
+    //
+    // RFC attestation-v1-normative.md §6 S5, round-3 addition (i): ALSO
+    // re-derives EpochCommitmentStatus from the pinned local cache (never
+    // fetches — reverify_cached_epoch_commitment_status), enforces
+    // TNG-INDEX-EPOCH-COMMITMENT-INVALID on ArmingInvalid (the
+    // epoch-commitment phase is index-scoped, R4: it strictly precedes
+    // entry-trust), and threads the derived status into the entry-attestation
+    // reverify below so a re-arm that happened between `lock` and `verify`
+    // reflects the CURRENT cache, never a stale lockfile-time claim.
+    // Defaults to Unarmed when index-trust is inactive for this invocation
+    // (no index configured, or effective policy off) — the same
+    // warn-equivalent treatment a genuinely unarmed registry gets.
+    let mut reverified_epoch_status = milpa_core::epoch_commitment::EpochCommitmentStatus::Unarmed;
     {
         let raw = std::env::var("MILPA_INDEX_URL").ok();
         let explicit_no_index = raw.as_deref().map(|s| s.trim().is_empty()).unwrap_or(false);
@@ -916,6 +988,22 @@ fn cmd_verify(
                     eprintln!("milpa-error: {}", e.code());
                     return Ok(1);
                 }
+
+                let (epoch_verifier, expected_signer) = build_epoch_commitment_verifier(&url)?;
+                let status = milpa_core::index_cache::reverify_cached_epoch_commitment_status(
+                    &url,
+                    &index_cache_dir(),
+                    &epoch_commitment_cache_dir(),
+                    epoch_verifier.as_ref(),
+                    &active.cfg.trust_bundle,
+                    &expected_signer,
+                );
+                if let Err(e) = milpa_core::epoch_commitment::enforce_epoch_commitment(&status) {
+                    eprintln!("cached epoch-commitment reverify failed: {}", message_of(&e));
+                    eprintln!("milpa-error: {}", e.code());
+                    return Ok(1);
+                }
+                reverified_epoch_status = status;
             }
         }
     }
@@ -923,18 +1011,22 @@ fn cmd_verify(
     // P3a (RFC per-entry-attestation.md §7): offline reverify of CACHED
     // per-entry attestation bundles. Same shape as the index reverify above —
     // never fetches, independent of the online dep_decl edge check below.
-    if let Err(e) = reverify_cached_entry_attestations(
+    let entry_trust_verified_count = match reverify_cached_entry_attestations(
         &lock,
         &verify_entry_trust_policy,
         verify_index_signer.clone(),
         verify_index_bundle.clone(),
         require_attested_entries,
         no_index,
+        &reverified_epoch_status,
     ) {
-        eprintln!("cached entry attestation reverify failed: {}", message_of(&e));
-        eprintln!("milpa-error: {}", e.code());
-        return Ok(1);
-    }
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("cached entry attestation reverify failed: {}", message_of(&e));
+            eprintln!("milpa-error: {}", e.code());
+            return Ok(1);
+        }
+    };
 
     let deps_dir = dir.join("_deps");
     // Gap-1 D: VERIFY-DEPS-DIR-MISSING — emitted inline (Ok(1) path).
@@ -1047,6 +1139,16 @@ fn cmd_verify(
     }
 
     eprintln!("verified {} deps", lock.deps.len());
+
+    // D12 same-invocation "verified" wording (RFC attestation-v1-normative.md
+    // §6 S5): this line is the ONLY place milpa ever says an attestation was
+    // "verified" (as opposed to a cold `show`'s permanent "claims" wording) —
+    // printed only right here, immediately after
+    // `reverify_cached_entry_attestations` genuinely re-ran crypto in THIS
+    // process, never inferred later from policy shape.
+    if entry_trust_verified_count > 0 {
+        eprintln!("entry-trust: {entry_trust_verified_count} attestation(s) verified this run");
+    }
     Ok(0)
 }
 
@@ -3313,13 +3415,51 @@ fn apply_epoch_commitment_phase(
     entry_trust_policy: &milpa_manifest::TrustPolicy,
     index_history_policy: &milpa_manifest::TrustPolicy,
 ) -> Result<(), MilpaError> {
-    use milpa_core::epoch_commitment::{
-        check_epoch_ratchet_requirement, enforce_epoch_commitment, DEFAULT_REARM_SIGNER,
-    };
+    use milpa_core::epoch_commitment::{check_epoch_ratchet_requirement, enforce_epoch_commitment};
     use milpa_core::index_cache::{load_epoch_commitment_status, read_cached_epoch_commitment_pointer};
-    use milpa_core::index_trust::{IndexBundleVerifier, MockVerifier, SigstoreVerifier, VerificationResult};
 
     let pointer = read_cached_epoch_commitment_pointer(index_url, &index_cache_dir());
+
+    // Verifier + re-arm signer: the SAME construction `milpa verify`'s
+    // offline re-derivation uses (`build_epoch_commitment_verifier` —
+    // extracted in RFC attestation-v1-normative.md §6 S5 to avoid a second
+    // hand-rolled copy of the mock/production dispatch).
+    let (verifier, expected_signer) = build_epoch_commitment_verifier(index_url)?;
+
+    let http_get = build_commitment_http_fn();
+    let status = load_epoch_commitment_status(
+        index_url,
+        pointer.as_deref(),
+        &epoch_commitment_cache_dir(),
+        http_get.as_ref(),
+        verifier.as_ref(),
+        trust_bundle,
+        &expected_signer,
+    );
+    index.epoch_commitment_status = status.clone();
+
+    enforce_epoch_commitment(&status)?;
+    check_epoch_ratchet_requirement(&status, entry_trust_policy, index_history_policy)?;
+
+    // Dsgn-H2 (RFC attestation-v1-normative.md §6 S5): informational, never
+    // gates the resolve — see maybe_emit_no_epoch_armed_notice's doc comment.
+    milpa_core::entry_trust::maybe_emit_no_epoch_armed_notice(entry_trust_policy, &status);
+
+    Ok(())
+}
+
+/// `(verifier, expected_signer)` for the epoch-commitment phase — the SAME
+/// construction [`apply_epoch_commitment_phase`] uses (extracted so `milpa
+/// verify`'s offline re-derivation, RFC attestation-v1-normative.md §6 S5,
+/// builds the identical mock/production verifier and re-arm signer rather
+/// than a second hand-rolled copy). `index_url` MUST be the already
+/// three-way-resolved URL ([`milpa_core::index_cache::index_url_from_env`]),
+/// matching the guard `apply_epoch_commitment_phase` enforces.
+fn build_epoch_commitment_verifier(
+    index_url: &str,
+) -> Result<(Box<dyn milpa_core::index_trust::IndexBundleVerifier>, String), MilpaError> {
+    use milpa_core::epoch_commitment::DEFAULT_REARM_SIGNER;
+    use milpa_core::index_trust::{IndexBundleVerifier, MockVerifier, SigstoreVerifier, VerificationResult};
 
     // Verifier: MockVerifier from the conformance seam (mirrors
     // MILPA_INDEX_TRUST_MOCK_VERIFIER's file://-only guard exactly), else
@@ -3366,21 +3506,7 @@ fn apply_epoch_commitment_phase(
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| DEFAULT_REARM_SIGNER.to_string());
 
-    let http_get = build_commitment_http_fn();
-    let status = load_epoch_commitment_status(
-        index_url,
-        pointer.as_deref(),
-        &epoch_commitment_cache_dir(),
-        http_get.as_ref(),
-        verifier.as_ref(),
-        trust_bundle,
-        &expected_signer,
-    );
-    index.epoch_commitment_status = status.clone();
-
-    enforce_epoch_commitment(&status)?;
-    check_epoch_ratchet_requirement(&status, entry_trust_policy, index_history_policy)?;
-    Ok(())
+    Ok((verifier, expected_signer))
 }
 
 /// `$XDG_CACHE_HOME/milpa/epoch-commitment/` (default
@@ -3769,13 +3895,22 @@ fn build_entry_trust_gate(
 /// `BundleMissing` (cause `unfetchable`), exactly as if the bundle had never
 /// been fetched.
 ///
-/// S-EpochGate scope note: this offline, lockfile-driven path never loads an
-/// `Index` (that would require re-acquiring + re-verifying the index and its
-/// epoch-commitment sidecar, which the offline invariant above forbids). It
-/// always classifies as `Unarmed` (`epoch_membership = None`) — the same
-/// warn-equivalent treatment `effective_epoch_policy` gives a genuinely
-/// unarmed registry — rather than reconstructing a stale or unverifiable
-/// membership claim from the lockfile alone.
+/// `epoch_status` (RFC attestation-v1-normative.md §6 S5, round-3 addition
+/// (i) — RE-DERIVE, not trust-the-lock-time-claim): the caller (`cmd_verify`)
+/// threads through the status the index reverify block already re-derived
+/// offline from the PINNED LOCAL index cache this same invocation —
+/// reflecting what is on disk NOW, not whatever was true when the lockfile
+/// was written (the M1 case: the cached index was replaced by a newer
+/// `fetch` between `lock` and `verify`). Defaults to `Unarmed` when
+/// index-trust was inactive for this invocation — the same warn-equivalent
+/// treatment a genuinely unarmed registry gets, never a stale reconstruction
+/// from the lockfile alone.
+///
+/// Returns the count of entries whose re-verification outcome was `Trusted`
+/// this run (the same-invocation "verified" fact `cmd_verify`'s summary line
+/// reports — D12: distinct from a cold `show`'s permanent "claims" wording,
+/// which infers nothing from policy or from a check that ran in a DIFFERENT
+/// process).
 fn reverify_cached_entry_attestations(
     lock: &milpa_core::Lockfile,
     entry_trust_policy: &milpa_manifest::TrustPolicy,
@@ -3783,9 +3918,10 @@ fn reverify_cached_entry_attestations(
     manifest_bundle: Option<String>,
     require_attested_entries: bool,
     no_index: bool,
-) -> Result<(), MilpaError> {
-    use milpa_core::entry_trust::EntryVerificationResult;
-    use milpa_core::epoch_commitment::EpochCommitmentStatus;
+    epoch_status: &milpa_core::epoch_commitment::EpochCommitmentStatus,
+) -> Result<u32, MilpaError> {
+    use milpa_core::entry_trust::{classify_epoch_membership, EntryVerificationResult};
+    use milpa_core::epoch_commitment::PreEpochIdentity;
     use milpa_core::{EntryAttestation, EntryGateOutcome};
 
     let Some(cfg) = build_entry_trust_gate(
@@ -3796,18 +3932,32 @@ fn reverify_cached_entry_attestations(
         no_index,
     )?
     else {
-        return Ok(()); // policy off
+        return Ok(0); // policy off
     };
 
-    let epoch_status = EpochCommitmentStatus::default(); // Unarmed — see doc comment above.
+    // Dsgn-H2 (RFC attestation-v1-normative.md §6 S5): informational, never
+    // gates verify — see maybe_emit_no_epoch_armed_notice's doc comment.
+    // Same dedup-gated function the fetch/lock path (apply_epoch_commitment_phase)
+    // calls — at most one notice per process regardless of which path ran.
+    milpa_core::entry_trust::maybe_emit_no_epoch_armed_notice(entry_trust_policy, epoch_status);
+
+    let mut trusted_count: u32 = 0;
 
     for dep in &lock.deps {
         let Some(att) = &dep.attestation else { continue };
 
+        let identity = PreEpochIdentity {
+            namespace: att.namespace.clone(),
+            name: dep.name.clone(),
+            version: dep.version.clone(),
+            content_hash: dep.identity.clone().unwrap_or_default(),
+        };
+        let membership = classify_epoch_membership(epoch_status, &identity);
+
         let outcome: EntryGateOutcome = match &att.bundle_pin {
             None => EntryGateOutcome {
                 result: EntryVerificationResult::BundleMissing,
-                epoch_membership: None,
+                epoch_membership: membership,
                 cause: Some("no-pin".to_string()),
             },
             Some(pin) => match &cfg.bundle_store {
@@ -3829,18 +3979,22 @@ fn reverify_cached_entry_attestations(
                         cfg.bundle_store.as_deref(),
                         &cfg.trust_bundle,
                         &cfg.expected_vendor_signer,
-                        &epoch_status,
+                        epoch_status,
                     )?
                 }
                 // NEVER fetch — a present-but-uncached pin (or no store at
                 // all) is unfetchable-from-cache.
                 _ => EntryGateOutcome {
                     result: EntryVerificationResult::BundleMissing,
-                    epoch_membership: None,
+                    epoch_membership: membership,
                     cause: Some("unfetchable".to_string()),
                 },
             },
         };
+
+        if outcome.result == EntryVerificationResult::Trusted {
+            trusted_count += 1;
+        }
 
         milpa_core::enforce_entry_trust(
             &outcome,
@@ -3849,9 +4003,10 @@ fn reverify_cached_entry_attestations(
             &dep.name,
             &dep.version,
             cfg.bundle_store.as_deref(),
+            true, // verify_context: this IS milpa verify's offline reverify path
         )?;
     }
-    Ok(())
+    Ok(trusted_count)
 }
 
 /// Internal helper: call load_index_with_history with pre-resolved arguments.

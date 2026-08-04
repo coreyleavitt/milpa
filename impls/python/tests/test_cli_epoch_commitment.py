@@ -192,3 +192,58 @@ def test_d18_armed_all_strict_is_ok(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     env = _make_minimal_env()
     result_env = _load_index_for_verb(env, project_dir)
     assert isinstance(result_env.index.epoch_commitment_status, Armed)
+
+
+def test_no_epoch_armed_notice_fires_on_fetch_lock_path_when_strict_and_unarmed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """RFC attestation-v1-normative.md §6 S5 (Dsgn-H2): the fetch/lock gate
+    (`_apply_epoch_commitment_phase`, invoked via `_load_index_for_verb`)
+    must emit the no-epoch-armed observability notice once when entry-trust
+    is effectively strict and the loaded index is Unarmed — otherwise
+    strict silently degrades to warn-equivalent with zero signal."""
+    from milpa.entry_trust import NO_EPOCH_ARMED_NOTICE, _reset_no_epoch_armed_notice
+
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    _write_project(
+        project_dir,
+        _MINIMAL_MILPA_KDL + 'index-trust "warn"\nentry-trust "strict"\n',
+    )
+    idx_url = _write_local_index(tmp_path, armed=False)
+    _base_env(monkeypatch, tmp_path, idx_url)
+    _reset_no_epoch_armed_notice()
+
+    from milpa.cli import _load_index_for_verb
+
+    env = _make_minimal_env()
+    _load_index_for_verb(env, project_dir)
+    err = capsys.readouterr().err
+    assert NO_EPOCH_ARMED_NOTICE in err
+    assert err.count(NO_EPOCH_ARMED_NOTICE) == 1
+
+
+def test_no_epoch_armed_notice_silent_when_entry_trust_warn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A `warn` entry-trust policy has nothing to silently degrade FROM —
+    the notice exists to flag strict's false confidence, not to narrate
+    every unarmed registry."""
+    from milpa.entry_trust import NO_EPOCH_ARMED_NOTICE, _reset_no_epoch_armed_notice
+
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    _write_project(
+        project_dir,
+        _MINIMAL_MILPA_KDL + 'index-trust "warn"\nentry-trust "warn"\n',
+    )
+    idx_url = _write_local_index(tmp_path, armed=False)
+    _base_env(monkeypatch, tmp_path, idx_url)
+    _reset_no_epoch_armed_notice()
+
+    from milpa.cli import _load_index_for_verb
+
+    env = _make_minimal_env()
+    _load_index_for_verb(env, project_dir)
+    err = capsys.readouterr().err
+    assert NO_EPOCH_ARMED_NOTICE not in err

@@ -688,6 +688,55 @@ pub fn _reset_warned_entries() {
     WARNED_ENTRIES.with(|w| w.borrow_mut().clear());
 }
 
+// ---------------------------------------------------------------------------
+// no-epoch-armed observability notice (Dsgn-H2, RFC attestation-v1-
+// normative.md §6 S5, round-3 addition (ii))
+// ---------------------------------------------------------------------------
+
+/// The literal notice text (RFC S5): deliberately audience-agnostic (br10) —
+/// the SAME `Unarmed` state means "attestation is rolling out" to a
+/// flagship-registry consumer mid-migration and "this registry does not
+/// attest" to a self-hosted/air-gapped operator who never plans to; milpa has
+/// no signal to distinguish the two (both present as an absent field), so the
+/// notice states the mechanical fact and names both readings.
+pub const NO_EPOCH_ARMED_NOTICE: &str = "milpa: entry-trust is \"strict\", but this registry has not armed a pre-epoch commitment — no entry is currently mandated to carry an attestation (every entry is treated as warn-equivalent). If this registry is rolling out attestation, this is expected until it arms an epoch; if this registry does not attest at all, \"strict\" enforces nothing here until it does.";
+
+/// Dedup flag: at most one no-epoch-armed notice per invocation (mirrors
+/// [`WARNED_ENTRIES`]'s per-invocation dedup discipline), regardless of how
+/// many registries/candidates are classified `Unarmed` this run.
+thread_local! {
+    static NO_EPOCH_ARMED_NOTICE_SHOWN: RefCell<bool> = RefCell::new(false);
+}
+
+/// Clear the once-per-invocation no-epoch-armed notice flag. **TEST USE ONLY.**
+#[cfg(test)]
+pub fn _reset_no_epoch_armed_notice() {
+    NO_EPOCH_ARMED_NOTICE_SHOWN.with(|f| *f.borrow_mut() = false);
+}
+
+/// Emit [`NO_EPOCH_ARMED_NOTICE`] to stderr, once per invocation, when
+/// effective entry-trust is `Strict` but the loaded index carries no epoch
+/// commitment (`Unarmed`) — otherwise strict silently degrades to
+/// warn-equivalent (D11) with zero signal, a false-confidence gap for an
+/// operator who believes "strict" is actively enforcing something.
+///
+/// Informational only: never errors, never affects the exit code. Called
+/// from BOTH the fetch/lock gate (`apply_epoch_commitment_phase`) and
+/// `milpa verify`'s offline re-derivation
+/// (`reverify_cached_epoch_commitment_status`) — the same fact, the same
+/// wording, regardless of which command surfaced it.
+pub fn maybe_emit_no_epoch_armed_notice(policy: &TrustPolicy, status: &EpochCommitmentStatus) {
+    if *policy != TrustPolicy::Strict || !matches!(status, EpochCommitmentStatus::Unarmed) {
+        return;
+    }
+    let already_shown = NO_EPOCH_ARMED_NOTICE_SHOWN.with(|f| *f.borrow());
+    if already_shown {
+        return;
+    }
+    NO_EPOCH_ARMED_NOTICE_SHOWN.with(|f| *f.borrow_mut() = true);
+    eprintln!("{NO_EPOCH_ARMED_NOTICE}");
+}
+
 /// Static hints for results whose remediation text does not depend on
 /// `cause`/bundle-store backend. `BundleMissing` is deliberately absent —
 /// its hint is cause- and backend-dependent (see `bundle_missing_hint`, D6).
@@ -781,6 +830,38 @@ fn bundle_missing_hint(cause: Option<&str>, backend: Option<BundleStoreBackend>)
     }
 }
 
+/// `milpa verify`'s OWN `BundleMissing` remediation (RFC attestation-v1-
+/// normative.md §6 S5, D6/D12) — distinct from [`bundle_missing_hint`]'s
+/// fetch-path cause/backend split.
+///
+/// `verify` re-checks bundles already resident on disk and NEVER fetches
+/// (spec cli-contract.md §5.4). So a lockfile minted under the pre-flip
+/// `warn` default (or one whose bundle was never cached for any other
+/// reason) has nothing to re-verify — the ONLY recovery is to run `milpa
+/// fetch` first, which `verify` itself cannot do. Unlike the fetch path,
+/// this hint does NOT distinguish `cause == "no-pin"` from `"unfetchable"`
+/// (both reduce to the same "there is nothing cached here" fact from
+/// `verify`'s offline vantage point) — it DOES keep the operator-mirror
+/// split for [`BundleStoreBackend::File`] (air-gapped mirrors are populated
+/// by an operator, not by `milpa fetch`).
+fn verify_bundle_missing_hint(backend: Option<BundleStoreBackend>) -> String {
+    match backend {
+        Some(BundleStoreBackend::File) => {
+            "no cached attestation bundle for this entry, and 'milpa verify' \
+             never fetches. Ask the registry operator to populate \
+             MILPA_ENTRY_BUNDLE_DIR with this entry's bundle, then re-run \
+             'milpa verify'; or set 'entry-trust \"warn\"' in milpa.kdl to \
+             suppress."
+                .to_string()
+        }
+        _ => "no cached attestation bundle for this entry — 'milpa verify' only \
+              re-checks bundles already on disk and never fetches. Run 'milpa \
+              fetch' to acquire the bundle, then re-run 'milpa verify'; or set \
+              'entry-trust \"warn\"' in milpa.kdl to suppress."
+            .to_string(),
+    }
+}
+
 /// Pinned remediation prose keyed by epoch membership (RFC §6 S-EpochGate).
 ///
 /// `PostEpoch`: the mandate-context sentence a strict failure needs — WHY
@@ -822,6 +903,15 @@ fn epoch_membership_hint_suffix(membership: Option<EpochMembership>) -> &'static
 /// bytes from — passed through ONLY so a `BundleMissing` result can select
 /// the D6 cause × backend hint text (`bundle_missing_hint`); it has no
 /// bearing on any other result.
+///
+/// `verify_context` (RFC attestation-v1-normative.md §6 S5, D6/D12): `true`
+/// only when the caller is `milpa verify`'s offline reverify path (CLI
+/// `reverify_cached_entry_attestations`). Selects [`verify_bundle_missing_hint`]
+/// in place of [`bundle_missing_hint`] for a `BundleMissing` outcome —
+/// `verify` cannot self-heal a missing bundle (it never fetches), so its
+/// remediation is "run `milpa fetch`, then re-verify" rather than the fetch
+/// path's cause/backend-split hint. `false` for every other caller (the
+/// fetch/lock-path selection gate in `resolver.rs`).
 pub fn enforce_entry_trust(
     outcome: &EntryGateOutcome,
     policy: &TrustPolicy,
@@ -829,6 +919,7 @@ pub fn enforce_entry_trust(
     name: &str,
     version: &str,
     bundle_store: Option<&dyn EntryBundleStore>,
+    verify_context: bool,
 ) -> Result<(), MilpaError> {
     if *policy == TrustPolicy::Off || outcome.result == EntryVerificationResult::Trusted {
         return Ok(());
@@ -842,7 +933,11 @@ pub fn enforce_entry_trust(
     let slug = outcome.result.to_slug();
     let coordinate = format!("pkg:tianguis/{namespace}/{name}@{version}");
     let mut hint = if outcome.result == EntryVerificationResult::BundleMissing {
-        bundle_missing_hint(outcome.cause.as_deref(), bundle_store.map(|s| s.backend()))
+        if verify_context {
+            verify_bundle_missing_hint(bundle_store.map(|s| s.backend()))
+        } else {
+            bundle_missing_hint(outcome.cause.as_deref(), bundle_store.map(|s| s.backend()))
+        }
     } else {
         hint_for(outcome.result)
     };
@@ -865,6 +960,58 @@ pub fn enforce_entry_trust(
         eprintln!("milpa: entry-trust warning ({slug}): {hint} (entry: {coordinate:?})");
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// format_entry_trust_info — `show --entry-trust` observability (RFC
+// attestation-v1-normative.md §6 S5, R8/R10: minimal parity with `show
+// --index-trust`'s convention)
+// ---------------------------------------------------------------------------
+
+/// Format the `milpa show --entry-trust` observability output.
+///
+/// Fixed-width label block, SAME 16-character label convention as
+/// [`crate::index_trust::format_index_trust_info`] — byte-identical between
+/// the Rust and Python impls (see the Python counterpart
+/// `entry_trust.format_entry_trust_info`).
+///
+/// CLAIMS ONLY (mirrors `format_index_trust_info`'s discipline): the
+/// epoch-commitment row reports whether the CACHED index text carries an
+/// `attestation-epoch-commitment` pointer field — read straight off disk, no
+/// composed cryptographic verification. Actually classifying
+/// `Armed`/`ArmingInvalid` requires running that crypto, which is
+/// `fetch`/`lock`/`verify`'s job, not a passive `show` audit view's.
+///
+/// `policy` — the effective entry-trust policy (`warn` / `strict` / `off`).
+/// `index_url` — the registry entry-trust operates against.
+/// `epoch_commitment_pointer` — the raw `attestation-epoch-commitment` hex
+/// pointer read off the cached index text, or `None` when the field is
+/// absent (or nothing is cached yet).
+///
+/// Returns the formatted output string with a trailing newline.
+pub fn format_entry_trust_info(
+    policy: &str,
+    index_url: &str,
+    epoch_commitment_pointer: Option<&str>,
+) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    lines.push(format!("entry-trust:    {policy}"));
+    lines.push(format!("index-url:      {index_url}"));
+    match epoch_commitment_pointer {
+        Some(pointer) => {
+            let prefix = &pointer[..pointer.len().min(12)];
+            lines.push(format!(
+                "epoch-commit:   claimed ({prefix}...), cached claim only, not verified by show"
+            ));
+        }
+        None => {
+            lines.push(
+                "epoch-commit:   not armed (no attestation-epoch-commitment field on the cached index)"
+                    .to_string(),
+            );
+        }
+    }
+    lines.join("\n") + "\n"
 }
 
 // ---------------------------------------------------------------------------
@@ -1242,21 +1389,21 @@ mod tests {
     #[test]
     fn enforce_off_is_silent() {
         enforce_entry_trust(
-            &outcome(EntryVerificationResult::Unattested), &TrustPolicy::Off, "ns1", "bar", "2.0.0", None,
+            &outcome(EntryVerificationResult::Unattested), &TrustPolicy::Off, "ns1", "bar", "2.0.0", None, false,
         ).expect("off must never raise");
     }
 
     #[test]
     fn enforce_trusted_is_silent_even_under_strict() {
         enforce_entry_trust(
-            &outcome(EntryVerificationResult::Trusted), &TrustPolicy::Strict, "ns1", "bar", "2.0.0", None,
+            &outcome(EntryVerificationResult::Trusted), &TrustPolicy::Strict, "ns1", "bar", "2.0.0", None, false,
         ).expect("trusted must never raise");
     }
 
     #[test]
     fn enforce_strict_raises_slug() {
         let err = enforce_entry_trust(
-            &outcome(EntryVerificationResult::SignerMismatch), &TrustPolicy::Strict, "ns1", "bar", "2.0.0", None,
+            &outcome(EntryVerificationResult::SignerMismatch), &TrustPolicy::Strict, "ns1", "bar", "2.0.0", None, false,
         ).unwrap_err();
         assert_eq!(err.code(), "TNG-ENTRY-SIGNER-MISMATCH");
     }
@@ -1265,7 +1412,7 @@ mod tests {
     fn enforce_warn_never_raises() {
         _reset_warned_entries();
         enforce_entry_trust(
-            &outcome(EntryVerificationResult::Unattested), &TrustPolicy::Warn, "ns1", "warntest", "2.0.0", None,
+            &outcome(EntryVerificationResult::Unattested), &TrustPolicy::Warn, "ns1", "warntest", "2.0.0", None, false,
         ).expect("warn must not raise");
     }
 
@@ -1302,7 +1449,7 @@ mod tests {
     fn unattested_hint_recommends_warn_not_off() {
         _reset_warned_entries();
         enforce_entry_trust(
-            &outcome(EntryVerificationResult::Unattested), &TrustPolicy::Warn, "ns1", "foo", "1.0.0", None,
+            &outcome(EntryVerificationResult::Unattested), &TrustPolicy::Warn, "ns1", "foo", "1.0.0", None, false,
         ).unwrap();
         assert_eq!(hint_for(EntryVerificationResult::Unattested).contains("entry-trust \"warn\""), true);
         assert_eq!(hint_for(EntryVerificationResult::Unattested).contains("entry-trust \"off\""), false);
@@ -1356,6 +1503,7 @@ mod tests {
             "foo",
             "1.0.0",
             Some(store.as_ref()),
+            false,
         ).unwrap();
     }
 
@@ -1494,7 +1642,7 @@ mod tests {
             let outcome = evaluate_unattested(Some(EpochMembership::PostEpoch));
             assert_eq!(outcome.result, EntryVerificationResult::Unattested);
             assert_eq!(outcome.epoch_membership, Some(EpochMembership::PostEpoch));
-            let err = enforce_entry_trust(&outcome, &TrustPolicy::Strict, "ns1", "foo", "1.0.0", None).unwrap_err();
+            let err = enforce_entry_trust(&outcome, &TrustPolicy::Strict, "ns1", "foo", "1.0.0", None, false).unwrap_err();
             assert_eq!(err.code(), "TNG-ENTRY-UNATTESTED");
         }
 
@@ -1503,7 +1651,7 @@ mod tests {
             _reset_warned_entries();
             let outcome = evaluate_unattested(Some(EpochMembership::PreEpoch));
             assert_eq!(outcome.epoch_membership, Some(EpochMembership::PreEpoch));
-            enforce_entry_trust(&outcome, &TrustPolicy::Strict, "ns1", "foo", "1.0.0", None)
+            enforce_entry_trust(&outcome, &TrustPolicy::Strict, "ns1", "foo", "1.0.0", None, false)
                 .expect("PreEpoch must stay warn-territory even under strict");
         }
 
@@ -1512,14 +1660,14 @@ mod tests {
             _reset_warned_entries();
             let outcome = evaluate_unattested(None);
             assert_eq!(outcome.epoch_membership, None);
-            enforce_entry_trust(&outcome, &TrustPolicy::Strict, "ns1", "foo", "1.0.0", None)
+            enforce_entry_trust(&outcome, &TrustPolicy::Strict, "ns1", "foo", "1.0.0", None, false)
                 .expect("Unarmed must be warn-equivalent even under strict");
         }
 
         #[test]
         fn post_epoch_mandate_hint_is_pinned() {
             let outcome = evaluate_unattested(Some(EpochMembership::PostEpoch));
-            let err = enforce_entry_trust(&outcome, &TrustPolicy::Strict, "ns1", "foo", "1.0.0", None).unwrap_err();
+            let err = enforce_entry_trust(&outcome, &TrustPolicy::Strict, "ns1", "foo", "1.0.0", None, false).unwrap_err();
             let msg = err.message();
             assert!(msg.contains("not in the registry's committed pre-epoch set"), "{msg}");
             assert!(msg.contains("must carry a verifiable attestation"), "{msg}");
@@ -1545,7 +1693,7 @@ mod tests {
                     Some(&store), &TrustBundle::test(), "vendor-bot", &status_for(membership),
                 ).unwrap();
                 assert_eq!(outcome.result, EntryVerificationResult::Trusted);
-                enforce_entry_trust(&outcome, &TrustPolicy::Strict, "ns1", "foo", "1.0.0", None)
+                enforce_entry_trust(&outcome, &TrustPolicy::Strict, "ns1", "foo", "1.0.0", None, false)
                     .expect("Trusted must never raise/warn regardless of membership");
             }
         }
@@ -1555,7 +1703,7 @@ mod tests {
             for membership in [Some(EpochMembership::PreEpoch), Some(EpochMembership::PostEpoch), None] {
                 _reset_warned_entries();
                 let outcome = evaluate_unattested(membership);
-                enforce_entry_trust(&outcome, &TrustPolicy::Warn, "ns1", "foo", "1.0.0", None)
+                enforce_entry_trust(&outcome, &TrustPolicy::Warn, "ns1", "foo", "1.0.0", None, false)
                     .expect("warn must never raise");
             }
         }
@@ -1564,7 +1712,7 @@ mod tests {
         fn off_policy_never_raises_regardless_of_membership() {
             for membership in [Some(EpochMembership::PreEpoch), Some(EpochMembership::PostEpoch), None] {
                 let outcome = evaluate_unattested(membership);
-                enforce_entry_trust(&outcome, &TrustPolicy::Off, "ns1", "foo", "1.0.0", None)
+                enforce_entry_trust(&outcome, &TrustPolicy::Off, "ns1", "foo", "1.0.0", None, false)
                     .expect("off must never raise");
             }
         }
@@ -1676,6 +1824,7 @@ mod tests {
                 ENTRY_FIXTURE_NAME,
                 ENTRY_FIXTURE_VERSION,
                 None,
+                false,
             )
             .unwrap_err();
             assert_eq!(err.code(), "TNG-ENTRY-UNATTESTED");
@@ -1732,6 +1881,7 @@ mod tests {
                 ENTRY_FIXTURE_NAME,
                 ENTRY_FIXTURE_VERSION,
                 None,
+                false,
             )
             .unwrap_err();
             assert_eq!(err.code(), "TNG-ENTRY-SIGNER-MISMATCH");
@@ -1916,6 +2066,7 @@ mod tests {
                 ENTRY_FIXTURE_NAME,
                 ENTRY_FIXTURE_VERSION,
                 Some(&store),
+                false,
             )
             .unwrap_err();
             assert_eq!(err.code(), "TNG-ENTRY-BUNDLE-MISSING");
@@ -1947,7 +2098,7 @@ mod tests {
             assert_eq!(outcome.result, EntryVerificationResult::Unattested);
             assert_eq!(outcome.epoch_membership, Some(EpochMembership::PreEpoch));
 
-            enforce_entry_trust(&outcome, &TrustPolicy::Strict, "testns", "legacy-pkg", "0.9.0", None)
+            enforce_entry_trust(&outcome, &TrustPolicy::Strict, "testns", "legacy-pkg", "0.9.0", None, false)
                 .expect("pre-epoch legacy unattested must stay warn-territory even under strict");
         }
 
@@ -1982,6 +2133,153 @@ mod tests {
                 Some(EpochMembership::PostEpoch),
                 "a non-member identity must classify PostEpoch regardless of when it was \
                  published — membership is set-only (D17), not a published_at comparison"
+            );
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // S5 (RFC attestation-v1-normative.md §6 S5): verify's own
+    // BUNDLE-MISSING hint, the no-epoch-armed notice, and
+    // format_entry_trust_info.
+    // -------------------------------------------------------------------
+    mod s5_verify_reconciliation {
+        use super::*;
+
+        #[test]
+        fn verify_bundle_missing_hint_file_backend_names_the_operator_mirror() {
+            let hint = verify_bundle_missing_hint(Some(BundleStoreBackend::File));
+            assert_eq!(
+                hint,
+                "no cached attestation bundle for this entry, and 'milpa verify' \
+                 never fetches. Ask the registry operator to populate \
+                 MILPA_ENTRY_BUNDLE_DIR with this entry's bundle, then re-run \
+                 'milpa verify'; or set 'entry-trust \"warn\"' in milpa.kdl to \
+                 suppress."
+            );
+        }
+
+        #[test]
+        fn verify_bundle_missing_hint_http_backend_says_run_fetch_then_verify() {
+            let hint = verify_bundle_missing_hint(Some(BundleStoreBackend::Http));
+            assert_eq!(
+                hint,
+                "no cached attestation bundle for this entry — 'milpa verify' only \
+                 re-checks bundles already on disk and never fetches. Run 'milpa \
+                 fetch' to acquire the bundle, then re-run 'milpa verify'; or set \
+                 'entry-trust \"warn\"' in milpa.kdl to suppress."
+            );
+        }
+
+        #[test]
+        fn verify_bundle_missing_hint_no_store_matches_http_wording() {
+            // Deliberately not split further than File-vs-everything-else:
+            // from verify's offline vantage point, no-store-configured and an
+            // unreachable HTTP mirror reduce to the same "nothing cached here" fact.
+            assert_eq!(verify_bundle_missing_hint(None), verify_bundle_missing_hint(Some(BundleStoreBackend::Http)));
+        }
+
+        #[test]
+        fn enforce_entry_trust_verify_context_selects_verify_hint() {
+            _reset_warned_entries();
+            let outcome = EntryGateOutcome {
+                result: EntryVerificationResult::BundleMissing,
+                // PostEpoch so the strict mandate applies (Unarmed/None would
+                // downgrade to warn-equivalent per effective_epoch_policy, and
+                // enforce would not raise).
+                epoch_membership: Some(EpochMembership::PostEpoch),
+                cause: Some("unfetchable".to_string()),
+            };
+            let err = enforce_entry_trust(&outcome, &TrustPolicy::Strict, "ns1", "foo", "1.0.0", None, true)
+                .unwrap_err();
+            let msg = err.message();
+            assert!(msg.contains("'milpa verify' only"), "{msg}");
+            assert!(!msg.contains("re-run 'milpa fetch'"), "{msg}");
+        }
+
+        #[test]
+        fn enforce_entry_trust_fetch_context_selects_fetch_hint() {
+            _reset_warned_entries();
+            let outcome = EntryGateOutcome {
+                result: EntryVerificationResult::BundleMissing,
+                // PostEpoch so the strict mandate applies (see the verify-context test).
+                epoch_membership: Some(EpochMembership::PostEpoch),
+                cause: Some("unfetchable".to_string()),
+            };
+            let err = enforce_entry_trust(&outcome, &TrustPolicy::Strict, "ns1", "foo", "1.0.0", None, false)
+                .unwrap_err();
+            let msg = err.message();
+            assert!(msg.contains("no attestation-bundle source is configured"), "{msg}");
+            assert!(!msg.contains("'milpa verify' only"), "{msg}");
+        }
+
+        #[test]
+        fn no_epoch_armed_notice_fires_when_strict_and_unarmed() {
+            _reset_no_epoch_armed_notice();
+            let shown_before = NO_EPOCH_ARMED_NOTICE_SHOWN.with(|f| *f.borrow());
+            assert!(!shown_before);
+            maybe_emit_no_epoch_armed_notice(&TrustPolicy::Strict, &EpochCommitmentStatus::Unarmed);
+            let shown_after = NO_EPOCH_ARMED_NOTICE_SHOWN.with(|f| *f.borrow());
+            assert!(shown_after);
+        }
+
+        #[test]
+        fn no_epoch_armed_notice_silent_under_warn() {
+            _reset_no_epoch_armed_notice();
+            maybe_emit_no_epoch_armed_notice(&TrustPolicy::Warn, &EpochCommitmentStatus::Unarmed);
+            let shown = NO_EPOCH_ARMED_NOTICE_SHOWN.with(|f| *f.borrow());
+            assert!(!shown, "warn policy must never arm the notice — only strict does");
+        }
+
+        #[test]
+        fn no_epoch_armed_notice_silent_when_armed() {
+            _reset_no_epoch_armed_notice();
+            let status = EpochCommitmentStatus::Armed {
+                identities: std::collections::HashSet::new(),
+                integrated_time: 1_700_000_000,
+            };
+            maybe_emit_no_epoch_armed_notice(&TrustPolicy::Strict, &status);
+            let shown = NO_EPOCH_ARMED_NOTICE_SHOWN.with(|f| *f.borrow());
+            assert!(!shown, "an Armed status must never arm the notice — only Unarmed does");
+        }
+
+        #[test]
+        fn no_epoch_armed_notice_fires_only_once_per_invocation() {
+            _reset_no_epoch_armed_notice();
+            maybe_emit_no_epoch_armed_notice(&TrustPolicy::Strict, &EpochCommitmentStatus::Unarmed);
+            // Reset only clears the assertion vantage point below, not the flag itself —
+            // calling again without resetting must be a no-op (dedup holds).
+            let shown_first = NO_EPOCH_ARMED_NOTICE_SHOWN.with(|f| *f.borrow());
+            assert!(shown_first);
+            // A second call (still armed+strict) must not panic or change state —
+            // the dedup flag is already set, so this is purely a no-op smoke check.
+            maybe_emit_no_epoch_armed_notice(&TrustPolicy::Strict, &EpochCommitmentStatus::Unarmed);
+            let shown_second = NO_EPOCH_ARMED_NOTICE_SHOWN.with(|f| *f.borrow());
+            assert!(shown_second);
+        }
+
+        #[test]
+        fn format_entry_trust_info_not_armed() {
+            let output = format_entry_trust_info("strict", "https://example.com/index.kdl", None);
+            assert_eq!(
+                output,
+                "entry-trust:    strict\n\
+                 index-url:      https://example.com/index.kdl\n\
+                 epoch-commit:   not armed (no attestation-epoch-commitment field on the cached index)\n"
+            );
+        }
+
+        #[test]
+        fn format_entry_trust_info_claimed_armed() {
+            let pointer = "a".repeat(64);
+            let output = format_entry_trust_info("strict", "https://example.com/index.kdl", Some(&pointer));
+            assert_eq!(
+                output,
+                format!(
+                    "entry-trust:    strict\n\
+                     index-url:      https://example.com/index.kdl\n\
+                     epoch-commit:   claimed ({}...), cached claim only, not verified by show\n",
+                    &pointer[..12]
+                )
             );
         }
     }

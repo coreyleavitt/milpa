@@ -115,7 +115,7 @@ import sys as _sys
 from typing import Any, Protocol
 
 from milpa import identity
-from milpa.epoch_commitment import Armed, EpochCommitmentStatus, PreEpochIdentity
+from milpa.epoch_commitment import Armed, EpochCommitmentStatus, PreEpochIdentity, Unarmed
 from milpa.errors import (
     TNG_ENTRY_BUNDLE_MALFORMED,
     TNG_ENTRY_BUNDLE_MISSING,
@@ -667,6 +667,62 @@ def _reset_warned_entries() -> None:
     _warned_entries.clear()
 
 
+# ---------------------------------------------------------------------------
+# no-epoch-armed observability notice (Dsgn-H2, RFC attestation-v1-
+# normative.md §6 S5, round-3 addition (ii))
+# ---------------------------------------------------------------------------
+
+#: The literal notice text (RFC S5): deliberately audience-agnostic (br10) —
+#: the SAME ``Unarmed`` state means "attestation is rolling out" to a
+#: flagship-registry consumer mid-migration and "this registry does not
+#: attest" to a self-hosted/air-gapped operator who never plans to; milpa has
+#: no signal to distinguish the two (both present as an absent field), so the
+#: notice states the mechanical fact and names both readings.
+NO_EPOCH_ARMED_NOTICE = (
+    'milpa: entry-trust is "strict", but this registry has not armed a '
+    "pre-epoch commitment — no entry is currently mandated to carry an "
+    "attestation (every entry is treated as warn-equivalent). If this "
+    "registry is rolling out attestation, this is expected until it arms an "
+    'epoch; if this registry does not attest at all, "strict" enforces '
+    "nothing here until it does."
+)
+
+#: Dedup flag: at most one no-epoch-armed notice per invocation (mirrors
+#: ``_warned_entries``'s per-invocation dedup discipline), regardless of how
+#: many registries/candidates are classified ``Unarmed`` this run.
+_no_epoch_armed_notice_shown = False
+
+
+def _reset_no_epoch_armed_notice() -> None:
+    """Clear the once-per-invocation no-epoch-armed notice flag.  TEST USE ONLY."""
+    global _no_epoch_armed_notice_shown
+    _no_epoch_armed_notice_shown = False
+
+
+def maybe_emit_no_epoch_armed_notice(
+    policy: TrustPolicy, status: "EpochCommitmentStatus"
+) -> None:
+    """Emit ``NO_EPOCH_ARMED_NOTICE`` to stderr, once per invocation, when
+    effective entry-trust is ``"strict"`` but the loaded index carries no
+    epoch commitment (``Unarmed``) — otherwise strict silently degrades to
+    warn-equivalent (D11) with zero signal, a false-confidence gap for an
+    operator who believes "strict" is actively enforcing something.
+
+    Informational only: never raises, never affects the exit code. Called
+    from BOTH the fetch/lock gate (``_enforce_epoch_commitment_phase``) and
+    ``milpa verify``'s offline re-derivation
+    (``reverify_cached_epoch_commitment_status``) — the same fact, the same
+    wording, regardless of which command surfaced it.
+    """
+    global _no_epoch_armed_notice_shown
+    if policy != "strict" or not isinstance(status, Unarmed):
+        return
+    if _no_epoch_armed_notice_shown:
+        return
+    _no_epoch_armed_notice_shown = True
+    print(NO_EPOCH_ARMED_NOTICE, file=_sys.stderr)
+
+
 #: Static hints for results whose remediation text does not depend on
 #: ``cause``/bundle-store backend. ``BundleMissing`` is deliberately absent —
 #: its hint is cause- and backend-dependent (see ``_bundle_missing_hint``,
@@ -749,6 +805,40 @@ def _bundle_missing_hint(cause: "str | None", bundle_store: "object | None") -> 
     )
 
 
+def _verify_bundle_missing_hint(cause: "str | None", bundle_store: "object | None") -> str:
+    """``milpa verify``'s OWN ``BundleMissing`` remediation (RFC
+    attestation-v1-normative.md §6 S5, D6/D12) — distinct from
+    ``_bundle_missing_hint``'s fetch-path cause/backend split.
+
+    ``verify`` re-checks bundles already resident on disk and NEVER fetches
+    (spec cli-contract.md §5.4). So a lockfile minted under the pre-flip
+    ``warn`` default (or one whose bundle was never cached for any other
+    reason) has nothing to re-verify — the ONLY recovery is to run `milpa
+    fetch` first, which `verify` itself cannot do. Unlike the fetch path,
+    this hint does NOT distinguish `no-pin` from `unfetchable` (both reduce
+    to the same "there is nothing cached here" fact from `verify`'s offline
+    vantage point) — it DOES keep the operator-mirror split for
+    ``FileEntryBundleStore`` (air-gapped mirrors are populated by an
+    operator, not by `milpa fetch`).
+    """
+    from milpa.entry_bundle_store import FileEntryBundleStore
+
+    if isinstance(bundle_store, FileEntryBundleStore):
+        return (
+            "no cached attestation bundle for this entry, and 'milpa verify' "
+            "never fetches. Ask the registry operator to populate "
+            "MILPA_ENTRY_BUNDLE_DIR with this entry's bundle, then re-run "
+            "'milpa verify'; or set 'entry-trust \"warn\"' in milpa.kdl to "
+            "suppress."
+        )
+    return (
+        "no cached attestation bundle for this entry — 'milpa verify' only "
+        "re-checks bundles already on disk and never fetches. Run 'milpa "
+        "fetch' to acquire the bundle, then re-run 'milpa verify'; or set "
+        "'entry-trust \"warn\"' in milpa.kdl to suppress."
+    )
+
+
 def _epoch_membership_hint_suffix(membership: "EpochMembership | None") -> str:
     """Pinned remediation prose keyed by epoch membership (RFC §6 S-EpochGate).
 
@@ -781,6 +871,7 @@ def enforce_entry_trust(
     name: str,
     version: str,
     bundle_store: "object | None" = None,
+    verify_context: bool = False,
 ) -> None:
     """warn/strict slug dispatch for one selected entry's gate outcome (D9).
 
@@ -801,6 +892,14 @@ def enforce_entry_trust(
     (or failed to acquire bytes) from — passed through ONLY so a
     ``BundleMissing`` result can select the D6 cause × backend hint text
     (``_bundle_missing_hint``); it has no bearing on any other result.
+
+    ``verify_context`` (RFC attestation-v1-normative.md §6 S5, D6/D12):
+    ``True`` only when the caller is ``milpa verify``'s offline reverify path
+    (``_reverify_cached_entry_attestations``). Selects
+    ``_verify_bundle_missing_hint`` in place of ``_bundle_missing_hint`` for a
+    ``BundleMissing`` outcome — ``verify`` cannot self-heal a missing bundle
+    (it never fetches), so its remediation is "run `milpa fetch`, then
+    re-verify" rather than the fetch path's cause/backend-split hint.
     """
     if policy == "off" or outcome.result is Trusted:
         return
@@ -811,11 +910,14 @@ def enforce_entry_trust(
 
     slug = result_to_slug(outcome.result)
     coordinate = f"pkg:tianguis/{namespace}/{name}@{version}"
-    hint = (
-        _bundle_missing_hint(outcome.cause, bundle_store)
-        if outcome.result is BundleMissing
-        else _HINT_MAP[outcome.result]
-    )
+    if outcome.result is BundleMissing:
+        hint = (
+            _verify_bundle_missing_hint(outcome.cause, bundle_store)
+            if verify_context
+            else _bundle_missing_hint(outcome.cause, bundle_store)
+        )
+    else:
+        hint = _HINT_MAP[outcome.result]
     if outcome.cause is not None:
         hint = f"{hint} (cause: {outcome.cause})"
     hint = f"{hint}{_epoch_membership_hint_suffix(outcome.epoch_membership)}"
@@ -837,3 +939,62 @@ def enforce_entry_trust(
             f"milpa: entry-trust warning ({slug}): {hint} (entry: {coordinate!r})",
             file=_sys.stderr,
         )
+
+
+# ---------------------------------------------------------------------------
+# format_entry_trust_info — `show --entry-trust` observability (RFC
+# attestation-v1-normative.md §6 S5, R8/R10: minimal parity with `show
+# --index-trust`'s convention)
+# ---------------------------------------------------------------------------
+
+
+def format_entry_trust_info(
+    *,
+    policy: str,
+    index_url: str,
+    epoch_commitment_pointer: "str | None",
+) -> str:
+    """Format the ``milpa show --entry-trust`` observability output.
+
+    Fixed-width label block, SAME 16-character label convention as
+    ``index_trust.format_index_trust_info`` — byte-identical between the
+    Python and Rust impls (see the Rust counterpart
+    ``milpa_core::entry_trust::format_entry_trust_info``).
+
+    CLAIMS ONLY (mirrors ``format_index_trust_info``'s discipline): the
+    epoch-commitment row reports whether the CACHED index text carries an
+    ``attestation-epoch-commitment`` pointer field — read straight off disk,
+    no composed cryptographic verification. Actually classifying
+    ``Armed``/``ArmingInvalid`` requires running that crypto, which is
+    `fetch`/`lock`/`verify`'s job, not a passive `show` audit view's.
+
+    Parameters
+    ----------
+    policy:
+        The effective entry-trust policy (``warn`` / ``strict`` / ``off``).
+    index_url:
+        The registry entry-trust operates against.
+    epoch_commitment_pointer:
+        The raw ``attestation-epoch-commitment`` hex pointer read off the
+        cached index text, or ``None`` when the field is absent (or nothing
+        is cached yet).
+
+    Returns
+    -------
+    str
+        The formatted output string with a trailing newline.
+    """
+    lines: list[str] = []
+    lines.append(f"entry-trust:    {policy}")
+    lines.append(f"index-url:      {index_url}")
+    if epoch_commitment_pointer is not None:
+        lines.append(
+            f"epoch-commit:   claimed ({epoch_commitment_pointer[:12]}...), "
+            "cached claim only, not verified by show"
+        )
+    else:
+        lines.append(
+            "epoch-commit:   not armed (no attestation-epoch-commitment "
+            "field on the cached index)"
+        )
+    return "\n".join(lines) + "\n"

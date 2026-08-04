@@ -77,7 +77,7 @@ from urllib.parse import urlparse, urlunparse
 
 from milpa.atomic_cache import atomic_write_bytes as _atomic_write_bytes
 from milpa.atomic_cache import unique_temp_path as _unique_temp_path
-from milpa.errors import MILPA_INDEX_UNREACHABLE, MilpaError
+from milpa.errors import MILPA_INDEX_UNREACHABLE, MILPA_INTERNAL, MilpaError
 
 if TYPE_CHECKING:
     from milpa.epoch_commitment import EpochCommitmentStatus
@@ -623,6 +623,68 @@ def load_epoch_commitment_status(
             _atomic_write_bytes(cache_path, sidecar_bytes)
 
     return status
+
+
+def _offline_epoch_commitment_http_get(url: str) -> bytes:
+    """Poisoned transport for ``reverify_cached_epoch_commitment_status`` —
+    ``milpa verify`` must never fetch (spec cli-contract.md §5.4), so any
+    attempt to reach this on a cache miss is itself the offline-invariant
+    violation; raising turns that cache miss into ``fetch_failed=True`` (→
+    ``ArmingInvalid``, D14's fail-closed posture) rather than a real
+    network call."""
+    raise MilpaError(
+        MILPA_INTERNAL,
+        f"milpa verify must never fetch the epoch-commitment sidecar over "
+        f"the network (attempted for {url!r}); this is an offline-invariant "
+        f"bug, not a runtime condition a user can hit.",
+    )
+
+
+def reverify_cached_epoch_commitment_status(
+    *,
+    index_url: str,
+    verifier: "IndexBundleVerifier",
+    trust_bundle: "TrustBundle",
+    expected_signer: str,
+    index_cache_dir: "Path | None" = None,
+    epoch_cache_dir: "Path | None" = None,
+) -> "EpochCommitmentStatus":
+    """Re-derive ``EpochCommitmentStatus`` from the PINNED LOCAL cache,
+    fully offline — ``milpa verify``'s epoch-commitment counterpart to
+    ``reverify_cached_index`` (RFC attestation-v1-normative.md §6 S5,
+    round-3 addition (i)).
+
+    ``verify`` RE-DERIVES membership rather than trusting a lock-time claim
+    (RECOMMENDED reading of the round-3 fork): the composed-verification
+    pipeline is pure and cache-only here, so re-running it is idempotent and
+    safe, and it reflects the CURRENT local index snapshot — not whatever
+    was true when the lockfile was written. Concretely: if the cached index
+    was replaced by a newer ``fetch`` between ``lock`` and ``verify`` (a
+    re-arm, or the commitment simply was not cached yet at lock time), this
+    function reports the status implied by what is on disk NOW, not the
+    lockfile's stale claim (see the M1 regression test).
+
+    Reads the ``attestation-epoch-commitment`` pointer off the CACHED index
+    text (never re-fetches the index itself — that is ``milpa fetch``'s
+    job), then re-runs the SAME composed-verification pipeline
+    ``load_epoch_commitment_status`` uses, with the network transport
+    poisoned (``_offline_epoch_commitment_http_get``): a cache hit for the
+    commitment sidecar verifies exactly as it would at lock time; a cache
+    miss (pointer present, sidecar never cached) fails closed as
+    ``ArmingInvalid`` rather than attempting to fetch — mirroring
+    ``reverify_cached_index``'s "missing cached bundle -> BundleMissing,
+    never fetched" posture for the whole-index axis.
+    """
+    pointer = read_cached_epoch_commitment_pointer(index_url, index_cache_dir)
+    return load_epoch_commitment_status(
+        index_url=index_url,
+        pointer=pointer,
+        cache_dir=epoch_cache_dir,
+        http_get=_offline_epoch_commitment_http_get,
+        verifier=verifier,
+        trust_bundle=trust_bundle,
+        expected_signer=expected_signer,
+    )
 
 
 # ---------------------------------------------------------------------------

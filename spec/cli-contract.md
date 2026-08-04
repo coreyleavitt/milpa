@@ -625,9 +625,9 @@ present by default; there is no flag to enable it.
 > error messages) MUST be written to **stderr**.
 
 > NORMATIVE: Machine-readable output — the dep tree printed by `milpa show`,
-> the observability block printed by `show --index-trust` (§5.3a), and the
-> status/diff block printed by `milpa index status` / `milpa index accept`
-> (§5.12) — MUST be written to **stdout**.
+> the observability block printed by `show --index-trust` (§5.3a) or `show
+> --entry-trust` (§5.3b), and the status/diff block printed by `milpa index
+> status` / `milpa index accept` (§5.12) — MUST be written to **stdout**.
 
 > NORMATIVE: Verbs that produce no machine-readable output (`fetch`,
 > `lock`, `verify`, `clean`, `add`, `remove`, `update`) MUST produce
@@ -915,6 +915,54 @@ bundle), `fixture-358` (index cached, no bundle).
 
 **stderr:** empty.
 
+### 5.3b  `show --entry-trust`
+
+**Purpose:** Print the effective entry-trust policy and whether the cached
+index CLAIMS an epoch commitment is armed — no cryptographic verification,
+no network access. A minimal observability counterpart to `show
+--index-trust` (`rfc-attestation-v1-normative.md` §6 S5, R8/R10).
+
+**Arguments:** `--entry-trust` flag on the `show` subcommand.
+
+**Global flags used:** `-C` (used to resolve the manifest's entry-trust
+declaration; the index state itself is read from the XDG/env-derived cache
+like §5.3a).
+
+> NORMATIVE: `show --entry-trust` MUST:
+> - Print the effective entry-trust policy string (`warn`, `strict`, or
+>   `off`) as `entry-trust:` in the output block, resolved the SAME way the
+>   entry-trust gate resolves it (manifest + `MILPA_ENTRY_TRUST`; the CLI
+>   escalation flag is never consulted by `show`, mirroring §5.3a's
+>   `index-trust` treatment).
+> - Print the configured index URL as `index-url:`.
+> - Report whether the CACHED index text carries an
+>   `attestation-epoch-commitment` pointer field as `epoch-commit:` —
+>   `claimed (<pointer prefix>...)` when present, or `not armed` when
+>   absent (or nothing is cached). This is a CLAIM read straight off the
+>   cached bytes; `show` MUST NOT run the composed cryptographic
+>   verification that would classify the commitment as `Armed` /
+>   `ArmingInvalid` (that is `fetch`/`lock`/`verify`'s job, per §3.4.8 of
+>   `spec/registry-protocol.md` — mirrors §5.3a's "claims only" discipline
+>   for the whole-index bundle).
+> - Produce output that is byte-identical between all conformant
+>   implementations.
+
+> NORMATIVE: The output format uses the SAME fixed 16-character
+> label+colon column convention as §5.3a:
+>
+> ```
+> entry-trust:    <warn|strict|off>
+> index-url:      <url>
+> epoch-commit:   <claimed (<pointer prefix>...), cached claim only, not verified by show>
+>                 | <not armed (no attestation-epoch-commitment field on the cached index)>
+> ```
+
+**Exit codes:** 0 always.
+
+**stdout:** the fixed-format observability block (above).
+
+**stderr:** empty.
+
 ### 5.4  `verify`
 
 **Purpose:** Recheck every dep in `_deps/` against `milpa.lock` using
@@ -933,6 +981,60 @@ content hashes. Does not fetch.
 >   to stderr and exit 0.
 > - If any divergence is found, print every divergence to stderr and
 >   exit 1.
+
+> NORMATIVE (`rfc-attestation-v1-normative.md` §6 S5, R10): `verify` MUST
+> re-verify the cached attestation state on **both** trust axes, offline,
+> in crypto-only mode — it re-checks bytes already resident on disk and
+> MUST NOT fetch (`spec/registry-protocol.md` §3.4.1's "`verify` invokes
+> the gate in crypto-only mode, offline" applies to both index-trust and
+> entry-trust, not index-trust alone):
+>
+> - **Index axis:** re-verify the cached `index.kdl` + `index.kdl.bundle`
+>   under the effective `index-trust` policy (`TNG-INDEX-*` outcomes,
+>   `spec/registry-protocol.md` §3.4), AND re-derive the
+>   `EpochCommitmentStatus` from the cached `attestation-epoch-commitment`
+>   pointer + its content-addressed sidecar (`TNG-INDEX-EPOCH-COMMITMENT-
+>   INVALID` on `ArmingInvalid`) — a pointer present in the cached index
+>   text with no cached sidecar fails closed as `ArmingInvalid` rather than
+>   being fetched.
+> - **Entry axis:** for every locked dep carrying an `attestation` block,
+>   re-verify the cached per-entry bundle under the effective `entry-trust`
+>   policy (`TNG-ENTRY-*` outcomes). `EpochMembership` MUST be RE-DERIVED
+>   from the `EpochCommitmentStatus` the index axis just computed THIS
+>   invocation from the pinned local cache — never trusted from a stale
+>   lock-time claim (the lockfile schema records no membership field to
+>   begin with, `spec/lockfile-schema.md` §3.9). Concretely: if the cached
+>   index was replaced by a newer `fetch` between `lock` and `verify` (a
+>   registry re-arm, or first arming), `verify`'s classification MUST
+>   reflect the CURRENT local cache, not whatever was true when the
+>   lockfile was written.
+>
+> `verify` carries its OWN `TNG-ENTRY-BUNDLE-MISSING` remediation, DISTINCT
+> from the `fetch`-path cause/backend-split hint
+> (`spec/registry-protocol.md` §3.6, D6): because `verify` never fetches,
+> it cannot self-heal a missing bundle — a lockfile minted under the
+> pre-flip `warn` default (or any lockfile whose bundle was never cached)
+> has nothing to re-check. The hint MUST name running `milpa fetch` to
+> acquire the bundle, then re-running `verify` (this is the concrete
+> migration break real users hit against an existing lockfile the first
+> time they run `verify` post-flip).
+>
+> NORMATIVE (Dsgn-H2, no-epoch-armed notice): when the effective
+> `entry-trust` policy is `strict` but the re-derived `EpochCommitmentStatus`
+> is `Unarmed`, `verify` MUST print a one-time informational notice to
+> stderr (exit code unaffected) — otherwise `strict` silently degrades to
+> warn-equivalent (`spec/registry-protocol.md` §3.6's D11 grace) with zero
+> signal. The SAME notice, with the SAME wording, MUST also be printed by
+> `fetch`/`lock` when they compute an `Unarmed` status under an effective
+> `strict` entry-trust policy — this is a fact about the registry
+> configuration, not something specific to the `verify` verb. The notice
+> text MUST be usable by BOTH of its real audiences without milpa knowing
+> which applies: a flagship-registry consumer mid-migration (attestation is
+> rolling out, this is expected until the registry arms an epoch) and a
+> self-hosted/air-gapped operator who never plans to adopt attestation
+> (`strict` enforces nothing here until the registry does) — both present
+> identically as `Unarmed`, so the notice states the mechanical fact and
+> names both readings rather than guessing.
 
 > NORMATIVE: If `milpa.lock` does not exist, `verify` MUST print a
 > diagnostic to stderr and exit 1. If `_deps/` does not exist, `verify`
@@ -974,7 +1076,13 @@ missing lockfile, or missing `_deps/`).
 **stdout:** none.
 
 **stderr:** `verified N deps` on success; divergence list on failure;
-local-source drift warnings are printed regardless of exit code.
+local-source drift warnings are printed regardless of exit code. When
+entry-trust attestations were re-verified this run, an additional
+`entry-trust: N attestation(s) verified this run` line reports the
+same-invocation count of `Trusted` outcomes — the ONLY place `verify` (or
+any other verb) ever uses "verified" wording for an attestation claim,
+distinct from `show`'s permanent "claims" wording for a cold lockfile read
+(`spec/lockfile-schema.md` §3.9 NOTE, D12).
 
 ### 5.5  `clean`
 

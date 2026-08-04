@@ -455,6 +455,17 @@ def _make_parser() -> argparse.ArgumentParser:
             "spec/cli-contract.md §5.3a."
         ),
     )
+    sp_show.add_argument(
+        "--entry-trust",
+        action="store_true",
+        default=False,
+        dest="entry_trust",
+        help=(
+            "print entry-trust observability: effective policy and the "
+            "cached index's claimed epoch-commitment arming state (no "
+            "verification — claims only). spec/cli-contract.md §5.3a."
+        ),
+    )
 
     # verify
     subparsers.add_parser(
@@ -1382,7 +1393,6 @@ def _apply_epoch_commitment_phase(
             ``index-history=strict``).
     """
     from milpa.epoch_commitment import (
-        DEFAULT_REARM_SIGNER,
         check_epoch_ratchet_requirement,
         enforce_epoch_commitment,
     )
@@ -1391,16 +1401,52 @@ def _apply_epoch_commitment_phase(
         load_epoch_commitment_status,
         read_cached_epoch_commitment_pointer,
     )
-    from milpa.index_trust import MockVerifier, SigstoreVerifier, VerificationResult
 
     index_url = index_url_from_env()
     pointer = read_cached_epoch_commitment_pointer(index_url)
 
-    # Verifier: MockVerifier from the conformance seam (mirrors
-    # MILPA_INDEX_TRUST_MOCK_VERIFIER's file://-only guard exactly), else
-    # SigstoreVerifier — the SAME production class index-trust uses (see
-    # epoch_commitment.py's "Composed verification reuse" for why this is
-    # safe: only expected_signer differs).
+    # Verifier + re-arm signer: the SAME construction ``milpa verify``'s
+    # offline re-derivation uses (``_build_epoch_commitment_verifier`` —
+    # extracted in RFC attestation-v1-normative.md §6 S5 to avoid a second
+    # hand-rolled copy of the mock/production dispatch).
+    verifier, expected_signer = _build_epoch_commitment_verifier(index_url)
+
+    status = load_epoch_commitment_status(
+        index_url=index_url,
+        pointer=pointer,
+        verifier=verifier,
+        trust_bundle=index_trust_config.trust_bundle,  # type: ignore[attr-defined]
+        expected_signer=expected_signer,
+    )
+    index.epoch_commitment_status = status  # type: ignore[attr-defined]
+
+    enforce_epoch_commitment(status)
+
+    entry_trust_policy = _effective_entry_trust_policy(env, project_dir)
+    check_epoch_ratchet_requirement(
+        status,
+        entry_trust_policy=entry_trust_policy,
+        index_history_policy=index_history_policy,
+    )
+
+    # Dsgn-H2 (RFC attestation-v1-normative.md §6 S5): informational, never
+    # gates the resolve — see maybe_emit_no_epoch_armed_notice's docstring.
+    from milpa.entry_trust import maybe_emit_no_epoch_armed_notice
+
+    maybe_emit_no_epoch_armed_notice(entry_trust_policy, status)
+
+
+def _build_epoch_commitment_verifier(index_url: str) -> "tuple[object, str]":
+    """``(verifier, expected_signer)`` for the epoch-commitment phase — the
+    SAME construction ``_apply_epoch_commitment_phase`` uses (extracted so
+    ``milpa verify``'s offline re-derivation, RFC attestation-v1-normative.md
+    §6 S5, builds the identical mock/production verifier and re-arm signer
+    rather than a second hand-rolled copy). ``index_url`` MUST be the already
+    three-way-resolved URL (``index_url_from_env()``), matching the guard
+    ``_apply_epoch_commitment_phase`` enforces."""
+    from milpa.epoch_commitment import DEFAULT_REARM_SIGNER
+    from milpa.index_trust import MockVerifier, SigstoreVerifier, VerificationResult
+
     _MOCK_MAP = {
         "trusted": VerificationResult.TRUSTED,
         "sig-invalid": VerificationResult.SIG_INVALID,
@@ -1433,34 +1479,15 @@ def _apply_epoch_commitment_phase(
     else:
         verifier = SigstoreVerifier()
 
-    # Signer: a DEDICATED re-arm identity (D15), overridable independently
-    # of the whole-index signer (MILPA_INDEX_TRUST_SIGNER is NOT reused here
-    # on purpose). No manifest-node override exists yet (env-only for this
-    # slice) — a natural follow-up, not a trust-default change.
     expected_signer = (
         os.environ.get("MILPA_INDEX_EPOCH_SIGNER", "").strip() or DEFAULT_REARM_SIGNER
     )
-
-    status = load_epoch_commitment_status(
-        index_url=index_url,
-        pointer=pointer,
-        verifier=verifier,
-        trust_bundle=index_trust_config.trust_bundle,  # type: ignore[attr-defined]
-        expected_signer=expected_signer,
-    )
-    index.epoch_commitment_status = status  # type: ignore[attr-defined]
-
-    enforce_epoch_commitment(status)
-
-    entry_trust_policy = _effective_entry_trust_policy(env, project_dir)
-    check_epoch_ratchet_requirement(
-        status,
-        entry_trust_policy=entry_trust_policy,
-        index_history_policy=index_history_policy,
-    )
+    return verifier, expected_signer
 
 
-def _reverify_cached_index_bundle(env: MilpaEnv, project_dir: "Path | None") -> None:
+def _reverify_cached_index_bundle(
+    env: MilpaEnv, project_dir: "Path | None"
+) -> "object | None":
     """Sv: re-verify the CACHED index attestation bundle offline (never fetches).
 
     Builds the same ``IndexTrustConfig`` + verifier as index loading, then re-runs
@@ -1469,27 +1496,57 @@ def _reverify_cached_index_bundle(env: MilpaEnv, project_dir: "Path | None") -> 
     ``MILPA_INDEX_URL``), when the effective policy is ``off``, or when nothing is
     cached. A failing cached bundle raises the mapped ``TNG-INDEX-*`` slug under
     ``strict`` (warns under ``warn``).
+
+    RFC attestation-v1-normative.md §6 S5, round-3 addition (i): ALSO
+    re-derives ``EpochCommitmentStatus`` from the pinned local cache (never
+    fetches — ``reverify_cached_epoch_commitment_status``), enforces
+    ``TNG-INDEX-EPOCH-COMMITMENT-INVALID`` on ``ArmingInvalid`` (the
+    epoch-commitment phase is index-scoped, R4: it strictly precedes
+    entry-trust), and returns the derived status so the caller
+    (``cmd_verify``) can thread it into
+    ``_reverify_cached_entry_attestations`` for membership re-derivation —
+    computed ONCE per invocation rather than twice. Returns ``None`` when
+    index-trust is inactive for this invocation (no index configured, or
+    effective policy ``off``) — the caller falls back to treating epoch
+    status as ``Unarmed``.
     """
+    from milpa.epoch_commitment import enforce_epoch_commitment
     from milpa.index_cache import (
         _default_cache_dir,
         index_url_from_env,
+        reverify_cached_epoch_commitment_status,
         reverify_cached_index,
     )
 
     if _no_index_requested(env.no_index):
-        return
+        return None
     raw_index_url = os.environ.get("MILPA_INDEX_URL")
     if raw_index_url is not None and raw_index_url.strip() == "":
-        return  # explicitly no index → nothing to reverify
+        return None  # explicitly no index → nothing to reverify
     config, verifier = _build_index_trust(env, project_dir) if project_dir is not None else (None, None)
     reverify_cached_index(index_url_from_env(), _default_cache_dir(), config, verifier)
+
+    if config is None or verifier is None:
+        return None  # index-trust inactive — mirrors _apply_epoch_commitment_phase's gate
+
+    resolved_index_url = index_url_from_env()
+    epoch_verifier, expected_signer = _build_epoch_commitment_verifier(resolved_index_url)
+    status = reverify_cached_epoch_commitment_status(
+        index_url=resolved_index_url,
+        verifier=epoch_verifier,
+        trust_bundle=config.trust_bundle,
+        expected_signer=expected_signer,
+    )
+    enforce_epoch_commitment(status)
+    return status
 
 
 def _reverify_cached_entry_attestations(
     env: "MilpaEnv | None",
     project_dir: "Path | None",
     lockfile: "Lockfile",
-) -> None:
+    epoch_status: "object | None" = None,
+) -> int:
     """P3a (RFC per-entry-attestation.md §7): re-verify CACHED per-entry
     attestation bundles offline — NEVER fetches.
 
@@ -1497,10 +1554,17 @@ def _reverify_cached_entry_attestations(
     verification outcome from the cached bundle (crypto + subject binding,
     no freshness — mirrors ``reverify_cached_index``'s shape) against the
     lockfile's recorded kind/signer/namespace. Missing cached bundle →
-    ``TNG-ENTRY-BUNDLE-MISSING`` (warn/strict per policy). Skips silently
-    when ``env``/``project_dir`` is ``None`` (unit-test bypass, mirrors
-    ``_reverify_cached_index_bundle``) or when the effective entry-trust
-    policy is ``off``.
+    ``TNG-ENTRY-BUNDLE-MISSING`` (warn/strict per policy, verify's OWN
+    remediation — ``verify_context=True``, D6/D12: "run `milpa fetch` to
+    acquire the bundle, then re-verify", distinct from the fetch-path
+    cause/backend split). Skips silently when ``env``/``project_dir`` is
+    ``None`` (unit-test bypass, mirrors ``_reverify_cached_index_bundle``) or
+    when the effective entry-trust policy is ``off``. Returns the count of
+    entries whose re-verification outcome was ``Trusted`` this run (the
+    same-invocation "verified" fact ``cmd_verify``'s summary line reports —
+    D12: distinct from a cold ``show``'s permanent "claims" wording, which
+    infers nothing from policy or from a check that ran in a DIFFERENT
+    process).
 
     Offline invariant: this function checks ``bundle_store.is_cached(pin)``
     BEFORE ever calling ``bundle_store.get(pin)`` — for ``HttpEntryBundleStore``,
@@ -1509,46 +1573,61 @@ def _reverify_cached_entry_attestations(
     reported as ``TNG-ENTRY-BUNDLE-MISSING`` (cause ``unfetchable``), exactly
     as if the bundle had never been fetched.
 
-    S-EpochGate scope note: this offline, lockfile-driven path never loads an
-    ``Index`` (that would require re-acquiring + re-verifying the index and
-    its epoch-commitment sidecar, which ``milpa verify``'s offline invariant
-    above forbids). It always classifies as ``Unarmed`` (``epoch_membership
-    = None``) — the same warn-equivalent treatment ``effective_epoch_policy``
-    gives a genuinely unarmed registry — rather than reconstructing a stale
-    or unverifiable membership claim from the lockfile alone.
+    ``epoch_status`` (RFC attestation-v1-normative.md §6 S5, round-3 addition
+    (i) — RE-DERIVE, not trust-the-lock-time-claim): the caller
+    (``cmd_verify``) threads through the status
+    ``_reverify_cached_index_bundle`` already re-derived offline from the
+    PINNED LOCAL index cache this same invocation — reflecting what is on
+    disk NOW, not whatever was true when the lockfile was written (the M1
+    case: the cached index was replaced by a newer ``fetch`` between ``lock``
+    and ``verify``). ``None`` (index-trust inactive, or a direct unit-test
+    call that bypasses the CLI's index-trust wiring) falls back to
+    ``Unarmed()`` — the same warn-equivalent treatment a genuinely unarmed
+    registry gets, never a stale reconstruction from the lockfile alone.
     """
     if env is None or project_dir is None:
-        return
+        return 0
 
     from milpa.entry_trust import (
         BundleMissing,
         EntryGateOutcome,
-        build_entry_subject,
+        Trusted,
+        classify_epoch_membership,
         enforce_entry_trust,
         evaluate_entry_attestation,
+        maybe_emit_no_epoch_armed_notice,
     )
-    from milpa.epoch_commitment import Unarmed
+    from milpa.epoch_commitment import PreEpochIdentity, Unarmed
     from milpa.registry import EntryAttestation
 
     config = _build_entry_trust(env, project_dir)
     if config is None:
-        return  # policy off
+        return 0  # policy off
 
+    effective_status = epoch_status if epoch_status is not None else Unarmed()
+    maybe_emit_no_epoch_armed_notice(config.policy, effective_status)
+
+    trusted_count = 0
     for dep in lockfile.deps:
         att = dep.attestation
         if att is None:
             continue
 
-        # S-EpochGate scope note (see docstring above): this offline path
-        # never loads an Index, so membership is always None (Unarmed) — the
-        # two manually-constructed BundleMissing outcomes below carry that
-        # same ``epoch_membership=None`` for consistency with the delegated
-        # (evaluate_entry_attestation) branch, which also runs Unarmed().
+        membership = classify_epoch_membership(
+            effective_status,
+            PreEpochIdentity(
+                namespace=att.namespace,
+                name=dep.name,
+                version=dep.version,
+                content_hash=dep.identity or "",
+            ),
+        )
+
         if att.bundle_pin is None:
-            outcome = EntryGateOutcome(result=BundleMissing, epoch_membership=None, cause="no-pin")
+            outcome = EntryGateOutcome(result=BundleMissing, epoch_membership=membership, cause="no-pin")
         elif config.bundle_store is None or not config.bundle_store.is_cached(att.bundle_pin):
             # NEVER fetch — a present-but-uncached pin is unfetchable-from-cache.
-            outcome = EntryGateOutcome(result=BundleMissing, epoch_membership=None, cause="unfetchable")
+            outcome = EntryGateOutcome(result=BundleMissing, epoch_membership=membership, cause="unfetchable")
         else:
             # Cached: reuse the shared gate pipeline. bundle_store.get() on a
             # cached pin never touches the network (verified is_cached above).
@@ -1563,8 +1642,11 @@ def _reverify_cached_entry_attestations(
                 bundle_store=config.bundle_store,
                 trust_bundle=config.trust_bundle,
                 expected_vendor_signer=config.expected_vendor_signer,
-                epoch_status=Unarmed(),
+                epoch_status=effective_status,
             )
+
+        if outcome.result is Trusted:
+            trusted_count += 1
 
         enforce_entry_trust(
             outcome,
@@ -1573,7 +1655,10 @@ def _reverify_cached_entry_attestations(
             name=dep.name,
             version=dep.version,
             bundle_store=config.bundle_store,
+            verify_context=True,
         )
+
+    return trusted_count
 
 
 # ---------------------------------------------------------------------------
@@ -2611,10 +2696,21 @@ def cmd_show(project_dir: Path) -> int:
             from milpa.lockfile import collapse_notes as _collapse_notes
             for note in _collapse_notes([dep]):
                 print(f"  note        {note}")
-        # RFC per-entry-attestation.md P2 (§7): render the lockfile's
-        # attestation block as an UNVERIFIED claim — no crypto has ever been
-        # run over it.  The wording upgrades to a verified fact only once the
-        # (later) P3 entry-trust gate exists; this schema does not change.
+        # RFC per-entry-attestation.md P2 (§7) + attestation-v1-normative.md
+        # §6 S5 (D12, R8): render the lockfile's attestation block as an
+        # UNVERIFIED claim — permanently, by design. `show` reads a
+        # PRE-EXISTING lockfile from a cold, separate process invocation, so
+        # it can never know whether crypto ran over this record (a check
+        # from a past `fetch`/`lock`/`verify` run, or none at all). Inferring
+        # "verified" from the CURRENT effective policy shape would
+        # reintroduce the exact claim/outcome conflation lockfile-schema.md
+        # §3.9 forbids, and would misrender under set-once-epoch time travel
+        # (an entry locked pre-arming, correctly warn at lock time, would
+        # wrongly read "verified" once the epoch is later armed). The
+        # "verified" wording lives ONLY in `cmd_verify`'s own same-invocation
+        # summary line (`entry-trust: N attestation(s) verified this run`),
+        # printed immediately after crypto genuinely ran in THIS process —
+        # never here.
         if dep.attestation is not None:
             print(f"  attestation {_format_attestation_claim(dep.attestation)}")
     return 0
@@ -2745,6 +2841,54 @@ def cmd_show_index_trust(project_dir: Path) -> int:
 
 
 # ---------------------------------------------------------------------------
+# cmd_show_entry_trust (show --entry-trust)
+# ---------------------------------------------------------------------------
+
+
+def cmd_show_entry_trust(project_dir: Path) -> int:
+    """Print entry-trust observability: effective policy + the claimed
+    epoch-commitment arming state (RFC attestation-v1-normative.md §6 S5 —
+    minimal ``show --entry-trust`` parity with ``show --index-trust``'s
+    convention, R8/R10).
+
+    CLAIMS ONLY — no cryptographic verification is performed (mirrors
+    ``cmd_show_index_trust``'s discipline): the epoch-commitment row reports
+    whether the CACHED index text carries an ``attestation-epoch-commitment``
+    pointer, not whether it composed-verifies. Composed verification is
+    ``fetch``/``lock``/``verify``'s job; this command is a passive audit view.
+
+    The effective policy is computed the SAME way ``_build_entry_trust``
+    computes it (manifest + ``MILPA_ENTRY_TRUST``, flag always ``False`` —
+    ``show`` has no ``--require-attested-entries``-equivalent flag of its
+    own, matching ``cmd_show_index_trust``'s ``flag=False``).
+
+    spec/cli-contract.md §5.3a (S5 entry-trust addendum).
+    """
+    from milpa.entry_trust import format_entry_trust_info
+    from milpa.index_cache import (
+        _default_cache_dir,
+        index_url_from_env,
+        read_cached_epoch_commitment_pointer,
+    )
+    from milpa.trust import effective_trust_policy
+
+    manifest_policy = _load_manifest_entry_trust_policy(project_dir)
+    env_entry_trust = os.environ.get("MILPA_ENTRY_TRUST")
+    policy = effective_trust_policy(manifest_policy, flag=False, env_override=env_entry_trust)
+
+    index_url = index_url_from_env()
+    pointer = read_cached_epoch_commitment_pointer(index_url, _default_cache_dir())
+
+    output = format_entry_trust_info(
+        policy=str(policy),
+        index_url=index_url,
+        epoch_commitment_pointer=pointer,
+    )
+    print(output, end="")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # cmd_verify (10c)
 # ---------------------------------------------------------------------------
 
@@ -2831,9 +2975,10 @@ def cmd_verify(
     # warn). Never fetches; independent of the online dep_decl edge check below.
     # (env is None only in direct unit-test calls that bypass the CLI env build.)
     # -------------------------------------------------------------------------
+    reverified_epoch_status = None
     if env is not None:
         try:
-            _reverify_cached_index_bundle(
+            reverified_epoch_status = _reverify_cached_index_bundle(
                 env, ws.root_dir if ws is not None else project_dir
             )
         except MilpaError as exc:
@@ -2848,11 +2993,18 @@ def cmd_verify(
     # P3a (RFC per-entry-attestation.md §7): offline reverify of CACHED
     # per-entry attestation bundles. Same shape as the index reverify above —
     # never fetches, independent of the online dep_decl edge check below.
+    # RFC attestation-v1-normative.md §6 S5: ``reverified_epoch_status`` is
+    # the SAME invocation's re-derived ``EpochCommitmentStatus`` (index-trust
+    # strictly precedes entry-trust, R4) — never the lockfile's stale claim.
     # -------------------------------------------------------------------------
+    entry_trust_verified_count = 0
     if env is not None:
         try:
-            _reverify_cached_entry_attestations(
-                env, ws.root_dir if ws is not None else project_dir, lockfile
+            entry_trust_verified_count = _reverify_cached_entry_attestations(
+                env,
+                ws.root_dir if ws is not None else project_dir,
+                lockfile,
+                epoch_status=reverified_epoch_status,
             )
         except MilpaError as exc:
             print(
@@ -2950,6 +3102,17 @@ def cmd_verify(
         )
     else:
         print(f"verified {len(lockfile.deps)} deps", file=sys.stderr)
+
+    # D12 same-invocation "verified" wording: this line is the ONLY place
+    # milpa ever says an attestation was "verified" (as opposed to a cold
+    # `show`'s permanent "claims" wording) — printed only right here,
+    # immediately after `_reverify_cached_entry_attestations` genuinely
+    # re-ran crypto in THIS process, never inferred later from policy shape.
+    if entry_trust_verified_count > 0:
+        print(
+            f"entry-trust: {entry_trust_verified_count} attestation(s) verified this run",
+            file=sys.stderr,
+        )
     return 0
 
 
@@ -5587,6 +5750,8 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "show":
             if getattr(args, "index_trust", False):
                 return cmd_show_index_trust(project_dir)
+            if getattr(args, "entry_trust", False):
+                return cmd_show_entry_trust(project_dir)
             return cmd_show(project_dir)
         elif args.command == "verify":
             return cmd_verify(

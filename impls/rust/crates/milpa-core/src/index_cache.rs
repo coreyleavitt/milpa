@@ -631,6 +631,65 @@ pub fn load_epoch_commitment_status(
     status
 }
 
+/// Poisoned transport for [`reverify_cached_epoch_commitment_status`] —
+/// `milpa verify` must never fetch (spec cli-contract.md §5.4), so any
+/// attempt to reach this on a cache miss is itself the offline-invariant
+/// violation; returning `Err` turns that cache miss into `fetch_failed =
+/// true` (→ `ArmingInvalid`, D14's fail-closed posture) inside
+/// [`load_epoch_commitment_status`] rather than a real network call.
+fn offline_epoch_commitment_http_get(url: &str) -> Result<Vec<u8>, String> {
+    Err(format!(
+        "milpa verify must never fetch the epoch-commitment sidecar over the \
+         network (attempted for {url:?}); this is an offline-invariant bug, \
+         not a runtime condition a user can hit."
+    ))
+}
+
+/// Re-derive [`EpochCommitmentStatus`] from the PINNED LOCAL cache, fully
+/// offline — `milpa verify`'s epoch-commitment counterpart to
+/// [`reverify_cached_index`] (RFC attestation-v1-normative.md §6 S5,
+/// round-3 addition (i)).
+///
+/// `verify` RE-DERIVES membership rather than trusting a lock-time claim
+/// (RECOMMENDED reading of the round-3 fork): the composed-verification
+/// pipeline is pure and cache-only here, so re-running it is idempotent and
+/// safe, and it reflects the CURRENT local index snapshot — not whatever was
+/// true when the lockfile was written. Concretely: if the cached index was
+/// replaced by a newer `fetch` between `lock` and `verify` (a re-arm, or the
+/// commitment simply was not cached yet at lock time), this function reports
+/// the status implied by what is on disk NOW, not the lockfile's stale claim
+/// (see the M1 regression test).
+///
+/// Reads the `attestation-epoch-commitment` pointer off the CACHED index text
+/// (never re-fetches the index itself — that is `milpa fetch`'s job), then
+/// re-runs the SAME composed-verification pipeline
+/// [`load_epoch_commitment_status`] uses, with the network transport
+/// poisoned ([`offline_epoch_commitment_http_get`]): a cache hit for the
+/// commitment sidecar verifies exactly as it would at lock time; a cache
+/// miss (pointer present, sidecar never cached) fails closed as
+/// `ArmingInvalid` rather than attempting to fetch — mirroring
+/// [`reverify_cached_index`]'s "missing cached bundle -> BundleMissing,
+/// never fetched" posture for the whole-index axis.
+pub fn reverify_cached_epoch_commitment_status(
+    index_url: &str,
+    index_cache_dir: &Path,
+    epoch_cache_dir: &Path,
+    verifier: &dyn IndexBundleVerifier,
+    trust_bundle: &TrustBundle,
+    expected_signer: &str,
+) -> EpochCommitmentStatus {
+    let pointer = read_cached_epoch_commitment_pointer(index_url, index_cache_dir);
+    load_epoch_commitment_status(
+        index_url,
+        pointer.as_deref(),
+        epoch_cache_dir,
+        &offline_epoch_commitment_http_get,
+        verifier,
+        trust_bundle,
+        expected_signer,
+    )
+}
+
 /// Force a network fetch of `url` and verify it under the effective
 /// index-trust policy — WITHOUT any cache mutation (no bundle sidecar, no
 /// index write, no freshness stamp, no ratchet baseline touched).

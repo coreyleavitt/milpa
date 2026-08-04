@@ -1255,3 +1255,194 @@ fn a3_write_baseline_pair_reports_write_failed_when_cache_dir_uncreatable() {
     // No partial write leaked into a sibling of the blocker file.
     assert!(!cache_dir.exists());
 }
+
+// ---------------------------------------------------------------------------
+// S5 (RFC attestation-v1-normative.md §6 S5): reverify_cached_epoch_commitment_status
+// — `milpa verify`'s offline epoch-commitment re-derivation.
+// ---------------------------------------------------------------------------
+
+mod s5_reverify_cached_epoch_commitment_status {
+    use super::*;
+    use crate::epoch_commitment::{commitment_digest, PreEpochIdentity};
+
+    const EPOCH_SIGNER: &str = "https://example.test/rearm-signer";
+
+    fn id_(namespace: &str, name: &str, version: &str, content_hash: &str) -> PreEpochIdentity {
+        PreEpochIdentity {
+            namespace: namespace.to_string(),
+            name: name.to_string(),
+            version: version.to_string(),
+            content_hash: content_hash.to_string(),
+        }
+    }
+
+    fn valid_sidecar_json(identities: &[PreEpochIdentity], integrated_time: i64) -> Vec<u8> {
+        let identities_json: Vec<serde_json::Value> = identities
+            .iter()
+            .map(|i| {
+                serde_json::json!({
+                    "namespace": i.namespace,
+                    "name": i.name,
+                    "version": i.version,
+                    "content_hash": i.content_hash,
+                })
+            })
+            .collect();
+        serde_json::to_vec(&serde_json::json!({
+            "identities": identities_json,
+            "bundle": {
+                "verificationMaterial": {
+                    "tlogEntries": [{"integratedTime": integrated_time.to_string()}]
+                }
+            },
+        }))
+        .unwrap()
+    }
+
+    /// Seed the ordinary (non-content-addressed) index cache file for `url`
+    /// with an `attestation-epoch-commitment` pointer field, mirroring what a
+    /// real `fetch`/`lock` would have cached.
+    fn seed_cached_index_with_pointer(cache_dir: &std::path::Path, url: &str, pointer: &str) {
+        let cache_file = cache_path_for(url, cache_dir);
+        std::fs::create_dir_all(cache_file.parent().unwrap()).unwrap();
+        let text = format!(
+            "schema_version 1\nattestation-epoch-commitment \"{pointer}\"\npackage \"bar\" {{\n    version \"1.0.0\"\n}}\n"
+        );
+        std::fs::write(&cache_file, text).unwrap();
+    }
+
+    #[test]
+    fn armed_when_pointer_and_sidecar_both_cached() {
+        let d = tmp();
+        let index_cache_dir = d.path().join("index");
+        let epoch_cache_dir = d.path().join("epoch-commitment");
+        std::fs::create_dir_all(&epoch_cache_dir).unwrap();
+
+        let h = "5".repeat(64);
+        let identities = vec![id_("ns", "pkg", "1.0.0", &format!("dag-sha256:{h}"))];
+        let pointer = commitment_digest(&identities);
+        let sidecar = valid_sidecar_json(&identities, 1_700_000_000);
+
+        seed_cached_index_with_pointer(&index_cache_dir, URL, &pointer);
+        std::fs::write(epoch_commitment_cache_path(&pointer, &epoch_cache_dir), &sidecar).unwrap();
+
+        let verifier = MockVerifier::new(VerificationResult::Trusted);
+        let status = reverify_cached_epoch_commitment_status(
+            URL,
+            &index_cache_dir,
+            &epoch_cache_dir,
+            &verifier,
+            &TrustBundle::test(),
+            EPOCH_SIGNER,
+        );
+
+        match status {
+            EpochCommitmentStatus::Armed { identities: got, .. } => {
+                assert_eq!(got.len(), 1);
+                assert!(got.contains(&identities[0]));
+            }
+            other => panic!("expected Armed, got {other:?}"),
+        }
+    }
+
+    /// The M1 case: pointer cached on the index, but the content-addressed
+    /// sidecar was never cached (e.g. a fresh `fetch` wrote a new pointer but
+    /// the sidecar fetch is what a live `fetch`/`lock` would have performed —
+    /// this offline path must NEVER attempt that fetch itself). Fails closed
+    /// as `ArmingInvalid`, never a network attempt.
+    #[test]
+    fn arming_invalid_when_pointer_cached_but_sidecar_missing() {
+        let d = tmp();
+        let index_cache_dir = d.path().join("index");
+        let epoch_cache_dir = d.path().join("epoch-commitment");
+        std::fs::create_dir_all(&epoch_cache_dir).unwrap();
+
+        let pointer = "6".repeat(64);
+        seed_cached_index_with_pointer(&index_cache_dir, URL, &pointer);
+        // Deliberately do NOT write the sidecar cache file.
+
+        let verifier = MockVerifier::new(VerificationResult::Trusted);
+        let status = reverify_cached_epoch_commitment_status(
+            URL,
+            &index_cache_dir,
+            &epoch_cache_dir,
+            &verifier,
+            &TrustBundle::test(),
+            EPOCH_SIGNER,
+        );
+
+        assert!(
+            matches!(status, EpochCommitmentStatus::ArmingInvalid { .. }),
+            "a cache-miss sidecar must fail closed, never fetch — got {status:?}"
+        );
+    }
+
+    #[test]
+    fn unarmed_when_no_cached_index_at_all() {
+        let d = tmp();
+        let index_cache_dir = d.path().join("index");
+        let epoch_cache_dir = d.path().join("epoch-commitment");
+
+        let verifier = MockVerifier::new(VerificationResult::Trusted);
+        let status = reverify_cached_epoch_commitment_status(
+            URL,
+            &index_cache_dir,
+            &epoch_cache_dir,
+            &verifier,
+            &TrustBundle::test(),
+            EPOCH_SIGNER,
+        );
+
+        assert_eq!(status, EpochCommitmentStatus::Unarmed);
+    }
+
+    /// M1 regression, full shape: re-deriving from the CURRENT cache reflects
+    /// a re-arm that happened between `lock` and `verify` — this is the core
+    /// behavior change RFC attestation-v1-normative.md §6 S5 exists for.
+    #[test]
+    fn rederives_from_current_cache_after_a_simulated_rearm() {
+        let d = tmp();
+        let index_cache_dir = d.path().join("index");
+        let epoch_cache_dir = d.path().join("epoch-commitment");
+        std::fs::create_dir_all(&epoch_cache_dir).unwrap();
+
+        // "lock time" — no commitment armed at all: the cached index carries
+        // no attestation-epoch-commitment field.
+        let cache_file = cache_path_for(URL, &index_cache_dir);
+        std::fs::create_dir_all(cache_file.parent().unwrap()).unwrap();
+        std::fs::write(&cache_file, "schema_version 1\npackage \"bar\" {\n    version \"1.0.0\"\n}\n").unwrap();
+
+        let verifier = MockVerifier::new(VerificationResult::Trusted);
+        let lock_time_status = reverify_cached_epoch_commitment_status(
+            URL,
+            &index_cache_dir,
+            &epoch_cache_dir,
+            &verifier,
+            &TrustBundle::test(),
+            EPOCH_SIGNER,
+        );
+        assert_eq!(lock_time_status, EpochCommitmentStatus::Unarmed);
+
+        // "a newer fetch re-armed the registry" — the cached index now
+        // carries a pointer, and the sidecar is cached too.
+        let h = "7".repeat(64);
+        let identities = vec![id_("ns", "pkg", "1.0.0", &format!("dag-sha256:{h}"))];
+        let pointer = commitment_digest(&identities);
+        let sidecar = valid_sidecar_json(&identities, 1_700_000_001);
+        seed_cached_index_with_pointer(&index_cache_dir, URL, &pointer);
+        std::fs::write(epoch_commitment_cache_path(&pointer, &epoch_cache_dir), &sidecar).unwrap();
+
+        let verify_time_status = reverify_cached_epoch_commitment_status(
+            URL,
+            &index_cache_dir,
+            &epoch_cache_dir,
+            &verifier,
+            &TrustBundle::test(),
+            EPOCH_SIGNER,
+        );
+        assert!(
+            matches!(verify_time_status, EpochCommitmentStatus::Armed { .. }),
+            "re-derivation must reflect the CURRENT cache, not the lock-time Unarmed status — got {verify_time_status:?}"
+        );
+    }
+}

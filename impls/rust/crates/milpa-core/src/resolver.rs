@@ -4456,6 +4456,7 @@ impl<'a> ResolveProvider<'a> {
                             &dep_key.name,
                             &version_str,
                             cfg.bundle_store.as_deref(),
+                            false,
                         )?;
                     }
                 }
@@ -4539,6 +4540,7 @@ impl<'a> ResolveProvider<'a> {
                             &dep_key.name,
                             &version_str,
                             cfg.bundle_store.as_deref(),
+                            false,
                         )?;
                     }
                 }
