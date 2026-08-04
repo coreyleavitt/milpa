@@ -705,6 +705,103 @@ Fields: `registry` (required), `repository` (required), `digest` (required),
 > milpa cannot fetch is non-fatal provided other provenances on the same version
 > remain fetchable).
 
+### 3.3a  Generic verification-gate model
+
+This spec defines two independent cryptographic verification gates over the
+registry read path: the whole-index gate (§3.4, `index-trust`, Layer 1) and
+the per-entry attestation gate (§3.6, `entry-trust`, Layer 2). Both gates
+verify a Sigstore bundle (a DSSE-enveloped in-toto statement, backed by a
+Fulcio certificate chain and a Rekor inclusion proof) against an expected
+subject and an expected signer identity, and both are governed by the
+`{off, warn, strict}` policy-axis mechanics §3.4.0 already factors out
+generically. What §3.4.0 does **not** factor is the shape of the
+verification pipeline itself — the ordering and precedence rules a
+conformant bundle verifier MUST follow regardless of which artifact it is
+verifying. Stating those rules independently in §3.4 and §3.6 would let the
+two prose copies drift on security-critical detail (`rfc-per-entry-
+attestation.md` §6 flags exactly this risk for the *code*; the same risk
+exists for the *spec prose*). This section states the pipeline-shape rules
+**once**; §3.4 and §3.6 each instantiate them rather than restating them.
+
+A gate instantiation is parametrized by four axis-specific choices, each
+supplied by the instantiating section:
+
+| Parameter | §3.4 (index-trust) | §3.6 (entry-trust) |
+|---|---|---|
+| Subject shape | whole-index bytes, bound by digest only (`sha256(index_bytes)`, §3.4.3) | `content_hash` (digest) **and** the `pkg:tianguis/<namespace>/<name>@<version>` package coordinate (name) — both required, §3.6 |
+| Expected-signer derivation | a pinned default identity (or manifest/env override), resolved per index URL (§3.4.4 step 5, §3.4.6) | the entry's own claimed `signed_by` identity for `AuthorSigned`, or Layer 1's already-verified vendor-bot identity for `MilpaVendored` — self-declared attribution, not independently authorized against a registry-side owner mapping (the Part 3 owner registry, §3 non-goal, is the future closing of this residual) |
+| Stage list | 7 steps (§3.4.4) | 8 outcome-mapped stages (§3.6) |
+| Freshness applicability | yes — a network-fetch-path staleness bound against `integratedTime` (§3.4.4 step 3); not asserted on a pure cache read | no — a per-entry bundle, once fetched into the content-addressed entry-bundle store, is permanent; there is no TTL, no staleness concept, and no degraded-serve state (D2; an earlier draft's citation of Layer 1's four-state freshness cache here was an error this spec does not repeat) |
+
+The invariants themselves, stated once for both instantiations:
+
+> NORMATIVE (parse-before-crypto ordering): A gate MUST detect structural /
+> pre-cryptographic failures — the bundle is not valid JSON, is not a JSON
+> object, or is missing a required structural field (the DSSE envelope, the
+> Rekor `tlogEntries`, the `integratedTime`) — and report them BEFORE any
+> cryptographic verification step (certificate-chain validation, DSSE
+> signature verification, Rekor inclusion-proof verification) is attempted.
+> A malformed bundle is a distinct failure class from a well-formed but
+> cryptographically invalid one, and MUST be reported as such.
+
+> NORMATIVE (TOCTOU single-read invariant): The bytes of the artifact being
+> verified (the whole index document for §3.4; the served attestation
+> bundle for §3.6) MUST be read from their transport or cache exactly ONCE.
+> The same in-memory bytes object MUST be passed to every downstream
+> consumer that needs it — the bundle verifier, the subject-digest
+> comparison, and (for §3.4) the KDL parser. There MUST NOT be a second
+> disk or network read between verification and consumption. A conformant
+> implementation that re-reads the artifact after verification has
+> reintroduced the exact substitution window verification exists to close.
+
+> NORMATIVE (delegate-not-hand-roll): Verification MUST NOT use hand-rolled
+> cryptographic code. Implementations MUST delegate certificate-chain
+> validation, DSSE signature verification, and Rekor inclusion-proof
+> verification to `sigstore-python` (Python) or `sigstore-rs` (Rust), or an
+> equivalent audited Sigstore client library. Verification MUST work without
+> live Rekor network access — a conformant bundle carries all material
+> needed for offline verification (inclusion proof + signed entry
+> timestamp).
+
+> NORMATIVE (first-failing-stage-wins precedence): Each gate instantiation
+> defines an ORDERED stage list (§3.4.4's seven steps; §3.6's eight
+> outcome-mapped stages). When multiple failure conditions coexist in a
+> single verification attempt, the reported outcome MUST be the failure of
+> the FIRST stage, in that instantiation's fixed evaluation order, that
+> actually fails — never a later stage's failure, and never a failure
+> synthesized from library-specific exception ordering. This makes the
+> reported outcome deterministic across underlying cryptographic libraries
+> that internally interleave sub-checks differently.
+
+> NORMATIVE (subject-binding-precedes-crypto): The check that binds the
+> verified artifact to its expected subject — for §3.4, the DSSE payload's
+> `subject[0].digest.sha256` against `sha256(index_bytes)`; for §3.6, the
+> statement's subject digest AND name against the candidate's `content_hash`
+> and package coordinate — MUST be evaluated BEFORE the cryptographic
+> verification stages (certificate chain, DSSE signature, Rekor inclusion),
+> and its failure MUST take precedence over any concurrently-failing
+> cryptographic stage. Rationale: a subject mismatch means the bundle
+> attests a DIFFERENT artifact than the one being verified — it is not
+> "about" this artifact at all, which is the most fundamental mismatch and
+> the cheapest to detect (a digest/string comparison, no cryptography).
+> Checking it first also yields identical outcomes across implementations
+> whose underlying verification libraries interleave the cryptographic
+> sub-steps differently. This ordering is SAFE despite reading the subject
+> from a not-yet-cryptographically-verified payload: the pre-check can only
+> REJECT (it never accepts on its own strength), the `Trusted` verdict still
+> requires the full cryptographic verification to pass, and the exact
+> payload bytes read for the subject check are the same bytes whose DSSE
+> signature is verified on the `Trusted` path — satisfying the TOCTOU
+> single-read invariant above, not a second read.
+
+> NOTE: A gate instantiation MAY, for implementation convenience, evaluate
+> stages in an order different from the stage list's numbering internally
+> (e.g. a library that validates the certificate chain and the DSSE
+> signature in one call), provided the REPORTED outcome always matches
+> first-failing-stage-wins precedence as if the stages had been evaluated
+> strictly in order. What is normative is the observable outcome, not the
+> internal control flow.
+
 ### 3.4  Whole-index attestation gate (Layer 1)
 
 Layer 1 verifies the Sigstore attestation over the complete `index.kdl`
@@ -718,13 +815,20 @@ specified and enforced **in this document, at §3.6**: §3.6 owns the
 verifier, the policy gate, and the `TNG-ENTRY-{UNATTESTED,BUNDLE-MISSING,
 BUNDLE-PIN-MISMATCH,BUNDLE-MALFORMED,DIGEST-MISMATCH,SUBJECT-MISMATCH,
 SIGNATURE-INVALID,SIGNER-MISMATCH}` slug family (`errors.md`). §3.4.0's
-policy-axis table below is the cross-reference between the two axes.
+policy-axis table below is the cross-reference between the two axes. This
+section (verification-pipeline mechanics) and §3.6 both instantiate the
+generic **§3.3a verification-gate model**; §3.4.4 states this axis's
+concrete stage list and slug mapping rather than restating §3.3a's shared
+ordering/precedence rules. §3.4 additionally owns an **index-scoped
+epoch-commitment phase** (§3.4.8–§3.4.9) that §3.6 reads from but does not
+itself compute — see the cross-axis-precedence NORMATIVE clause in §3.6.
 
 #### 3.4.0  Generic policy-axis model
 
 This spec defines multiple independent trust/integrity axes over the
 registry read path — `index-trust` (this section, whole-index Sigstore
-verification), `entry-trust` (per-entry author attribution,
+verification), `entry-trust` (per-entry author attribution, specified
+normatively at §3.6 of this document; design record:
 `rfc-per-entry-attestation.md` §4), and `index-history` (§3.5, the
 append-only consumer ratchet) — and the count is expected to grow. Each
 axis fails independently, is remediated independently, and is deliberately
@@ -783,7 +887,7 @@ prose.
 > | Axis | Manifest node(s) | Env var | Default | Member-error slug | Normative home |
 > |---|---|---|---|---|---|
 > | `index-trust` | `index-trust`, `index-trust-signer`, `index-trust-bundle` | `MILPA_INDEX_TRUST` | `warn` | `WS-INDEX-TRUST-ON-MEMBER` | §3.4.5 / §3.4.7 (this document) |
-> | `entry-trust` | `entry-trust` | `MILPA_ENTRY_TRUST` | `warn` | `WS-ENTRY-TRUST-ON-MEMBER` | `rfc-per-entry-attestation.md` §4 |
+> | `entry-trust` | `entry-trust` | `MILPA_ENTRY_TRUST` | `warn` | `WS-ENTRY-TRUST-ON-MEMBER` | §3.6 (this document) |
 > | `index-history` | `index-history` | `MILPA_INDEX_HISTORY` | `warn` | `WS-INDEX-HISTORY-ON-MEMBER` | §3.5.2 (this document) |
 >
 > This table is the SSOT for which axes exist and their identifying
@@ -971,40 +1075,32 @@ key. Failure MUST raise `TNG-INDEX-SIGNATURE-INVALID`.
 >   Implementations MUST detect this from the verified payload, not from exception
 >   message text.
 
-> NORMATIVE (first-failure precedence): When multiple failure conditions coexist,
-> the reported variant MUST be the FIRST failure encountered in the §3.4.4
-> evaluation order. In particular: a bundle that is both stale (step 3) and has an
-> invalid signature (steps 4+) MUST report `TNG-INDEX-BUNDLE-STALE`, not
-> `TNG-INDEX-SIGNATURE-INVALID`.
+> NORMATIVE (this axis's first-failing-stage-wins instantiation): §3.3a's
+> first-failing-stage-wins precedence, applied to the seven-step order above:
+> a bundle that is both stale (step 3) and has an invalid signature (steps
+> 4+) MUST report `TNG-INDEX-BUNDLE-STALE`, not `TNG-INDEX-SIGNATURE-INVALID`.
 >
-> NORMATIVE (subject-digest binding precedence): The subject-digest binding of
-> step 6 is evaluated BEFORE the cryptographic verification of steps 4–5 and 7.
-> A bundle whose `statement.subject[0].digest.sha256` ≠ `sha256(index_bytes)`
-> (or whose subject digest is absent/unextractable) MUST report
-> `TNG-INDEX-DIGEST-MISMATCH`, taking precedence over any concurrent signature,
-> certificate, signer-identity, or inclusion-proof failure. Rationale: a subject
-> mismatch means the bundle attests a DIFFERENT artifact than the index being
-> loaded — it is not "about" this index at all, which is the most fundamental
-> mismatch and cheapest to detect (a hash comparison, no cryptography). Checking
-> it first also yields identical slugs across implementations whose underlying
-> verification libraries interleave the cryptographic sub-steps differently.
->
-> This precedence is SAFE despite the digest being read from a not-yet-verified
-> payload: the pre-check can only REJECT (it never accepts), the `Trusted` verdict
-> still requires the full cryptographic verification of steps 4–7 to pass, and the
-> exact payload bytes read for the digest pre-check are the same bytes whose DSSE
-> signature is verified on the `Trusted` path (single-read invariant below — no
-> TOCTOU). Implementations MUST NOT accept a bundle on the strength of the digest
+> NORMATIVE (this axis's subject-binding-precedes-crypto instantiation):
+> §3.3a's subject-binding rule, applied here: the subject-digest binding of
+> step 6 is evaluated BEFORE the cryptographic verification of steps 4–5 and
+> 7. A bundle whose `statement.subject[0].digest.sha256` ≠
+> `sha256(index_bytes)` (or whose subject digest is absent/unextractable)
+> MUST report `TNG-INDEX-DIGEST-MISMATCH`, taking precedence over any
+> concurrent signature, certificate, signer-identity, or inclusion-proof
+> failure — see §3.3a for the rationale and the TOCTOU-safety argument (this
+> axis's TOCTOU single-read instantiation is the index-bytes rule below).
+> Implementations MUST NOT accept a bundle on the strength of the digest
 > pre-check alone.
 
-> NORMATIVE: Verification MUST NOT use hand-rolled cryptographic code.
-> Implementations MUST delegate to `sigstore-python` (Python) or `sigstore-rs`
-> (Rust). Verification MUST work without live Rekor network access — the bundle
-> carries all material needed for offline verification (inclusion proof + SET).
+> NORMATIVE: This axis instantiates §3.3a's delegate-not-hand-roll rule
+> verbatim: `sigstore-python` (Python) or `sigstore-rs` (Rust), fully
+> offline-capable (the bundle carries all material needed — inclusion proof
+> + SET — with no live Rekor network access required).
 
-> NORMATIVE (TOCTOU): The index bytes MUST be read ONCE. The same in-memory
-> bytes object MUST be passed to both bundle verification and the KDL parser.
-> There MUST NOT be a second disk read between verification and parsing.
+> NORMATIVE (TOCTOU — this axis's single-read invariant): The index bytes
+> MUST be read ONCE. The same in-memory bytes object MUST be passed to both
+> bundle verification and the KDL parser. There MUST NOT be a second disk
+> read between verification and parsing.
 
 > NOTE: The six error slugs referenced above — `TNG-INDEX-BUNDLE-MISSING`,
 > `TNG-INDEX-BUNDLE-MALFORMED`, `TNG-INDEX-SIGNATURE-INVALID`,
@@ -1097,6 +1193,219 @@ root-only rule generalizes.
 > slugs; it is a manifest-structure error that does not involve
 > cryptographic verification.
 
+#### 3.4.8  Epoch-commitment phase (pre-epoch set arming)
+
+This phase decides, for the whole index and **once per resolve**, whether
+the per-entry attestation mandate (§3.6) has a boundary at all, and if so,
+which entries are grandfathered ahead of it. It runs as part of the index
+gate — after §3.4.4's seven-step index-bundle verification succeeds and the
+index is parsed, and BEFORE any candidate is selected (§5) — because a
+compromised or forged commitment is a fact about the whole index, identical
+for every entry, not a per-candidate fact (D14). §3.6 reads this phase's
+output; it does not compute it.
+
+> NORMATIVE (identity): For this phase, an index entry's identity is the
+> tuple **`(namespace, name, version, content_hash)`** — the registry's own
+> `(namespace, name)` identity key, extended with `version` and
+> `content_hash` to name one specific published artifact. `namespace` MUST
+> be included: an identity keyed only on `(name, version, content_hash)`
+> would let an attacker publish `mallory/leftpad@1.0.0` as a byte-for-byte
+> copy of `alice/leftpad@1.0.0` — an identical `(name, version,
+> content_hash)` tuple lets the copy free-ride on `alice/leftpad`'s
+> pre-epoch (grandfathered) status although it was never itself
+> grandfathered. This is a REJECTED attack, closed by including `namespace`
+> in the identity (D16), the same way §3.2's subject-binding NORMATIVE
+> clause rejects a digest-only subject for the identical structural reason.
+
+> NORMATIVE (the frozen set `S` and its commitment `C`): At arming, the
+> registry commits to the FROZEN, EXPLICITLY ENUMERATED set `S` of
+> pre-epoch entry identities — not a cutover timestamp, not a per-entry
+> flag, and not a Merkle root with per-entry inclusion/exclusion proofs
+> (D17: pre-epoch entries predate the mandate and so have no independent
+> Rekor log footprint of their own to prove a position against; the
+> consumer already holds the whole index locally, so shipping the whole set
+> is both simpler and sufficient — it yields authenticated membership AND
+> non-membership from a local set lookup, with no proof machinery). The
+> commitment digest is:
+>
+> ```
+> C = sha256("milpa-preepoch-v1:" ‖ canonical_bytes(sorted_deduped(S)))
+> ```
+>
+> where `sorted_deduped(S)` is `S` with exact-duplicate identities removed
+> and the remainder sorted by `(namespace, name, version, content_hash)`
+> lexicographically on `namespace` then `name`, and by the `version.py`
+> version-ordering (never an ad-hoc string sort) on `version`, then
+> lexicographically on `content_hash` as a final tiebreak; `canonical_bytes`
+> is a fixed, deterministic encoding of the sorted identity list (one
+> encoding function, shared by every conformant implementation, so `C` is
+> byte-identical across impls for the same `S`). The `"milpa-preepoch-v1:"`
+> domain-separation prefix ensures this digest cannot collide with a hash of
+> the same bytes computed for an unrelated purpose elsewhere in the system.
+
+> NORMATIVE (composed verification, not inclusion-proof-only): `C` MUST be
+> authenticated by the same COMPOSED verification pipeline `index-trust`
+> uses — Fulcio certificate-chain validation, DSSE envelope signature
+> verification over an in-toto commitment statement, AND Rekor
+> inclusion-proof verification — against a dedicated **re-arm signer
+> identity**, distinct from the whole-index signer identity (§3.4.4 step 5)
+> and resolved the same way (a pinned default, overridable per §3.4.6's
+> per-URL mechanism). Rekor inclusion proof ALONE MUST NOT be treated as
+> sufficient (D15): `verify_entry_inclusion`-class functions prove only that
+> some body was logged in a Rekor-signed tree, never that the body is bound
+> to a particular DSSE envelope or certificate — and Rekor is a public,
+> permissionless transparency log any OIDC identity may write to. Accepting
+> inclusion alone would let ANY signer forge an apparently-committed `C`.
+> `E`, the epoch boundary, is defined as the Rekor signed-entry-timestamp
+> `integratedTime` of that fully-verified commitment entry — not an
+> operator-supplied date.
+
+> NORMATIVE (sidecar delivery): `C`, `S`, and the composed-verification
+> material are NOT carried inline in `index.kdl` — a real Rekor inclusion
+> proof (root hash, intermediate hashes, signed checkpoint) is not scalar
+> KDL text, and `S` itself (one identity per pre-epoch entry) does not
+> belong inline either. They are delivered as a content-addressed
+> **sidecar bundle**, acquired and cached the same way as the whole-index
+> bundle (§3.4.9).
+
+> NORMATIVE (the typed pointer): The index root MAY carry one optional
+> top-level node:
+>
+> ```
+> attestation-epoch-commitment "<C, 64-char lowercase hex>"
+> ```
+>
+> `C`'s presence on the index root is the sole trigger for this phase; its
+> value is the commitment digest defined above, which the sidecar's
+> verified statement subject digest MUST equal (binding the on-index
+> pointer to the fetched sidecar — evaluated as this phase's own
+> subject-binding-precedes-crypto instantiation of §3.3a, before the
+> composed-verification steps run). This is a **NEW, separate** field —
+> distinct from `attestation-epoch` (§1, §3.5.1's existing `set-once` root
+> row): `attestation-epoch` remains, unmodified, as informational metadata
+> only (it is NEVER read to decide the entry-trust boundary, per D-Watermark
+> — §8c of the design record RFC). Re-typing `attestation-epoch` itself
+> from a timestamp into a `(C, E)` pair — rather than adding this sibling
+> field — would be a value mutation of an already-`set-once` field and
+> would trip `TNG-INDEX-ROOT-MUTATED` for every consumer with an established
+> baseline the moment a registry re-arms (D16); this field exists
+> specifically so arming/re-arming never does that. §3.5.1 tags this field
+> with its own **Append-once** root-field order kind (R12) — see the table
+> row there.
+
+> NORMATIVE (`EpochCommitmentStatus`): This phase produces exactly one of:
+>
+> ```
+> EpochCommitmentStatus =
+>     Unarmed                    # attestation-epoch-commitment absent
+>   | Armed(S, E)                # sidecar fetched, C bound, composed-verified
+>   | ArmingInvalid(reason)      # present but unfetchable / malformed /
+>                                 # subject-digest mismatch / composed-
+>                                 # verification failure (bad cert chain,
+>                                 # bad DSSE signature, bad Rekor inclusion,
+>                                 # or wrong signer)
+> ```
+>
+> computed exactly ONCE per resolve. `Unarmed` is the natural, unconditional
+> default for a registry that has never armed a commitment (self-hosted,
+> air-gapped, or simply pre-arming) — every entry is then pre-epoch and
+> `entry-trust "strict"` is behaviorally warn-equivalent for that registry
+> (§3.4.0, D1, D11); this is stated normatively here, not left to inference.
+
+> NORMATIVE (fail-closed abort, never a downgrade): `ArmingInvalid` MUST
+> abort the ENTIRE resolve — raising the index-family error
+> **`TNG-INDEX-EPOCH-COMMITMENT-INVALID`** — exactly ONCE, BEFORE any
+> candidate is selected (§5). This failure MUST NOT downgrade to a warning
+> under any `entry-trust` policy value: a commitment that fails to verify is
+> an index-integrity fact (someone tampered with, or failed to correctly
+> produce, the arming commitment), and `entry-trust`'s own warn/strict
+> distinction governs only how UNVERIFIED per-entry claims are treated —
+> it has no authority over a corrupted index-scoped fact. This mirrors
+> D4/D11's asymmetry: index-scoped integrity failures are unconditional,
+> only entry-scoped claim gaps degrade gracefully.
+
+> NORMATIVE (membership is a local set lookup — D17): When `Armed(S, E)`,
+> membership for an entry with identity `id` is decided as **`id ∈ S`** —
+> a plain local set-containment test against the already-verified `S`, and
+> nothing else. Both membership (pre-epoch, grandfathered) and
+> non-membership (post-epoch, mandated) are decided this way; there is no
+> recomputation of `C` per entry, no per-entry inclusion/exclusion proof,
+> and no Merkle machinery. §3.6 defines how membership maps to
+> `EpochMembership` and how `EpochMembership` gates the attestation
+> mandate.
+
+> NORMATIVE (D18 co-requirement — arming requires the ratchet): When
+> `EpochCommitmentStatus` is `Armed` AND the effective `entry-trust` policy
+> (§3.4.0) for this resolve is `strict`, the effective `index-history`
+> policy (§3.5.2) for the same registry MUST also be `strict`; if it is
+> not, this is a configuration error — **`TNG-INDEX-EPOCH-RATCHET-
+> REQUIRED`** — raised once, before any candidate is selected, distinct
+> from `ArmingInvalid`. Rationale: Rekor's inclusion proof gives
+> IMMUTABILITY of a logged statement, never EXCLUSIVITY — nothing in the
+> composed-verification check above stops a compromised registry from
+> logging a SECOND valid commitment and re-arming with a different `S`,
+> and §3.4's whole-index gate authenticates only the CURRENT index content,
+> never temporal uniqueness across snapshots. "Only the first commitment
+> counts" is a set-once property, and the ONLY mechanism enforcing it in
+> either impl is the `index-history` ratchet's dominance fold (§3.5.1)
+> applied to this phase's own root field under its `Append-once` order kind
+> (a single-transition class exactly as strict as `set-once`, §3.5.1). The malicious-registry-
+> safety guarantee this phase exists to provide therefore **is**
+> `index-history "strict"` for that registry — arming without it is a
+> configuration that ships a false security claim. This is a coupling
+> invariant scoped to registries that arm a commitment: it does NOT change
+> `index-history`'s own default (`warn`, §3 non-goal preserved) — a
+> registry that arms no commitment (`Unarmed`) is completely unaffected and
+> stays warn-equivalent on the `index-history` axis exactly as before.
+
+#### 3.4.9  Epoch-commitment sidecar acquisition
+
+Templated on §3.4.2's whole-index-bundle acquisition, with the commitment
+sidecar as a distinct artifact class.
+
+> NORMATIVE: The sidecar URL is derived from the index URL identically to
+> §3.4.2's bundle-URL derivation, substituting the `.epoch-commitment`
+> suffix for `.bundle`: strip any query string and fragment from the index
+> URL; append `.epoch-commitment` to the URL PATH component; then reattach
+> the original query string and fragment.
+
+For the default index URL the derived sidecar URL is:
+
+```
+https://raw.githubusercontent.com/coreyleavitt/tianguis/main/index.kdl.epoch-commitment
+```
+
+> NORMATIVE: The sidecar is fetched ONLY when `attestation-epoch-commitment`
+> is present on the parsed index root (§3.4.8) — an index that has never
+> armed never attempts this fetch. Once fetched and composed-verified, the
+> sidecar is cached as an immutable content-addressed artifact keyed by `C`
+> (the same immutability posture §3.6's per-entry bundle store uses, D2 —
+> no TTL, no staleness concept: a commitment, once verified, never needs
+> re-verification against a wall-clock bound, because `S` is frozen by
+> construction and `E` is a fixed historical timestamp). If the locally
+> cached sidecar's key does not match the index root's current `C` (e.g.
+> because the index was replaced by a newer fetch that armed a different
+> commitment), the stale cache entry is discarded and exactly ONE fetch of
+> the current `C`'s sidecar is attempted — mirroring §3.4.2's
+> crash-recovery posture. If that fetch also fails to produce a sidecar
+> that verifies and binds to `C`, the outcome is `ArmingInvalid`; the
+> implementation MUST NOT loop.
+
+> NORMATIVE: The sidecar's payload carries: the enumerated identity list
+> `S` (canonically encoded, per §3.4.8); and a Sigstore bundle (§3.4.3's
+> JSON shape: `verificationMaterial.x509CertificateChain`,
+> `verificationMaterial.tlogEntries[]`, `dsseEnvelope`) whose in-toto
+> statement's subject digest is `C` as defined in §3.4.8 — the same
+> "digest of the signed content" pattern §3.4.3 uses for the whole-index
+> bundle, applied here to the canonically-encoded `S` instead of the index
+> bytes. Verifying the sidecar means: (1) parse it (parse-before-crypto,
+> §3.3a); (2) composed-verify the embedded Sigstore bundle against the
+> re-arm signer identity (§3.4.8); (3) confirm the verified statement's
+> subject digest equals the on-index `C` (subject-binding-precedes the
+> remaining accept decision, §3.3a); (4) recompute `C` from the shipped `S`
+> using §3.4.8's canonical construction and confirm it equals the verified,
+> bound digest. Any failure at any step ⇒ `ArmingInvalid` (§3.4.8).
+
 ### 3.5  Append-only invariant & refresh ratchet
 
 §3.4's whole-index attestation gate verifies that a served `index.kdl` was
@@ -1178,12 +1487,27 @@ fields, each tagged with its own order kind:
 | Root field | Order kind | Legal transitions |
 |---|---|---|
 | `schema_version` (§2) | **ordinal-non-decreasing** (plain integer `≤` — its own tag, NOT `attestation-monotone`) | increase is legal (schema evolution); decrease is a violation. `absent` ≡ the spec default (`1`, §2) within this order — removing an explicit `schema_version 2` node is a decrease, not an unclassified state. A candidate declaring a schema *newer than this consumer understands* never reaches the ratchet at all: `TNG-SCHEMA-UNKNOWN` aborts at parse time, unconditionally (§2); the increase-legal row is live only within the consumer's parseable range. |
-| `attestation-epoch` | **set-once** (the same tag as the entry table's `Frozen` row) | `absent → E` is legal exactly once; any change thereafter is a violation. Set-once, not merely non-decreasing: *raising* the epoch reclassifies every published entry as pre-epoch/legacy and nullifies the attestation mandate while staying technically non-decreasing. |
+| `attestation-epoch` | **set-once** (the same tag as the entry table's `Frozen` row) | `absent → E` is legal exactly once; any change thereafter is a violation. Set-once, not merely non-decreasing: *raising* the epoch reclassifies every published entry as pre-epoch/legacy and nullifies the attestation mandate while staying technically non-decreasing. This field is informational metadata only (D-Watermark, §3.4.8) — it is never read to decide the entry-trust epoch boundary. |
+| `attestation-epoch-commitment` (§3.4.8) | **Append-once** — its own tag, deliberately distinct from `set-once` even though both permit exactly one `absent → value` transition (the table-header note above: distinct tags even for orders that read alike in English) | `absent → C` is legal exactly once; any change thereafter (including a value-preserving re-encoding) is a violation. Distinct from `set-once` because this field's "value" is a content-address POINTER into an externally composed-verified sidecar (§3.4.9), not a self-contained claim the ratchet fold alone authenticates — conflating the two tags would wrongly suggest that re-typing the *existing* `attestation-epoch` field's shape (timestamp → commitment) is a sanctioned migration path; it is not (D16). There is no in-band correction for a bad arming (the "no in-band correction path" rule below applies identically): the sanctioned remedy is an out-of-band trust-anchor re-establishment (`milpa index accept`), the same remedy already specified for any other Frozen/set-once-class violation. |
 
 Violations attributed to the reserved root key raise `TNG-INDEX-ROOT-MUTATED`
 (§3.5.3; lands with implementation slice). Ownership follows the
 attestation-order rule above: this section owns root-field orders; the
 document that introduces a field owns its type.
+
+> NORMATIVE (arming an already-epoched index is legal): Because
+> `attestation-epoch` and `attestation-epoch-commitment` are two separate
+> root fields, each independently dominated under its own order-kind row
+> above, a candidate index that ADDS `attestation-epoch-commitment` (its
+> legal `absent → C` transition) while leaving an already-set
+> `attestation-epoch` value UNCHANGED violates neither row and MUST NOT
+> raise `TNG-INDEX-ROOT-MUTATED`. This is the ordinary, expected shape of a
+> production re-arm: a registry that set `attestation-epoch` before this
+> phase existed attaches a commitment to it later, without ever mutating
+> the timestamp field. (A candidate that ALSO changes the already-set
+> `attestation-epoch` value in the same transition is still a violation —
+> under that field's own unrelated `set-once` row — exactly as it was
+> before this field existed.)
 
 > NORMATIVE (dominance fold): A conformant implementation MUST implement
 > **one** generic `dominates(baseline_entry, candidate_entry) → violations`
@@ -1667,6 +1991,142 @@ distinct, non-epoch-boundary chronological-consistency audit, is a
 disposition settled in `docs/rfc-attestation-v1-normative.md`; this section
 guarantees only the baseline semantics (the watermark definition above)
 such a check would consume.
+
+### 3.6  Per-entry attestation gate (Layer 2)
+
+This section specifies `entry-trust`: the gate that verifies and enforces
+the per-entry author-ATTRIBUTION claim §3.2 types as `EntryAttestation`
+(the `attestation` / `signed_by` / `rekor` / `bundle` sibling nodes). It is
+orthogonal to §3.4: §3.4 verifies "this `index.kdl` document is genuine and
+recent"; this section verifies "the specific version a resolve is about to
+select carries a genuine attribution claim, if one is mandated for it."
+Both gates independently instantiate the **§3.3a verification-gate model**;
+§3.4.0's policy-axis table is the cross-reference between every trust axis
+this spec defines. This section instantiates §3.3a with the parameters
+given in §3.3a's table (subject shape: `content_hash` + package coordinate;
+expected-signer derivation: the entry's own `signed_by` claim, or Layer 1's
+verified vendor-bot identity; no freshness stage).
+
+#### 3.6.1  When the gate fires
+
+> NORMATIVE: The gate fires at candidate SELECTION time — post-solve, once
+> per registry-sourced candidate the resolver has chosen to materialize
+> into the resolved graph — not at index-load time (contrast §3.4.1). No
+> selected registry-sourced candidate's version may be used to construct
+> the resolved graph before the gate passes or produces a `warn`-policy
+> warning.
+
+> NORMATIVE (registry-source-only): The gate fires ONLY for a candidate
+> resolved through the named-dep registry read-contract (§5) — i.e. one
+> whose provenance is the registry entry itself. A dep resolved via a
+> `git=`, `tarball=`, or `oci=` provenance descriptor is NEVER subject to
+> `entry-trust` or epoch classification, even when its declared name
+> textually shadows a registry-owned `(namespace, name)` coordinate
+> (`RES-REGISTRY-SHADOW`, `resolver-semantics.md` §10.5): shadowing is a
+> provenance-selection outcome, and it does not retroactively bind the
+> shadowing dep to a trust axis that governs only registry-sourced
+> resolution.
+
+> NORMATIVE (frozen-path exclusion — mirrors §3.4.1): The gate MUST NOT
+> fire on frozen-path invocations (`fetch --frozen`, or any path that
+> reconstructs the dep graph from `milpa.lock` without loading the index
+> or re-running selection). A frozen resolve fires neither the §3.4 gate
+> nor this one.
+
+#### 3.6.2  Pipeline stages and outcome mapping
+
+> NORMATIVE (stage list and failure–slug mapping): The gate evaluates the
+> following stages, in this fixed order, for a selected candidate. Per
+> §3.3a's first-failing-stage-wins precedence, the reported outcome is the
+> FIRST of these stages that fails; a `Trusted` outcome requires every
+> stage to pass.
+>
+> | Stage | Outcome (on failure) |
+> |---|---|
+> | 0. attestation record present (`EntryAttestation` not `None`) | `TNG-ENTRY-UNATTESTED` |
+> | 1. bundle acquisition | `TNG-ENTRY-BUNDLE-MISSING` |
+> | 1b. acquisition integrity (served bytes vs the entry's `bundle` pin) | `TNG-ENTRY-BUNDLE-PIN-MISMATCH` |
+> | 2. bundle parse (structural / pre-cryptographic — §3.3a parse-before-crypto) | `TNG-ENTRY-BUNDLE-MALFORMED` |
+> | 3. subject digest (statement subject digest vs `content_hash`) | `TNG-ENTRY-DIGEST-MISMATCH` |
+> | 4. subject identity (statement subject name vs `pkg:tianguis/<namespace>/<name>@<version>`) | `TNG-ENTRY-SUBJECT-MISMATCH` |
+> | 5. certificate chain + DSSE signature | `TNG-ENTRY-SIGNATURE-INVALID` |
+> | 6. signer-identity policy (expected signer per §3.3a's derivation) | `TNG-ENTRY-SIGNER-MISMATCH` |
+> | 7. Rekor inclusion proof | `TNG-ENTRY-SIGNATURE-INVALID` (shared with stage 5) |
+>
+> Stages 0–1b are claim/acquisition stages (no cryptographic material has
+> been examined yet); stage 2 is this axis's parse-before-crypto boundary;
+> stages 3–4 are this axis's subject-binding-precedes-crypto instantiation
+> (§3.3a) and MUST both be evaluated, and MUST both fail before, stages
+> 5–7 (the cryptographic stages) run. `errors.md` is the per-slug reference
+> for each outcome's exact trigger condition; this table is the pipeline's
+> ordering authority.
+
+> NORMATIVE (subject cardinality exactly 1 — D3): The in-toto statement's
+> `subject` list MUST have length EXACTLY 1. A `subject` list of length 0
+> or of length 2 or more MUST be treated identically to an absent/
+> unextractable subject at stage 3 — `TNG-ENTRY-DIGEST-MISMATCH` — before
+> any cryptographic stage runs. A multi-subject statement makes no single,
+> unambiguous claim about one artifact, so it carries no more binding
+> information than no claim at all; treating it as anything other than
+> absent would let an attacker's statement vouch for the expected subject
+> merely by padding an unrelated second entry into the list.
+
+#### 3.6.3  `EntryGateOutcome` — the gate's return shape
+
+> NORMATIVE (one composed diagnostic, not independently-threaded fields —
+> D9): The gate's return value is a single typed shape:
+>
+> ```
+> EntryGateOutcome = {
+>   result: EntryVerificationResult,        # Trusted | one of the eight
+>                                            # TNG-ENTRY-* failure variants
+>                                            # from §3.6.2's table
+>   epoch_membership: EpochMembership | None,
+>   cause: BundleMissingCause | None,       # populated only when result is
+>                                            # the BUNDLE-MISSING variant:
+>                                            # `unfetchable` | `no-pin`
+> }
+> ```
+>
+> This is the SOLE shape the gate returns. It is a portable contract this
+> spec hands over — not a description of how an implementation threads a
+> result enum plus ad-hoc optional fields internally. A conformant
+> implementation MAY represent it with any internal structure that
+> preserves these three fields' semantics.
+
+> NORMATIVE (`EpochMembership`): `EpochMembership = PreEpoch | PostEpoch`.
+> `epoch_membership` is populated (non-`None`) only when the index's
+> `EpochCommitmentStatus` (§3.4.8) is `Armed(S, E)`: `PreEpoch` when the
+> candidate's identity `(namespace, name, version, content_hash)` is a
+> member of the verified set `S` (`identity ∈ S`, §3.4.8's local set-lookup
+> rule); `PostEpoch` when it is not. When `EpochCommitmentStatus` is
+> `Unarmed`, `epoch_membership` is `None` — NOT a third `EpochMembership`
+> variant — because "no commitment is armed" is a fact about the index,
+> already fully captured by `EpochCommitmentStatus`, and is not itself a
+> per-entry classification (D14). `PreEpoch` stays warn-territory even
+> under `entry-trust "strict"` (a fixed, shrinking grandfathered
+> population); `PostEpoch` is where the strict mandate applies; `Unarmed`
+> (via `epoch_membership = None`) is warn-equivalent for every candidate
+> from that registry, by the same D1/D11 rule §3.4.8 states normatively.
+> `published_at` (§3.2) is **informational only** and is NEVER read to
+> compute `epoch_membership` or any other part of this outcome.
+
+#### 3.6.4  Cross-axis precedence
+
+> NORMATIVE (index-trust strictly precedes entry-trust): For a given
+> resolve, index-trust (§3.4) — INCLUDING the epoch-commitment phase,
+> §3.4.8 — strictly precedes entry-trust (this section). This gate MUST
+> NOT evaluate any candidate until §3.4's whole-index verification and
+> §3.4.8's epoch-commitment phase have both completed without an
+> unrecovered hard failure: an `ArmingInvalid` (`TNG-INDEX-EPOCH-
+> COMMITMENT-INVALID`) or the D18 co-requirement's config error
+> (`TNG-INDEX-EPOCH-RATCHET-REQUIRED`) aborts the WHOLE resolve before
+> candidate selection begins, so this gate never runs at all on that
+> resolve. Consequently the `TNG-INDEX-*` and `TNG-ENTRY-*` slug families
+> never co-occur in a single resolve's outcome — a `TNG-INDEX-*` failure
+> always terminates the resolve upstream of every point this gate could
+> fire, and this gate's own failures are drawn exclusively from the
+> `TNG-ENTRY-*` family (§3.6.2).
 
 ---
 
