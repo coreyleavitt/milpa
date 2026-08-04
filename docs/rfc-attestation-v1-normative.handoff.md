@@ -234,9 +234,20 @@ Real-crypto Layer-2 fixtures minted + committed (`6f4a977`): `conformance/spec-v
 6. **S9 (cleanup + doc reconcile)** — final close-out; **Corey territory**: file the upstream sigstore-rs raw-digest issue (S-RustCrypto tripwire), the break-glass follow-up issue; superseded-pointer to rfc-registry-trust-federation.md; self-hosted `index-trust "off"` note; **the live tianguis epoch re-arm** (commitment over `S` + production index-history=strict + dry-run/diff + interregnum + signer parity) with acceptance criteria; update comparison-vs-nimble-atlas.md; update [[v1_critical_path]] memory.
 **RESUME:** after Corey mints S6 fixtures, `/loop` (or `/tdd`) resumes at S6→S7→S4→S5→S8→S9. Everything up to the real-crypto boundary is implemented and green.
 - [ ] S4 — flip BOTH defaults; **fix harness carve-out false-positive (Feas-C1)**; ~228 index-shaped migration split from entry-trust free path (Feas-C2)
-- [ ] S5 — verify/show under strict; verify-can't-self-heal remediation; no-epoch-armed notice; show --entry-trust parity-or-defer (R8,R10,D12)
-- [ ] S8 — differential attestation surface; conditional on §8b (allow-list vs pin)
-- [ ] S9 — doc reconcile incl. rfc-registry-trust-federation.md superseded-pointer + self-hosted migration note; break-glass follow-up issue; memory
+- [x] S5 — DONE `17abd68`. verify re-derives EpochCommitmentStatus from pinned cache + can't-self-heal remediation; D12 same-invocation "verified" vs cold-show "claims"; two-audience no-epoch-armed notice; `show --entry-trust` parity. Fixed 3 Rust CLI tests (needed PostEpoch for the strict mandate). Python exit 0; Rust workspace 0 failed.
+- [x] S8 — DONE `bc1717f`. Attestation fixtures documented as black-box KNOWN_LIMITATIONS (no CLI surface / S4 gate-ordering), differentially validated via in-process conformance against shared expected/; TestS8AttestationDifferential pins it; real-crypto D13 parity (both impls agree on the minted bundle). **Surfaced + fixed 6 S4 black-box regressions** (see below).
+- [ ] S9 — doc reconcile + file the deferred issues (list below); memory update. **LAST SLICE.**
+
+### 🔴 S9 FOLLOW-UP LIST (grew during S5-S8) — file as issues + reconcile
+1. **⚠️ S4 was incompletely gated (harness/ not run).** S4's flip broke 6 black-box harness fixtures (in-process adapter bypasses index-trust; real CLI applies it) — [[feedback_gate_active_impl_pytest]] trap. Fixed 061/135/136/137/138/214 in S8. **The FULL corpus migration is ~207 index.kdl-without-bundle-without-decl fixtures** — only 6 done (the black-box-TESTED ones); the rest can't be black-box-validated until the runner gap (below) is fixed. **Going forward: gate on `harness/` too.**
+2. **Black-box differential runner gaps (deferred):** `runner.py` doesn't handle cmd=`git-protocol` (13 fixtures → 8 baseline errors in TestB2/B4), `fetch` (exposed when git-protocol skipped), `index-trust`/`show-index-trust`/`entry-trust` (adapter-only recipe env). Extending it unblocks the full-corpus black-box differential + validates the full ~207 migration. FILE ISSUE.
+3. **2 pre-existing frozen failures** (test_slice_c_seed 177/208, FROZEN-IDENTITY-NOT-IN-STORE) — pre-date this RFC; note/file.
+4. Upstream sigstore-rs **raw-digest verify** issue (S-RustCrypto vendor-patch tripwire; distinct from #183 envelopeHash + sigstore-rs#285 Rekor). FILE.
+5. **Break-glass follow-up** (`MILPA_ENTRY_TRUST_BREAK_GLASS` + `--i-know-this-is-insecure`), deferred in the RFC's resolved-with-recommendation block. FILE.
+6. **Tianguis production epoch re-arm** (timestamp → `(C-over-S, Rekor)` set-once sidecar): commitment over `S` + production `index-history=strict` + dry-run/diff-of-`S` + interregnum grandfather-all + signer parity. Cross-repo coordination. FILE (tianguis).
+7. Doc reconcile: `comparison-vs-nimble-atlas.md` (attestation shipped/strict/v1), check off `rfc-per-entry-attestation.md`/`rfc-attestation-verifier.md` status boxes, superseded-pointer to `rfc-registry-trust-federation.md §6.1`, self-hosted `index-trust "off"` migration note (D11), cross-link D-Watermark to residual #187.
+8. Verify errors.md bijection has the 2 new slugs (added in S-EpochCommitment — confirm green).
+9. Update [[v1_critical_path]] memory: 13/14 slices done, S9 = doc/issue cleanup, the S4-migration + runner-gap deferrals.
 
 ## Round 2 review ledger
 | id | lens | sev | finding | disposition |
