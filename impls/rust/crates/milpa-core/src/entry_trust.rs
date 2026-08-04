@@ -1227,6 +1227,37 @@ mod tests {
         );
     }
 
+    /// S8 differential (rfc-attestation-v1-normative.md S8, D13): both impls verify the SAME
+    /// committed `entry-attested-pkg.bundle` against the SAME committed trust-root fixture
+    /// (`TrustBundle::production()` / `test_trust_bundle.json`) and must report the IDENTICAL
+    /// outcome — `Trusted`. D13: the trust root is a verification *input*, not part of the
+    /// impl, so "identical verdicts" is unconditional here — no trust-root allow-list. This is
+    /// the explicit Layer-2 differential pin, structured like the Layer-1 S5.5 cross-impl
+    /// pairing (`s5_5_multifault_bundle_same_slug_as_python` in `index_trust.rs` /
+    /// `test_index_trust.py::test_s55_multifault_bundle_same_slug_as_rust`); the Python
+    /// counterpart is `test_entry_trust.py::test_s8_real_entry_bundle_same_outcome_as_rust`.
+    /// Real crypto cannot be byte-identical-shared across impls (no shared mock corpus
+    /// fixture), so this is asserted per-impl against a shared expected-outcome constant
+    /// (`Trusted`) rather than via a single in-harness comparison — the S6 fallback this RFC
+    /// slice specifies.
+    #[test]
+    fn s8_real_entry_bundle_same_outcome_as_python() {
+        let bundle_bytes = std::fs::read(format!("{ENTRY_FIXTURE_DIR}/entry-attested-pkg.bundle"))
+            .expect("fixture entry bundle");
+
+        let result = SigstoreEntryVerifier.verify(
+            &entry_fixture_subject(),
+            &bundle_bytes,
+            &TrustBundle::production(),
+            ENTRY_FIXTURE_SIGNER,
+        );
+        assert_eq!(
+            result,
+            VerifierOutcome::Trusted,
+            "S8 differential: entry-attested-pkg.bundle must verify Trusted, matching Python's outcome, got {result:?}"
+        );
+    }
+
     /// S6 arming-commitment sidecar (D15): the commitment bundle is a whole-index-shaped
     /// artifact over the canonical preimage of the committed pre-epoch set `S`, verified via
     /// the SAME `SigstoreVerifier`/`verify_index_bundle` Layer-1 uses — proving signer-toolchain

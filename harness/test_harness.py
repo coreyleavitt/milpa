@@ -39,6 +39,8 @@ from harness.assertions import assert_conformance
 from harness.corpus import (
     KNOWN_LIMITATIONS,
     CorpusReport,
+    _detect_divergences,
+    discover_fixtures,
     format_report,
     run_corpus,
 )
@@ -649,6 +651,81 @@ class TestB4PythonRustCorpus(unittest.TestCase):
             rust_failed, 0,
             f"rust: {rust_failed} fixture(s) failed on the active (non-known-failing) set",
         )
+
+
+# ---------------------------------------------------------------------------
+# S8 — attestation surface in the differential harness
+# (rfc-attestation-v1-normative.md S8, D13)
+# ---------------------------------------------------------------------------
+
+class TestS8AttestationDifferential(unittest.TestCase):
+    """S8: the mock-seam index-trust (338-366) + entry-trust (367-377) fixtures.
+
+    These carry cmds/recipes the BLACK-BOX differential runner cannot drive:
+    ``index-trust``/``show-index-trust`` have no CLI surface (their ``env``
+    carries adapter-only recipe fields — ``MILPA_INDEX_TRUST_MANIFEST``,
+    ``mock_verifier_result`` — with no real CLI-flag equivalent, and most ship
+    no ``milpa.kdl``); the entry-trust tier resolves via the real CLI but, under
+    S4's flipped ``index-trust=strict`` default, hits the index-trust gate
+    before reaching the entry-trust gate it was authored for (the S4
+    index-trust-gate-ordering follow-up). They are therefore DOCUMENTED
+    ``KNOWN_LIMITATIONS`` for ``TestB4PythonRustCorpus`` (see ``corpus.py``), and
+    are differentially validated instead by EACH impl's in-process conformance
+    adapter matching the SAME committed ``expected/`` — both-match-expected means
+    the two impls agree. This class pins that disposition. The real-crypto
+    differential (both real verifiers agree on the committed bundle; D13's
+    shared trust root makes "identical verdicts" unconditional) is pinned
+    per-impl in ``test_entry_trust.py::test_s8_real_entry_bundle_same_outcome_as_rust``
+    and its Rust counterpart
+    ``entry_trust.rs::tests::s8_real_entry_bundle_same_outcome_as_python``.
+    """
+
+    @staticmethod
+    def _attestation_names() -> set:
+        return {
+            fx.name
+            for fx in discover_fixtures(_CONFORMANCE_ROOT)
+            if "index-trust" in fx.name or "entry-trust" in fx.name
+        }
+
+    def test_attestation_fixtures_discovered(self) -> None:
+        """discover_fixtures surfaces the whole attestation tier with no allow-list."""
+        names = self._attestation_names()
+        self.assertIn("fixture-338-index-trust-valid-trusted", names)
+        self.assertIn("fixture-367-entry-trust-strict-unattested", names)
+        self.assertIn("fixture-377-entry-trust-strict-trusted-succeeds", names)
+        self.assertGreaterEqual(
+            len(names), 40,
+            f"expected >=40 index-trust/entry-trust fixtures, found {len(names)}",
+        )
+
+    def test_attestation_fixtures_are_documented_black_box_limitations(self) -> None:
+        """Every attestation fixture is a DOCUMENTED KNOWN_LIMITATIONS entry for the
+        black-box differential runner (no CLI surface for index-trust/show-index-trust;
+        the S4 index-trust-gate-ordering collision for entry-trust). This guarantees
+        none silently drops out of cross-impl coverage unaccounted-for: the real
+        cross-impl guarantee is each impl's in-process conformance adapter validating
+        against the shared expected/ (test_attestation_fixtures_have_shared_expected)."""
+        undocumented = self._attestation_names() - set(KNOWN_LIMITATIONS)
+        self.assertEqual(
+            undocumented, set(),
+            "every attestation fixture must be a documented black-box KNOWN_LIMITATIONS "
+            "entry (covered instead by each impl's in-process conformance adapter); "
+            f"undocumented: {sorted(undocumented)}",
+        )
+
+    def test_attestation_fixtures_have_shared_expected(self) -> None:
+        """The cross-impl differential ANCHOR: both impls validate each attestation
+        fixture against the SAME committed expected/ dir, so both-passing — which the
+        green Python + Rust conformance suites establish — means the impls agree
+        (the same both-match-shared-expected guarantee S-EpochGate's armed fixtures use)."""
+        missing = sorted(
+            fx.name
+            for fx in discover_fixtures(_CONFORMANCE_ROOT)
+            if ("index-trust" in fx.name or "entry-trust" in fx.name)
+            and not (fx / "expected").is_dir()
+        )
+        self.assertEqual(missing, [], f"attestation fixtures missing expected/: {missing}")
 
 
 if __name__ == "__main__":

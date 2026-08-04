@@ -97,6 +97,107 @@ KNOWN_LIMITATIONS: dict[str, str] = {
     # remain (those adapters read milpa.kdl from fx.dir directly and do not
     # honour the project-dir control file — they are covered by impl-internal
     # unit tests instead).
+    #
+    # S8 (rfc-attestation-v1-normative.md, differential: attestation surface in
+    # the harness): the index-trust / show-index-trust fixture tier (338-366).
+    # These carry cmd="index-trust" or "show-index-trust", which runner.py has
+    # never mapped to a CLI invocation (confirmed via ValueError: "Unknown
+    # fixture cmd"). This is structural, not an oversight: the tier's `env` file
+    # carries schema-only recipe fields (e.g. MILPA_INDEX_TRUST_MANIFEST,
+    # mock_verifier_result) that each impl's OWN in-process conformance adapter
+    # (test_conformance.py::_execute_index_trust_fixture /
+    # milpa-conformance's Cmd::IndexTrust + Cmd::ShowIndexTrust) reads to
+    # synthesize a manifest and inject a MockVerifier result — there is no real
+    # CLI flag to drive a scripted verifier outcome, and most of these fixtures
+    # have no milpa.kdl on disk at all. Same category as lock-roundtrip /
+    # workspace-manifest-roundtrip above: no CLI surface, covered by
+    # impl-internal tests only (both impls' full test suites, part of the
+    # shared conformance corpus every impl runner consumes).
+    **{
+        name: (
+            "cmd=index-trust/show-index-trust has no CLI surface — the fixture's "
+            "env carries adapter-only recipe fields (MILPA_INDEX_TRUST_MANIFEST, "
+            "mock_verifier_result) with no real CLI flag equivalent; covered by "
+            "impl-internal tests only (test_conformance.py::_execute_index_trust_fixture "
+            "/ milpa-conformance Cmd::IndexTrust|ShowIndexTrust) — see RFC "
+            "rfc-attestation-v1-normative.md S8"
+        )
+        for name in (
+            "fixture-338-index-trust-valid-trusted",
+            "fixture-339-index-trust-warn-on-tamper",
+            "fixture-340-index-trust-strict-sig-invalid",
+            "fixture-341-index-trust-strict-digest-mismatch",
+            "fixture-342-index-trust-strict-signer-mismatch",
+            "fixture-343-index-trust-strict-bundle-missing",
+            "fixture-344-index-trust-strict-bundle-malformed",
+            "fixture-345-index-trust-strict-bundle-stale",
+            "fixture-346-index-trust-cert-expired-wall-clock-ok",
+            "fixture-347-index-trust-flag-escalates-warn",
+            "fixture-348-index-trust-upgrade-no-bundle-warn",
+            "fixture-349-index-trust-workspace-root-strict",
+            "fixture-350-index-trust-off-sig-invalid",
+            "fixture-351-index-trust-off-digest-mismatch",
+            "fixture-352-index-trust-off-bundle-missing",
+            "fixture-353-index-trust-manifest-off-env-strict",
+            "fixture-354-index-trust-manifest-warn-env-off",
+            "fixture-355-index-trust-workspace-member-illegal",
+            "fixture-356-show-index-trust-fresh",
+            "fixture-357-show-index-trust-stale",
+            "fixture-358-show-index-trust-no-bundle",
+            "fixture-359-index-trust-warn-sig-invalid",
+            "fixture-360-index-trust-warn-signer-mismatch",
+            "fixture-361-index-trust-warn-bundle-malformed",
+            "fixture-362-index-trust-warn-bundle-stale",
+            "fixture-363-index-trust-flag-escalation-failure",
+            "fixture-364-index-trust-env-strict-failure",
+            "fixture-365-index-trust-bundle-url-override",
+            "fixture-366-index-trust-workspace-root-off",
+        )
+    },
+    # S8: the entry-trust fixture tier (367-377). Unlike the index-trust tier
+    # above, these DO carry a real milpa.kdl + mocked-fetches/ and dispatch via
+    # the ordinary default cmd ("resolve" — no cmd file), so runner.py maps them
+    # to a real CLI invocation. But none of them declares `index-trust` and none
+    # ships an `index.kdl.bundle`, so under S4's flipped default (index-trust now
+    # strict) the REAL CLI's index-trust gate fires FIRST (TNG-INDEX-BUNDLE-MISSING)
+    # — before the fixture ever reaches the entry-trust gate it was authored to
+    # exercise. This is not a fresh S8 finding: it is the exact gap the S4 handoff
+    # already flagged as a non-blocking follow-up for Corey ("the general
+    # conformance corpus does NOT exercise index-trust=strict end-to-end (adapter
+    # bypasses it)... deferred; the flip is proven via dedicated fixtures + unit
+    # tests instead") — the in-process adapter's `_build_env` never invokes the
+    # CLI's index-trust gate (it constructs the index directly via `parse_index`),
+    # so it never sees this ordering collision; only the real black-box CLI does.
+    # Fixing this means deciding how the shared fixtures declare index-trust (the
+    # deferred ~228-fixture-style migration option (b)) — a judgment call for
+    # Corey, not a harness change. Covered today by each impl's own in-process
+    # conformance adapter (test_corpus_fixture / milpa-conformance), which DOES
+    # reach the entry-trust gate.
+    **{
+        name: (
+            "cmd=resolve, but the real CLI's index-trust gate (strict default, "
+            "S4) now fires before entry-trust because this fixture declares "
+            "neither `index-trust` nor an index.kdl.bundle — a known, already-"
+            "flagged S4 follow-up (see docs/rfc-attestation-v1-normative.handoff.md), "
+            "not a fresh S8 finding; deferred pending a fixture-authoring decision "
+            "for Corey. Covered by each impl's in-process conformance adapter, "
+            "which bypasses the CLI's index-trust gate and reaches entry-trust — "
+            "see RFC rfc-attestation-v1-normative.md S8"
+        )
+        for name in (
+            "fixture-367-entry-trust-strict-unattested",
+            "fixture-368-entry-trust-strict-bundle-missing-nopin",
+            "fixture-369-entry-trust-strict-bundle-missing-unfetchable",
+            "fixture-370-entry-trust-warn-bundle-pin-mismatch-unconditional",
+            "fixture-371-entry-trust-strict-bundle-malformed",
+            "fixture-372-entry-trust-strict-digest-mismatch",
+            "fixture-373-entry-trust-strict-subject-mismatch",
+            "fixture-374-entry-trust-strict-signature-invalid",
+            "fixture-375-entry-trust-strict-signer-mismatch",
+            "fixture-376-entry-trust-workspace-member-illegal",
+            "fixture-377-entry-trust-strict-trusted-succeeds",
+        )
+    },
 }
 
 

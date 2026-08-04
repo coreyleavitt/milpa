@@ -24,3 +24,4 @@ flags {
         }
     }
 }
+index-trust "warn"

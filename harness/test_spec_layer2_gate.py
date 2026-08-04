@@ -258,9 +258,8 @@ class TestLayer2GateNormativeSurface(unittest.TestCase):
             line,
             msg="entry-trust's normative home must now be this document's §3.6",
         )
-        # The default-value column is explicitly OUT of scope for S2 (S4
-        # flips it) — it must still read `warn`. Strip a leading blockquote
-        # marker (`> | ... |`) before splitting into cells.
+        # The default-value column reads `strict` as of S4 (the flip). Strip a
+        # leading blockquote marker (`> | ... |`) before splitting into cells.
         row = line.strip()
         if row.startswith(">"):
             row = row[1:].strip()
@@ -268,8 +267,8 @@ class TestLayer2GateNormativeSurface(unittest.TestCase):
         # cells: axis, manifest node(s), env var, default, member-error slug, normative home
         self.assertEqual(
             cells[3],
-            "`warn`",
-            msg="S2 must NOT change the entry-trust default column (S4's job)",
+            "`strict`",
+            msg="S4 flipped the entry-trust default column to `strict`",
         )
 
 

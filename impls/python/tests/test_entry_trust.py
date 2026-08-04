@@ -584,6 +584,27 @@ def test_s6_real_entry_bundle_wrong_signer_is_signer_mismatch() -> None:
     )
 
 
+def test_s8_real_entry_bundle_same_outcome_as_rust() -> None:
+    """S8 differential (rfc-attestation-v1-normative.md S8, D13): both impls verify the
+    SAME committed ``entry-attested-pkg.bundle`` against the SAME committed trust-root
+    fixture (``TrustBundle.production()`` / ``test_trust_bundle.json``) and must report
+    the IDENTICAL outcome — Trusted. D13: the trust root is a verification *input*, not
+    part of the impl, so "identical verdicts" is unconditional here — no trust-root
+    allow-list. This is the explicit Layer-2 differential pin, structured like the
+    Layer-1 S5.5 cross-impl pairing (test_s55_multifault_bundle_same_slug_as_rust /
+    index_trust.rs ``s5_5_multifault_bundle_same_slug_as_python``); the Rust counterpart
+    is entry_trust.rs ``tests::s8_real_entry_bundle_same_outcome_as_python``. Real crypto
+    cannot be byte-identical-shared across impls (no shared mock corpus fixture), so this
+    is asserted per-impl against a shared expected-outcome constant (Trusted) rather than
+    via a single in-harness comparison — the S6 fallback this RFC slice specifies."""
+    bundle_bytes = (_entry_fixture_dir() / "entry-attested-pkg.bundle").read_bytes()
+    v = SigstoreEntryVerifier()
+    assert (
+        v.verify(_entry_fixture_subject(), bundle_bytes, TrustBundle.production(), _ENTRY_FIXTURE_SIGNER)
+        is Trusted
+    ), "S8 differential: entry-attested-pkg.bundle must verify Trusted, matching Rust's outcome"
+
+
 def test_s6_real_commitment_bundle_verifies_trusted() -> None:
     """The arming-commitment sidecar (D15) is a whole-index-shaped bundle over the
     canonical preimage of the committed pre-epoch set S — verified via the SAME
