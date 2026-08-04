@@ -375,10 +375,17 @@ The library additions MUST be recorded in a `deps-rationale` comment in both
 The `index-trust` field in `milpa.kdl` controls the failure policy for
 whole-index verification.
 
+> **SUPERSEDED (v1, `rfc-attestation-v1-normative.md` D4/S4):** the default
+> flipped from `"warn"` to **`"strict"`** — both trust axes default strict in
+> v1. This section's old `"warn"` default and its "flip once all packages are
+> covered" adoption criteria are superseded by the epoch-commitment mechanism
+> (post-epoch entries are mandated; pre-epoch stay warn-equivalent). The policy
+> *values* below are unchanged; only the default is.
+
 | Policy value | Behavior on verification failure |
 |---|---|
-| `"warn"` (default) | Verify; resolve proceeds; emit one loud stderr warning per invocation. |
-| `"strict"` | Hard fail; raises the appropriate `TNG-INDEX-*` error. |
+| `"warn"` | Verify; resolve proceeds; emit one loud stderr warning per invocation. |
+| `"strict"` (**default, v1**) | Hard fail; raises the appropriate `TNG-INDEX-*` error. |
 | `"off"` | Skip verification entirely. |
 
 **Detection vs prevention:** Under `warn`, the gate provides tamper DETECTION

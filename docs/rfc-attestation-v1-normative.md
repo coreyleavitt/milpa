@@ -1,13 +1,16 @@
 # RFC: Strict attestation (both trust axes), normative in v1 — reconcile, complete, flip
 
-**Status:** draft (Stage 1 — RFC + slicing; **architect rounds 1–3 applied; all forks
-resolved**). Round 3 was the first adversarial review of D-Watermark itself (it entered via
-dialogue after the round-2 team ran); it applied the mechanism-agnostic hardening (D14–D16) and
-its two escalated forks are now **resolved** (Corey, 2026-08-04): **F1 → enumerated committed
-set `S`, membership `∈ S` (D17)**; **F2 → arming requires `index-history=strict`, a scoped
-co-requirement not a default flip (D18)**; F-op → grandfather-all-at-re-arm. Ready for `/tdd`
-from S1; S-EpochCommitment additionally needs tianguis re-arm coordination before it can go
-green. See §8c "Round-3 escalations — RESOLVED".)
+**Status:** **IMPLEMENTED** (2026-08-04 — architect rounds 1–3 applied, all forks resolved;
+all 14 slices landed + gated green in both impls). S1–S3 (spec), S-Acq/S-EpochCommitment/
+S-EpochGate/S-RustCrypto (builds), S6/S7 (real-crypto tiers, live-minted), S-Backdate (retired),
+S4 (both defaults flipped to strict), S5 (verify/show), S8 (differential), S9 (this doc/issue
+reconcile). Round 3 was the first adversarial review of D-Watermark itself; forks resolved:
+**F1 → enumerated committed set `S`, membership `∈ S` (D17)**; **F2 → arming requires
+`index-history=strict` (D18)**; F-op → grandfather-all-at-re-arm. **Residual (deferred, S9
+follow-ups in the handoff doc):** live tianguis production epoch re-arm (cross-repo); full
+~207-fixture black-box corpus migration + extending the differential runner (git-protocol/fetch/
+index-trust cmds); break-glass lever; upstream sigstore-rs raw-digest issue. See §8c
+"Round-3 escalations — RESOLVED".
 **Author:** Corey Leavitt
 **Tracking:** #184 (Registry trust Part 2), #185 (append-only), #182 (real-bundle claim extraction)
 **Depends on (all landed):** `rfc-per-entry-attestation.md` (Part 2 design; open

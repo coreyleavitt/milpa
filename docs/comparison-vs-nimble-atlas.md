@@ -47,7 +47,7 @@ deliberate scope-out.
 | Offline lockfile verification | requires git | requires git | **yes — bytes + lockfile suffice** |
 | Global content-addressed store | no | no | **yes — `~/.cache/milpa/store/sha256/...`, cross-project dedup** |
 | Hash algorithm agility | no | no | **yes — multihash encoding (`sha256:...`); future-proof** |
-| Sigstore / SLSA attestation | no | no | **yes (research direction)** |
+| Sigstore / SLSA attestation | no | no | **yes — SHIPPED: strict-default on both trust axes (`index-trust` whole-index + `entry-trust` per-entry), keyless Sigstore, epoch-gated, v1** |
 
 ### Resolution
 
@@ -226,6 +226,12 @@ transport dep delivery."
   fastest. Race to differentiation, not to parity.
 - **"Research direction" items in milpa's column** (proof
   certificates, compile-time graphs, effect-typed deps, refinement
-  types, OCI/IPFS, sigstore) are catalog entries in RFCs, not staffed
+  types, OCI/IPFS) are catalog entries in RFCs, not staffed
   implementations. They are positioned as multi-year directions, each
-  worth a publishable artifact.
+  worth a publishable artifact. (**Sigstore attestation is no longer in
+  this bucket** — it shipped as strict-default v1 on both trust axes; see
+  `rfc-attestation-v1-normative.md`.) NOTE (self-hosted / air-gapped, D11):
+  a registry that never carries a whole-index bundle must set
+  `index-trust "off"` on day one — the index-trust axis is an unconditional
+  hard fail without a bundle (only entry-trust has a warn-equivalent
+  no-epoch-armed grace), by design.
