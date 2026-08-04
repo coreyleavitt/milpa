@@ -1069,6 +1069,23 @@ def _load_manifest_entry_trust_policy(project_dir: Path) -> str:
     )
 
 
+def _effective_entry_trust_policy(env: MilpaEnv, project_dir: Path) -> "TrustPolicy":
+    """The effective entry-trust policy alone (steps 1-3 of
+    ``_build_entry_trust``, factored out as the SSOT both that function and
+    the S-EpochCommitment D18 co-requirement check (``_apply_epoch_commitment_phase``)
+    call — computing the full ``EntryTrustConfig`` just for its policy field
+    would build a bundle store and resolve a verifier for no reason)."""
+    from milpa.trust import effective_trust_policy
+
+    env_entry_trust_raw = os.environ.get("MILPA_ENTRY_TRUST", "").strip() or None
+    manifest_policy = _load_manifest_entry_trust_policy(project_dir)
+    return effective_trust_policy(
+        manifest_policy,  # type: ignore[arg-type]
+        flag=env.require_attested_entries,
+        env_override=env_entry_trust_raw,
+    )
+
+
 def _build_entry_trust(
     env: MilpaEnv,
     project_dir: Path,
@@ -1110,20 +1127,9 @@ def _build_entry_trust(
         SubjectMismatch,
         Trusted,
     )
-    from milpa.trust import effective_trust_policy
-
-    # 1. Read entry-trust env vars.
-    env_entry_trust_raw = os.environ.get("MILPA_ENTRY_TRUST", "").strip() or None
-
-    # 2. Load manifest entry-trust policy (root-scoped SSOT).
-    manifest_policy = _load_manifest_entry_trust_policy(project_dir)
-
-    # 3. Compute effective policy.
-    policy = effective_trust_policy(
-        manifest_policy,  # type: ignore[arg-type]
-        flag=env.require_attested_entries,
-        env_override=env_entry_trust_raw,
-    )
+    # 1-3. Effective entry-trust policy (SSOT, shared with the
+    # S-EpochCommitment D18 co-requirement check).
+    policy = _effective_entry_trust_policy(env, project_dir)
 
     if policy == "off":
         return None
@@ -1320,7 +1326,138 @@ def _load_index_for_verb(env: MilpaEnv, project_dir: "Path | None" = None) -> Mi
             # Unreachable index → let the resolver raise RES-NO-INDEX per dep.
             return replace(env, index=None)
         raise  # TNG-* and other catalog errors propagate
+
+    # S-EpochCommitment (rfc-attestation-v1-normative.md §6, D14-D18;
+    # registry-protocol §3.4.8/§3.4.9): the index-gate epoch-commitment
+    # phase, once per resolve, after index-trust's own verification
+    # succeeds and BEFORE any candidate is selected (this function runs
+    # before the resolver in every verb that calls it).
+    if project_dir is not None and config is not None and verifier is not None:
+        _apply_epoch_commitment_phase(env, project_dir, index, config, index_history_policy)
+
     return replace(env, index=index)
+
+
+# ---------------------------------------------------------------------------
+# S-EpochCommitment — the index-gate epoch-commitment phase (RFC
+# rfc-attestation-v1-normative.md §6, D14-D18; registry-protocol §3.4.8/§3.4.9)
+# ---------------------------------------------------------------------------
+
+
+def _apply_epoch_commitment_phase(
+    env: MilpaEnv,
+    project_dir: Path,
+    index: "object",
+    index_trust_config: "object",
+    index_history_policy: str,
+) -> None:
+    """Compute + enforce the epoch-commitment phase for one already-loaded
+    ``Index`` (mutated in place — ``Index`` is not frozen).
+
+    Reuses index-trust's already-resolved trust ROOT (``index_trust_config
+    .trust_bundle``) — the epoch commitment is authenticated against a
+    DEDICATED re-arm signer identity (D15), never the whole-index signer,
+    but the Fulcio/Rekor trust root is the same one index-trust resolved
+    for this invocation (spec §3.4.8: "resolved the same way").
+
+    JUDGMENT CALL (flagged, not spec-mandated): this phase runs ONLY when
+    index-trust is active for this invocation (the caller only invokes this
+    function when ``config is not None``, i.e. effective index-trust policy
+    is not ``"off"``). Spec §3.4.8 frames the phase as part of "the index
+    gate" without explicitly stating whether it is reachable when the
+    index-trust axis itself is disabled; since the phase's crypto has no
+    trust root to verify against in that case, gating it on index-trust's
+    own on/off state is the defensible reading adopted here. An index that
+    HAS armed a commitment while a consumer runs with index-trust off is
+    therefore silently treated as ``Unarmed`` by this consumer — a
+    documented residual, not a silent security downgrade of a check the
+    consumer opted into (index-trust off already means "no whole-index
+    crypto for this invocation").
+
+    Raises:
+        MilpaError(TNG-INDEX-EPOCH-COMMITMENT-INVALID) — unconditional
+            abort on ``ArmingInvalid`` (D14).
+        MilpaError(TNG-INDEX-EPOCH-RATCHET-REQUIRED) — the D18
+            co-requirement (``Armed`` + ``entry-trust=strict`` requires
+            ``index-history=strict``).
+    """
+    from milpa.epoch_commitment import (
+        DEFAULT_REARM_SIGNER,
+        check_epoch_ratchet_requirement,
+        enforce_epoch_commitment,
+    )
+    from milpa.index_cache import (
+        index_url_from_env,
+        load_epoch_commitment_status,
+        read_cached_epoch_commitment_pointer,
+    )
+    from milpa.index_trust import MockVerifier, SigstoreVerifier, VerificationResult
+
+    index_url = index_url_from_env()
+    pointer = read_cached_epoch_commitment_pointer(index_url)
+
+    # Verifier: MockVerifier from the conformance seam (mirrors
+    # MILPA_INDEX_TRUST_MOCK_VERIFIER's file://-only guard exactly), else
+    # SigstoreVerifier — the SAME production class index-trust uses (see
+    # epoch_commitment.py's "Composed verification reuse" for why this is
+    # safe: only expected_signer differs).
+    _MOCK_MAP = {
+        "trusted": VerificationResult.TRUSTED,
+        "sig-invalid": VerificationResult.SIG_INVALID,
+        "digest-mismatch": VerificationResult.DIGEST_MISMATCH,
+        "signer-mismatch": VerificationResult.SIGNER_MISMATCH,
+        "bundle-stale": VerificationResult.BUNDLE_STALE,
+        "bundle-missing": VerificationResult.BUNDLE_MISSING,
+        "bundle-malformed": VerificationResult.BUNDLE_MALFORMED,
+    }
+    mock_result_str = os.environ.get("MILPA_INDEX_EPOCH_MOCK_VERIFIER", "").strip()
+    verifier: object
+    if mock_result_str:
+        if not index_url.startswith("file://"):
+            raise MilpaError(
+                MILPA_INTERNAL,
+                "MILPA_INDEX_EPOCH_MOCK_VERIFIER is conformance-internal and only "
+                "honored for file:// index URLs (all conformance fixtures use "
+                "file://; production indexes are https). This variable must not "
+                "be set in production or with non-file:// index URLs.",
+            )
+        mock_result = _MOCK_MAP.get(mock_result_str)
+        if mock_result is None:
+            raise MilpaError(
+                MILPA_INTERNAL,
+                f"MILPA_INDEX_EPOCH_MOCK_VERIFIER={mock_result_str!r} is not a "
+                f"valid VerificationResult wire string (expected one of: "
+                f"{', '.join(_MOCK_MAP)}). Test seam must never fail-open silently.",
+            )
+        verifier = MockVerifier(mock_result)
+    else:
+        verifier = SigstoreVerifier()
+
+    # Signer: a DEDICATED re-arm identity (D15), overridable independently
+    # of the whole-index signer (MILPA_INDEX_TRUST_SIGNER is NOT reused here
+    # on purpose). No manifest-node override exists yet (env-only for this
+    # slice) — a natural follow-up, not a trust-default change.
+    expected_signer = (
+        os.environ.get("MILPA_INDEX_EPOCH_SIGNER", "").strip() or DEFAULT_REARM_SIGNER
+    )
+
+    status = load_epoch_commitment_status(
+        index_url=index_url,
+        pointer=pointer,
+        verifier=verifier,
+        trust_bundle=index_trust_config.trust_bundle,  # type: ignore[attr-defined]
+        expected_signer=expected_signer,
+    )
+    index.epoch_commitment_status = status  # type: ignore[attr-defined]
+
+    enforce_epoch_commitment(status)
+
+    entry_trust_policy = _effective_entry_trust_policy(env, project_dir)
+    check_epoch_ratchet_requirement(
+        status,
+        entry_trust_policy=entry_trust_policy,
+        index_history_policy=index_history_policy,
+    )
 
 
 def _reverify_cached_index_bundle(env: MilpaEnv, project_dir: "Path | None") -> None:

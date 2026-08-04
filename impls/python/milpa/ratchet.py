@@ -79,6 +79,17 @@ class OrderKind(Enum):
     APPEND_ONLY_MULTISET = "append-only-multiset"
     ADVISORY_MUTABLE = "advisory-mutable"
     ORDINAL_NON_DECREASING = "ordinal-non-decreasing"
+    #: registry-protocol §3.5.1's `attestation-epoch-commitment` root-field
+    #: row (R12): permits exactly one `absent -> value` transition, reading
+    #: identically to SET_ONCE in English but DELIBERATELY tagged separately
+    #: (the table-header note: distinct tags even for orders that read
+    #: alike) — this field's "value" is a content-address POINTER into an
+    #: externally composed-verified sidecar (§3.4.9), not a self-contained
+    #: claim the ratchet fold alone authenticates; sharing SET_ONCE's tag
+    #: would wrongly suggest re-typing the EXISTING `attestation-epoch`
+    #: field's shape (timestamp -> commitment) is a sanctioned migration
+    #: path (it is not — D16).
+    APPEND_ONCE = "append-once"
 
 
 # ---------------------------------------------------------------------------
@@ -291,6 +302,7 @@ LATTICE: dict[str, FieldSpec] = {
     # --- Root fields (document-level, reserved empty key) ---
     "schema_version": FieldSpec(OrderKind.ORDINAL_NON_DECREASING),
     "attestation-epoch": FieldSpec(OrderKind.SET_ONCE),
+    "attestation-epoch-commitment": FieldSpec(OrderKind.APPEND_ONCE),
 }
 
 #: Field groups that move in lockstep (§3.5.1: "``dep_decl`` **together
@@ -316,6 +328,16 @@ def _dominates_set_once(baseline: object, candidate: object) -> str | None:
     if candidate != baseline:
         return FROZEN_CHANGED
     return None
+
+
+def _dominates_append_once(baseline: object, candidate: object) -> str | None:
+    """Same dominance LOGIC as ``_dominates_set_once`` (absent -> anything is
+    legal exactly once; any change thereafter, including a value-preserving
+    re-encoding, violates) but kept as its own function per the OrderKind
+    docstring's "distinct tags even for orders that read alike" rule — a
+    future divergence between the two orders (e.g. a re-arm exception) has
+    a dedicated call site to change without touching SET_ONCE's fields."""
+    return _dominates_set_once(baseline, candidate)
 
 
 def _dominates_ordinal(baseline: object, candidate: object) -> str | None:
@@ -381,6 +403,7 @@ _DISPATCH: dict[OrderKind, Callable[[object, object], str | None]] = {
     OrderKind.ATTESTATION_MONOTONE: _dominates_attestation,
     OrderKind.APPEND_ONLY_MULTISET: _dominates_multiset,
     OrderKind.ADVISORY_MUTABLE: _dominates_advisory,
+    OrderKind.APPEND_ONCE: _dominates_append_once,
 }
 
 

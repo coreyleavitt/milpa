@@ -188,6 +188,9 @@ def _index_state_from(doc: KdlDocument, index: Index) -> IndexState:
             fields={
                 "schema_version": RawField(value=_raw_schema_version(doc)),
                 "attestation-epoch": RawField(value=_raw_attestation_epoch(doc)),
+                "attestation-epoch-commitment": RawField(
+                    value=_raw_attestation_epoch_commitment(doc)
+                ),
             }
         ),
     }
@@ -260,6 +263,35 @@ def _raw_attestation_epoch(doc: KdlDocument) -> str | None:
         if epoch is not None:
             _validate_no_control_chars(epoch, "attestation-epoch")
         return epoch
+    return None
+
+
+def _raw_attestation_epoch_commitment(doc: KdlDocument) -> str | None:
+    """The document-root ``attestation-epoch-commitment`` string, or ``None``
+    if absent (registry-protocol §3.4.8's typed pointer / §3.5.1's
+    ``Append-once`` root-field row, R12 — S-EpochCommitment,
+    ``rfc-attestation-v1-normative.md`` §6, D16). A *new*, separate root
+    field from the legacy ``attestation-epoch`` timestamp — see
+    ``_raw_attestation_epoch``'s docstring and D16: re-typing that existing
+    field's shape would trip ``TNG-INDEX-ROOT-MUTATED`` for every consumer
+    with an established baseline the moment a registry re-arms, so this is
+    a sibling field with its own ``OrderKind.APPEND_ONCE`` row instead.
+
+    Like ``attestation-epoch``, this field is not part of any ``package``
+    node, so ``registry.parse_index``'s own charset pass never sees it —
+    this re-walk is the only site that extracts it, so it is also the only
+    site that can charset-check it (registry-protocol §3.3 NORMATIVE).
+    """
+    for n in nodes(doc):
+        if node_name(n) != "attestation-epoch-commitment":
+            continue
+        args = node_args(n)
+        if not args:
+            return None
+        pointer = node_arg_str(n, 0)
+        if pointer is not None:
+            _validate_no_control_chars(pointer, "attestation-epoch-commitment")
+        return pointer
     return None
 
 

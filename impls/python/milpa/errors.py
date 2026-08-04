@@ -398,6 +398,14 @@ TNG_INDEX_BASELINE_CORRUPT = "TNG-INDEX-BASELINE-CORRUPT"
 # corpus.rs DEFERRED (joins the rest of the index-history axis).
 TNG_INDEX_NOT_CONFIGURED = "TNG-INDEX-NOT-CONFIGURED"
 TNG_INDEX_BASELINE_WRITE_FAILED = "TNG-INDEX-BASELINE-WRITE-FAILED"
+# S-EpochCommitment (rfc-attestation-v1-normative.md §6, D14-D18;
+# registry-protocol.md §3.4.8/§3.4.9): the index-gate pre-epoch set arming
+# phase.  COMMITMENT-INVALID is the unconditional fail-closed abort on a
+# present-but-unverifiable `attestation-epoch-commitment` pointer.
+# RATCHET-REQUIRED is the D18 co-requirement config error (Armed +
+# entry-trust=strict without index-history=strict).
+TNG_INDEX_EPOCH_COMMITMENT_INVALID = "TNG-INDEX-EPOCH-COMMITMENT-INVALID"
+TNG_INDEX_EPOCH_RATCHET_REQUIRED = "TNG-INDEX-EPOCH-RATCHET-REQUIRED"
 # TNG-ENTRY-* codes — per-entry Sigstore attestation gate (RFC
 # per-entry-attestation.md §5, P3a).  Eight codes, added to spec/errors.md AND
 # errors.py in the same commit per the bijection invariant.  Stage order (§5

@@ -52,6 +52,7 @@ from milpa.kdl_io import (
     parse_kdl,
     value_as_int,
 )
+from milpa.epoch_commitment import EpochCommitmentStatus, Unarmed
 from milpa.version import Version, VersionSet, parse_version
 
 # ---------------------------------------------------------------------------
@@ -522,9 +523,20 @@ class Index:
     Packages are stored in document order for deterministic iteration.
     Internal lookup is by ``(namespace, name)`` for qualified access or by
     bare name for ``lookup_bare``.
+
+    ``epoch_commitment_status`` — the S-EpochCommitment index-gate phase's
+    output (``rfc-attestation-v1-normative.md`` §6, D14; registry-protocol
+    §3.4.8). Defaults to ``Unarmed`` — ``parse_index`` itself never computes
+    this (parsing is pure, offline, and crypto-free); the caller that owns
+    sidecar acquisition + composed verification (``cli.py`` /
+    ``index_cache.py``, once per resolve) overwrites this field with the
+    real computed status AFTER ``parse_index`` returns. ``Index`` is a plain
+    mutable dataclass (not frozen), so this is a direct attribute
+    assignment, not a ``dataclasses.replace``.
     """
 
     packages: list[Package] = field(default_factory=list)
+    epoch_commitment_status: EpochCommitmentStatus = field(default_factory=Unarmed)
 
     def lookup_bare(self, name: str) -> Package | AmbiguousName | None:
         """Bare-name (namespace-unqualified) lookup.

@@ -80,8 +80,9 @@ from milpa.atomic_cache import unique_temp_path as _unique_temp_path
 from milpa.errors import MILPA_INDEX_UNREACHABLE, MilpaError
 
 if TYPE_CHECKING:
+    from milpa.epoch_commitment import EpochCommitmentStatus
     from milpa.index_ratchet_seam import BaselineMeta, GateDecision
-    from milpa.index_trust import IndexBundleVerifier, IndexTrustConfig
+    from milpa.index_trust import IndexBundleVerifier, IndexTrustConfig, TrustBundle
     from milpa.registry import Index
 
 # ---------------------------------------------------------------------------
@@ -152,6 +153,20 @@ def _default_cache_dir() -> Path:
     return base / "milpa" / "index"
 
 
+def _derive_sidecar_url(index_url: str, suffix: str) -> str:
+    """Shared path-suffix derivation for every index sidecar URL (index
+    bundle §3.4.2/§7.3, epoch-commitment sidecar §3.4.9): strip query string
+    and fragment from ``index_url``; append *suffix* to the URL PATH; then
+    reattach the original query string and fragment.  Naive string suffixing
+    breaks ``?ref=main`` and trailing-slash URLs (e.g.
+    ``https://host/index.kdl?ref=main.bundle`` is wrong) — the ONE
+    implementation both ``derive_bundle_url`` and ``derive_commitment_url``
+    delegate to (single source of truth for this derivation rule)."""
+    parsed = urlparse(index_url)
+    new_path = parsed.path + suffix
+    return urlunparse(parsed._replace(path=new_path))
+
+
 def derive_bundle_url(index_url: str) -> str:
     """Derive the bundle sidecar URL from the index URL (RFC §7.3 NORMATIVE).
 
@@ -164,11 +179,20 @@ def derive_bundle_url(index_url: str) -> str:
         ``https://raw.githubusercontent.com/coreyleavitt/tianguis/main/index.kdl``
         → ``https://raw.githubusercontent.com/coreyleavitt/tianguis/main/index.kdl.bundle``
     """
-    parsed = urlparse(index_url)
-    # Append .bundle to the path component only.
-    new_path = parsed.path + ".bundle"
-    # Reattach query and fragment (if any).
-    return urlunparse(parsed._replace(path=new_path))
+    return _derive_sidecar_url(index_url, ".bundle")
+
+
+def derive_commitment_url(index_url: str) -> str:
+    """Derive the epoch-commitment sidecar URL from the index URL
+    (registry-protocol §3.4.9 NORMATIVE): identical derivation to
+    ``derive_bundle_url``, substituting the ``.epoch-commitment`` suffix for
+    ``.bundle``.
+
+    Example (default index URL):
+        ``https://raw.githubusercontent.com/coreyleavitt/tianguis/main/index.kdl``
+        → ``https://raw.githubusercontent.com/coreyleavitt/tianguis/main/index.kdl.epoch-commitment``
+    """
+    return _derive_sidecar_url(index_url, ".epoch-commitment")
 
 
 # ---------------------------------------------------------------------------
@@ -433,6 +457,172 @@ def write_baseline_pair(
             "— the previous baseline pair (if any) is left intact",
             url=url,
         ) from exc
+
+
+# ---------------------------------------------------------------------------
+# Epoch-commitment sidecar acquisition (registry-protocol §3.4.9;
+# rfc-attestation-v1-normative.md §6 S-EpochCommitment sub-slice 3).
+#
+# Mirrors the whole-index bundle's fetch+cache class above, with ONE
+# structural difference: the bundle sidecar is cached by URL (one fixed
+# slot per index URL, overwritten on every refresh); this sidecar is
+# CONTENT-ADDRESSED, cached by the commitment digest ``C`` itself
+# (registry-protocol §3.4.9 NORMATIVE: "cached as an immutable
+# content-addressed artifact keyed by C ... no TTL, no staleness concept").
+# A new ``C`` (a re-arm, or a different registry) is simply a cache miss —
+# there is no "stale key" comparison to perform, unlike the single-slot
+# bundle cache.  This is the SAME content-addressed-by-hash-pin shape
+# ``entry_bundle_store.py`` uses for per-entry attestation bundles.
+# ---------------------------------------------------------------------------
+
+#: Epoch-commitment sidecar cache sub-directory under ``~/.cache/milpa/``.
+_EPOCH_COMMITMENT_CACHE_SUBDIR = "epoch-commitment"
+
+
+def _default_epoch_commitment_cache_dir() -> Path:
+    """``$XDG_CACHE_HOME/milpa/epoch-commitment/`` (default
+    ``~/.cache/milpa/epoch-commitment/``) — mirrors
+    ``entry_bundle_store._default_entry_bundle_cache_dir`` with a dedicated
+    sub-directory (the store's native content-address key, ``C``)."""
+    xdg = os.environ.get("XDG_CACHE_HOME", "").strip()
+    base = Path(xdg) if xdg else Path.home() / ".cache"
+    return base / "milpa" / _EPOCH_COMMITMENT_CACHE_SUBDIR
+
+
+def _epoch_commitment_cache_path(pointer: str, cache_dir: Path) -> Path:
+    """``<cache_dir>/<C>.epoch-commitment`` — the content-addressed cache
+    file for the commitment sidecar whose digest is *pointer*."""
+    return cache_dir / f"{pointer}.epoch-commitment"
+
+
+#: A fetch transport for the epoch-commitment sidecar: maps a URL string to
+#: body bytes, or raises on any failure (network error, 404 — this artifact
+#: class has no degraded "missing sidecar, proceed anyway" mode: the
+#: on-index pointer being present is itself the unconditional trigger,
+#: registry-protocol §3.4.9).
+EpochCommitmentHttpGet = Callable[[str], bytes]
+
+
+def read_cached_epoch_commitment_pointer(
+    index_url: str, cache_dir: "Path | None" = None
+) -> "str | None":
+    """Read the ``attestation-epoch-commitment`` pointer off the CACHED
+    index text for *index_url* (registry-protocol §3.4.8's typed pointer).
+
+    ``load_index`` returns only the parsed, validated ``Index`` — it does
+    not surface document-root free-text fields (the same reason
+    ``index_ratchet_seam.py`` exists as a re-walk seam for
+    ``attestation-epoch``: ``registry.parse_index`` never sees fields
+    outside a ``package`` node). This is a SECOND read of the same cached
+    file ``load_index`` just wrote or verified moments earlier — a
+    pragmatic simplification over threading the pointer through every
+    branch of ``load_index``'s four-state machine; safe because by the
+    time a caller reaches this function, ``load_index`` has already
+    completed Layer-1 verification for this invocation, so the cached
+    bytes are the same trusted bytes already served.
+
+    Returns ``None`` when there is no cache file yet, or the file cannot be
+    decoded/parsed as KDL (mirrors ``_raw_attestation_epoch``'s posture:
+    absence is not itself an error at this call site — a malformed index
+    would already have raised earlier, inside ``load_index``'s own parse).
+    """
+    from milpa.index_ratchet_seam import _raw_attestation_epoch_commitment
+    from milpa.kdl_io import parse_kdl
+
+    effective_cache_dir = cache_dir if cache_dir is not None else _default_cache_dir()
+    cache_file = cache_path_for(index_url, effective_cache_dir)
+    try:
+        text = cache_file.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    try:
+        doc = parse_kdl(text, context="registry")
+    except MilpaError:
+        return None
+    return _raw_attestation_epoch_commitment(doc)
+
+
+def load_epoch_commitment_status(
+    *,
+    index_url: str,
+    pointer: "str | None",
+    cache_dir: "Path | None" = None,
+    http_get: "EpochCommitmentHttpGet | None" = None,
+    verifier: "IndexBundleVerifier",
+    trust_bundle: "TrustBundle",
+    expected_signer: str,
+) -> "EpochCommitmentStatus":
+    """The full acquisition + composed-verification orchestration for the
+    S-EpochCommitment index-gate phase (registry-protocol §3.4.8/§3.4.9).
+
+    Thin I/O wrapper over ``epoch_commitment.evaluate_epoch_commitment``
+    (pure): this function's ONLY job is "get the sidecar bytes from the
+    content-addressed cache or the network, exactly like every other
+    sidecar in this module" — the parse/digest/crypto logic lives in
+    ``epoch_commitment.py``, not here (mirrors the
+    ``index_ratchet_seam.py`` / ``index_cache.py`` split).
+
+    Acquisition:
+      1. ``pointer is None`` → no fetch attempted at all (``Unarmed``,
+         computed by the pure function with ``sidecar_bytes=None,
+         fetch_failed=False``).
+      2. Cache hit (``<cache_dir>/<pointer>.epoch-commitment`` exists) →
+         serve cached bytes, no network (D2: content-addressed, no TTL, no
+         re-verification against a wall-clock bound).
+      3. Cache miss → ONE fetch attempt via *http_get* at
+         ``derive_commitment_url(index_url)``. A raised exception maps to
+         ``fetch_failed=True`` (→ ``ArmingInvalid``) — this function MUST
+         NOT loop or retry (registry-protocol §3.4.9 NORMATIVE).
+
+    Persistence: the fetched bytes are cached ONLY when verification
+    produces ``Armed`` (never persist bytes that failed to verify — an
+    ``ArmingInvalid`` sidecar must be re-fetched, not remembered, so a
+    transient/attacker-served bad sidecar self-corrects on the next
+    invocation once the registry is fixed).
+    """
+    from milpa.epoch_commitment import Armed, evaluate_epoch_commitment
+
+    effective_cache_dir = cache_dir if cache_dir is not None else _default_epoch_commitment_cache_dir()
+    effective_http_get = http_get if http_get is not None else urllib_bundle_http_get
+
+    if pointer is None:
+        return evaluate_epoch_commitment(
+            pointer=None,
+            sidecar_bytes=None,
+            fetch_failed=False,
+            verifier=verifier,
+            trust_bundle=trust_bundle,
+            expected_signer=expected_signer,
+        )
+
+    cache_path = _epoch_commitment_cache_path(pointer, effective_cache_dir)
+    sidecar_bytes: bytes | None = None
+    fetch_failed = False
+    try:
+        sidecar_bytes = cache_path.read_bytes()
+    except OSError:
+        sidecar_url = derive_commitment_url(index_url)
+        try:
+            sidecar_bytes = effective_http_get(sidecar_url)
+        except Exception:
+            sidecar_bytes = None
+            fetch_failed = True
+
+    status = evaluate_epoch_commitment(
+        pointer=pointer,
+        sidecar_bytes=sidecar_bytes,
+        fetch_failed=fetch_failed,
+        verifier=verifier,
+        trust_bundle=trust_bundle,
+        expected_signer=expected_signer,
+    )
+
+    if isinstance(status, Armed) and sidecar_bytes is not None:
+        effective_cache_dir.mkdir(parents=True, exist_ok=True)
+        with contextlib.suppress(OSError):
+            _atomic_write_bytes(cache_path, sidecar_bytes)
+
+    return status
 
 
 # ---------------------------------------------------------------------------

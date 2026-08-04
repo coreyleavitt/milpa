@@ -1526,6 +1526,18 @@ The `<cache-key>.index.kdl.baseline` sidecar exists but is unparseable, truncate
 
 **Triggered:** `index_cache.write_baseline_pair` catches an `OSError` writing either sidecar of the `<cache-key>.index.kdl.baseline` / `.baseline.meta` pair. Per `cli-contract.md §5.12` NORMATIVE, this MUST be a loud, distinct error — never a printed-diff-then-silent-no-op — and MUST leave a previously-written baseline pair intact; each sidecar is written through the same per-write-unique-temp-name atomic writer (`_atomic_write_bytes`) the ordinary ratchet gate uses, so a failure creating/renaming the first temp file never mutates the existing pair.
 
+### `TNG-INDEX-EPOCH-COMMITMENT-INVALID`
+
+The index root's `attestation-epoch-commitment` pointer is present but failed to verify — unfetchable sidecar, malformed sidecar, `hash(S) != C`, or a composed-verification failure (bad Fulcio cert chain, bad DSSE signature, bad Rekor inclusion, or wrong re-arm signer).
+
+**Triggered:** `epoch_commitment.evaluate_epoch_commitment` (the index-gate epoch-commitment phase, `rfc-attestation-v1-normative.md` §6 slice S-EpochCommitment, D14-D17) produces `ArmingInvalid`, and `epoch_commitment.enforce_epoch_commitment` raises. Runs after the whole-index bundle verification (`§3.4.4`) succeeds and the index is parsed, and BEFORE any candidate is selected (`§5`) — an index-integrity fact identical for every entry, computed exactly once per resolve. Unconditional: this failure MUST NOT downgrade to a warning under any `entry-trust` policy value (there is no warn tier on this axis; mirrors the D4/D11 index-scoped-vs-entry-scoped asymmetry). `Unarmed` (the field absent) is the natural default and never raises this slug. Defined in `registry-protocol.md §3.4.8`.
+
+### `TNG-INDEX-EPOCH-RATCHET-REQUIRED`
+
+An armed epoch commitment (`EpochCommitmentStatus.Armed`) was found together with `entry-trust "strict"` while the effective `index-history` policy for the same registry is not `strict` — a configuration error, distinct from `ArmingInvalid`.
+
+**Triggered:** `epoch_commitment.check_epoch_ratchet_requirement` (the D18 co-requirement), raised once, before any candidate is selected. Rationale: Rekor's inclusion proof gives immutability, never exclusivity — nothing in the composed-verification check stops a compromised registry from logging a second valid commitment over a different pre-epoch set; "only the first commitment counts" is a set-once property enforced ONLY by the `index-history` ratchet's `Append-once` dominance fold (`§3.5.1`) applied to the `attestation-epoch-commitment` root field. Arming under `entry-trust "strict"` without `index-history "strict"` would ship a false security claim. This is a coupling invariant scoped to registries that arm a commitment — it does NOT change `index-history`'s own default (`warn`); an `Unarmed` registry never triggers this check. Defined in `registry-protocol.md §3.4.8`.
+
 The eight `TNG-ENTRY-*` slugs below are the failure states of the `entry-trust`
 gate's single ordered pipeline (one selected registry-resolved dep at a time,
 first-failing-stage-wins). The full per-stage table — condition, slug, and
