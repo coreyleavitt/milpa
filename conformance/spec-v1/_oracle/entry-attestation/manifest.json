@@ -1,0 +1,33 @@
+{
+  "bundles": [
+    {
+      "digest": "9141345c8bfa2251a85bd540e15f365d2dbdf02abd76d8b37d0ea727f5955772",
+      "file": "entry-attested-pkg.bundle",
+      "kind": "entry",
+      "subject_name": "pkg:tianguis/testns/attested-pkg@1.0.0"
+    },
+    {
+      "digest": "7d51aa499ecba42a73c3dda5d0a2cb4b8200d8d6f7d5ab38b6b87d66ca4e2e8b",
+      "file": "commitment.bundle",
+      "kind": "commitment",
+      "subject_name": "milpa-preepoch-set-commitment"
+    }
+  ],
+  "commitment_c": "7d51aa499ecba42a73c3dda5d0a2cb4b8200d8d6f7d5ab38b6b87d66ca4e2e8b",
+  "issuer": "https://token.actions.githubusercontent.com",
+  "pass_entry": {
+    "content_hash": "dag-sha256:9141345c8bfa2251a85bd540e15f365d2dbdf02abd76d8b37d0ea727f5955772",
+    "name": "attested-pkg",
+    "namespace": "testns",
+    "version": "1.0.0"
+  },
+  "pre_epoch_set": [
+    {
+      "content_hash": "dag-sha256:862bb412668033e2f5665980220f9da2df20a3bb651dfe31b3cdae23725e06e4",
+      "name": "legacy-pkg",
+      "namespace": "testns",
+      "version": "0.9.0"
+    }
+  ],
+  "signer_san": "https://github.com/coreyleavitt/milpa/.github/workflows/generate-entry-attestation-fixtures.yaml@refs/heads/main"
+}
