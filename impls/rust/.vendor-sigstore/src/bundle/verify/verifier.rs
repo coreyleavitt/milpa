@@ -125,6 +125,60 @@ impl Verifier {
         P: VerificationPolicy,
     {
         let input_digest = input_digest.finalize();
+        self.verify_digest_bytes(&input_digest, bundle, policy, offline)
+            .await
+    }
+
+    /// Verifies an ALREADY-COMPUTED digest against the given Sigstore Bundle, ensuring
+    /// conformance to the provided [`VerificationPolicy`].
+    ///
+    /// milpa patch (upstream gap, not present in sigstore-rs 0.14.0; distinct from the
+    /// `envelopeHash` fix documented in `MILPA-PATCH.md`): the crate's only public verify
+    /// entry points (`verify_digest` / `verify`) require a live [`Sha256`] hasher seeded
+    /// with the REAL preimage bytes of the attested artifact — they call `.finalize()`
+    /// internally to obtain the digest. A caller that already holds the digest (and not the
+    /// preimage — e.g. a content-addressed identity computed and recorded elsewhere) has no
+    /// way to call in; seeding a hasher with the digest itself would be a preimage attack,
+    /// not a re-derivation. This method exposes the shared verification body
+    /// ([`verify_digest_bytes`]) directly over caller-supplied digest bytes, skipping ONLY
+    /// the hasher-finalize API step — every cryptographic check below (Fulcio cert chain,
+    /// SCT, DSSE/message signature, subject-digest consistency, policy) is identical to
+    /// [`verify_digest`]'s. TODO(milpa): delete this method (and its `blocking::Verifier`
+    /// mirror) if/when sigstore-rs exposes a raw-digest verify entry point upstream; track
+    /// as a distinct upstream item from #183 (envelopeHash re-serialization) and
+    /// sigstore-rs#285 (Rekor inclusion-proof wiring) — this is a third, independent gap.
+    ///
+    /// [`verify_digest`]: Verifier::verify_digest
+    pub async fn verify_raw_digest<P>(
+        &self,
+        input_digest: &[u8],
+        bundle: Bundle,
+        policy: &P,
+        offline: bool,
+    ) -> VerificationResult
+    where
+        P: VerificationPolicy,
+    {
+        self.verify_digest_bytes(input_digest, bundle, policy, offline)
+            .await
+    }
+
+    /// Shared verification body for [`verify_digest`] and [`verify_raw_digest`], over
+    /// already-computed digest bytes. See [`verify_raw_digest`]'s doc comment for why this
+    /// extraction exists (milpa patch).
+    ///
+    /// [`verify_digest`]: Verifier::verify_digest
+    /// [`verify_raw_digest`]: Verifier::verify_raw_digest
+    async fn verify_digest_bytes<P>(
+        &self,
+        input_digest: &[u8],
+        bundle: Bundle,
+        policy: &P,
+        offline: bool,
+    ) -> VerificationResult
+    where
+        P: VerificationPolicy,
+    {
         let materials: CheckedBundle = bundle.try_into()?;
 
         // In order to verify an artifact, we need to achieve the following:
@@ -181,7 +235,7 @@ impl Verifier {
             &materials.content,
             &signing_key,
             &materials.signature,
-            &input_digest,
+            input_digest,
         )?;
 
         debug!("signature corresponds to public key");
@@ -189,7 +243,7 @@ impl Verifier {
         // 4) Verify that the Rekor entry is consistent with the other signing
         //    materials
         let log_entry = materials
-            .tlog_entry(offline, &input_digest)
+            .tlog_entry(offline, input_digest)
             .ok_or(SignatureErrorKind::Transparency)?;
         debug!("log entry is consistent with other materials");
 
@@ -306,6 +360,26 @@ pub mod blocking {
             self.rt.block_on(
                 self.inner
                     .verify_digest(input_digest, bundle, policy, offline),
+            )
+        }
+
+        /// Verifies an ALREADY-COMPUTED digest against the given Sigstore Bundle, ensuring
+        /// conformance to the provided [`VerificationPolicy`]. milpa patch — see
+        /// [`AsyncVerifier::verify_raw_digest`] for the full rationale and the upstream-gap
+        /// tripwire.
+        pub fn verify_raw_digest<P>(
+            &self,
+            input_digest: &[u8],
+            bundle: Bundle,
+            policy: &P,
+            offline: bool,
+        ) -> VerificationResult
+        where
+            P: VerificationPolicy,
+        {
+            self.rt.block_on(
+                self.inner
+                    .verify_raw_digest(input_digest, bundle, policy, offline),
             )
         }
 

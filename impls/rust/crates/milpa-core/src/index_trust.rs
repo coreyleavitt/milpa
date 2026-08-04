@@ -417,13 +417,18 @@ fn extract_integrated_time(bundle_json: &serde_json::Value) -> Option<u64> {
 /// (RFC §4 error-taxonomy gap). So milpa cannot tell `SignerMismatch` from `SigInvalid`
 /// from the returned error. This wrapper records the policy-vs-not signal at the call site
 /// instead — byte-for-byte the same technique as the Python `_RecordingPolicy`.
-struct RecordingPolicy<'a> {
+///
+/// `pub(crate)` — S-RustCrypto (`rfc-attestation-v1-normative.md` D7) reuses this
+/// verbatim from `entry_trust.rs`'s `SigstoreEntryVerifier`, which needs the identical
+/// policy-vs-not recording trick for its own `SignerMismatch`/`SignatureInvalid` split.
+/// One implementation, two call sites — not a duplicated struct.
+pub(crate) struct RecordingPolicy<'a> {
     inner: &'a Identity,
-    rejected: Cell<bool>,
+    pub(crate) rejected: Cell<bool>,
 }
 
 impl<'a> RecordingPolicy<'a> {
-    fn new(inner: &'a Identity) -> Self {
+    pub(crate) fn new(inner: &'a Identity) -> Self {
         Self {
             inner,
             rejected: Cell::new(false),
@@ -1059,6 +1064,37 @@ mod tests {
         // Wrong index bytes → DigestMismatch (pre-check fires first).
         let r = SigstoreVerifier.verify(b"tampered index", &bundle, &TrustBundle::production(), FIXTURE_SIGNER, None);
         assert_eq!(r, VerificationResult::DigestMismatch, "wrong index → DigestMismatch, got {r:?}");
+    }
+
+    /// S-RustCrypto (RFC `rfc-attestation-v1-normative.md` D7): proves the milpa
+    /// `.vendor-sigstore` patch's new `blocking::Verifier::verify_raw_digest` entry point
+    /// (MILPA-PATCH.md "Change 2") performs the EXACT same real cryptography as
+    /// `verify_digest` — Fulcio cert chain + SCT + DSSE signature + SAN/issuer policy —
+    /// when handed an already-computed digest instead of a live `Sha256` hasher. This is
+    /// the load-bearing proof that bypassing only the hasher-finalize API step does not
+    /// weaken any check: it drives the SAME real bundle
+    /// `s5_real_bundle_verifies_trusted_end_to_end` verifies through the hasher path,
+    /// but through the raw-digest path `entry_trust.rs`'s `SigstoreEntryVerifier` uses
+    /// (it has no source preimage to seed a hasher with — see that module's "Real
+    /// crypto" doc section).
+    #[test]
+    fn verify_raw_digest_real_bundle_trusted_end_to_end() {
+        let index_bytes = std::fs::read(format!("{FIXTURE_DIR}/index.kdl")).expect("fixture index");
+        let bundle_bytes =
+            std::fs::read(format!("{FIXTURE_DIR}/index.kdl.bundle")).expect("fixture bundle");
+        let bundle: sigstore::bundle::Bundle =
+            serde_json::from_slice(&bundle_bytes).expect("parse real bundle");
+        let digest = Sha256::digest(&index_bytes);
+
+        let trust_root =
+            map_trusted_root(TrustBundle::production().raw_json).expect("map production trust root");
+        let verifier =
+            Verifier::new(RekorConfiguration::default(), trust_root).expect("construct verifier");
+        let identity = Identity::new(FIXTURE_SIGNER, DEFAULT_INDEX_ISSUER);
+        let recording = RecordingPolicy::new(&identity);
+
+        let result = verifier.verify_raw_digest(&digest, bundle, &recording, true);
+        assert!(result.is_ok(), "verify_raw_digest must accept the real bundle, got {result:?}");
     }
 
     /// S5.5 cross-impl differential: the SAME committed multi-fault bundle (wrong subject digest

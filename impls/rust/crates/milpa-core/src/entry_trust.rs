@@ -20,8 +20,8 @@
 //!   Returns [`VerifierOutcome`]. Production code passes
 //!   [`SigstoreEntryVerifier`]; test/conformance code passes
 //!   [`MockEntryVerifier`].
-//! - [`SigstoreEntryVerifier`] — production verifier. See "Extract-or-decline
-//!   decision" below for why real-crypto verification is P3b-gated.
+//! - [`SigstoreEntryVerifier`] — production verifier; real crypto (stages
+//!   5-7), see "Real crypto" below.
 //! - [`MockEntryVerifier`] — test verifier: keyed per-subject outcome scripting.
 //! - [`EntryTrustConfig`] — config bundle threaded through the resolver.
 //! - [`evaluate_entry_attestation`] — runs gate stages 0-7 (RFC §5 table) for
@@ -49,34 +49,47 @@
 //! `index_trust.rs`'s `verify_crypto` rather than extracting a shared helper —
 //! same rationale as the Python module's own decline-to-extract.
 //!
-//! The cryptographic stages (5-7: cert chain + DSSE signature + Rekor
-//! inclusion) are NOT wired to real `sigstore-rs` verification in this slice.
-//! Structural reason: `sigstore-rs`'s only public verify entry points
-//! (`Verifier::verify_digest` / `verify`) require the caller to supply a live
-//! `Sha256` hasher over the REAL preimage bytes of the attested artifact — the
-//! crate recomputes the digest internally and compares it to the DSSE
-//! subject claim. For the index-attestation path (`index_trust.rs`) milpa has
-//! those preimage bytes (the fetched `index.kdl` text). For a PER-ENTRY
-//! attestation, the "artifact" is the dep's already-resolved `content_hash` —
-//! milpa does not have (and should not need) the raw source tree just to
-//! verify a signature over a digest it already trusts structurally (the
-//! pre-crypto stage above already asserts the DSSE payload's claimed digest
-//! equals the expected subject). The crate has no public "verify this DSSE
-//! envelope against an already-known digest" entry point (only the
-//! crate-private `verify_bundle_content` takes raw digest bytes directly).
-//! Exposing/patching that seam (the same class of upstream gap the vendored
-//! `.vendor-sigstore` patch already fixes for the index path's `envelopeHash`
-//! check) is P3b work, gated on real per-entry bundles existing to validate
-//! against (tianguis delivery, P4). Until then [`SigstoreEntryVerifier`]
-//! deterministically returns [`EntryVerificationResult::SignatureInvalid`]
-//! after a bundle passes the pre-crypto stages — never silently reports
-//! [`EntryVerificationResult::Trusted`] for a bundle it cannot actually verify
-//! cryptographically (fail-closed). This path is not exercised by the shared
-//! conformance corpus (every fixture drives [`MockEntryVerifier`]) and is
-//! unit-tested here only for the pre-crypto malformed/mismatch cases, mirroring
-//! the Python module's own P3a test scope.
+//! # Real crypto (RFC D7 / S-RustCrypto, `rfc-attestation-v1-normative.md`)
 //!
-//! RFC: `docs/rfc-per-entry-attestation.md` §1, §5, §6, §7.
+//! Stages 5-7 (cert chain + DSSE signature + signer SAN/issuer policy + Rekor
+//! inclusion) ARE wired to real `sigstore-rs` verification. The structural
+//! obstacle documented in earlier revisions of this module — `sigstore-rs`'s
+//! only public verify entry points required a live `Sha256` hasher over the
+//! REAL preimage bytes of the attested artifact, but a per-entry attestation's
+//! "artifact" is the dep's already-resolved `content_hash` **digest**, not its
+//! source tree (milpa does not have, and should not need, the preimage just to
+//! check a signature over a digest already trusted structurally by the
+//! pre-crypto stage above) — is resolved by a small additive patch to
+//! `.vendor-sigstore` (see that dir's `MILPA-PATCH.md`, "Change 2"): a new
+//! `Verifier::verify_raw_digest` / `blocking::Verifier::verify_raw_digest`
+//! entry point that takes the digest bytes directly, running the exact same
+//! cryptographic body `verify_digest` runs (cert chain, SCT, DSSE signature,
+//! subject-digest consistency, policy) — no check removed or weakened, only
+//! the hasher-finalize API step bypassed.
+//!
+//! [`SigstoreEntryVerifier::verify`] mirrors `index_trust.rs`'s `verify_crypto`
+//! call pattern: construct a blocking `Verifier` over the mapped trust root,
+//! wrap `Identity(expected_signer, DEFAULT_INDEX_ISSUER)` in the shared
+//! [`crate::index_trust::RecordingPolicy`] so a policy rejection is
+//! distinguishable from any other verification failure, call
+//! `verify_raw_digest` offline (`offline = true` — milpa never makes an online
+//! Rekor call), then run the same offline Rekor inclusion-proof check
+//! ([`crate::rekor_adapter::verify_entry_inclusion`]) Layer-1 runs, over the
+//! SAME singleton tlog entry (composition binding, mirroring §4's binding
+//! discipline). A policy rejection maps to
+//! [`VerifierOutcome::SignerMismatch`]; any other cryptographic failure maps to
+//! [`VerifierOutcome::SignatureInvalid`] — never silently reports
+//! [`VerifierOutcome::Trusted`] for a bundle that did not actually verify
+//! (fail-closed).
+//!
+//! The shared conformance corpus still drives [`MockEntryVerifier`] exclusively
+//! (RFC §10.1: the corpus tests the policy state machine, not cryptography).
+//! The real end-to-end positive (a real per-entry bundle over a `pkg:tianguis/…`
+//! subject) is S6-gated — no such fixture exists yet; see this module's tests
+//! for the pending, explicitly-marked placeholder.
+//!
+//! RFC: `docs/rfc-per-entry-attestation.md` §1, §5, §6, §7;
+//! `docs/rfc-attestation-v1-normative.md` §6 S-RustCrypto / D7.
 
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
@@ -84,11 +97,17 @@ use std::collections::{BTreeSet, HashMap};
 use base64::Engine;
 use milpa_manifest::TrustPolicy;
 use milpa_types::{AttestationKind, EntryAttestation};
+use sigstore::bundle::verify::blocking::Verifier;
+use sigstore::bundle::verify::policy::Identity;
+use sigstore::bundle::verify::VerificationError;
+use sigstore::rekor::apis::configuration::Configuration as RekorConfiguration;
 
 use crate::entry_bundle_store::{BundleStoreBackend, EntryBundleStore};
 use crate::epoch_commitment::{EpochCommitmentStatus, PreEpochIdentity};
 use crate::error::CoreError;
-use crate::index_trust::TrustBundle;
+use crate::index_trust::{RecordingPolicy, TrustBundle, DEFAULT_INDEX_ISSUER};
+use crate::rekor_adapter::{verify_entry_inclusion, AdapterOutcome};
+use crate::trust_root::map_trusted_root;
 use crate::MilpaError;
 
 // ---------------------------------------------------------------------------
@@ -352,8 +371,8 @@ pub trait EntryBundleVerifier: Send + Sync {
 // SigstoreEntryVerifier — production EntryBundleVerifier (RFC §6)
 // ---------------------------------------------------------------------------
 
-/// Production verifier. See the module docstring's "Extract-or-decline
-/// decision" for why cryptographic verification (stages 5-7) is P3b-gated.
+/// Production verifier. See the module docstring's "Real crypto" section for
+/// how stages 5-7 are wired.
 pub struct SigstoreEntryVerifier;
 
 impl EntryBundleVerifier for SigstoreEntryVerifier {
@@ -361,8 +380,8 @@ impl EntryBundleVerifier for SigstoreEntryVerifier {
         &self,
         subject: &EntrySubject,
         bundle_bytes: &[u8],
-        _trust_bundle: &TrustBundle,
-        _expected_signer: &str,
+        trust_bundle: &TrustBundle,
+        expected_signer: &str,
     ) -> VerifierOutcome {
         // Stage 2: parse bundle JSON.
         let bundle_json: serde_json::Value = match serde_json::from_slice(bundle_bytes) {
@@ -403,12 +422,79 @@ impl EntryBundleVerifier for SigstoreEntryVerifier {
             return VerifierOutcome::SubjectMismatch;
         }
 
-        // Stages 5-7 (cert chain + DSSE signature + Rekor inclusion): P3b-gated
-        // — see the module docstring's "Extract-or-decline decision". A
-        // structurally valid bundle that reaches here has passed every
-        // pre-crypto check but has NOT been cryptographically verified;
-        // fail-closed rather than report Trusted.
-        VerifierOutcome::SignatureInvalid
+        // Stages 5-7: cert chain + DSSE signature + signer SAN/issuer policy + Rekor
+        // inclusion, via the real sigstore-rs verifier (RFC D7 / S-RustCrypto — see the
+        // module docstring's "Real crypto" section). A second, typed parse of
+        // `bundle_bytes` is unavoidable here: the crate's public `Bundle` type has no
+        // subject-NAME accessor (only the pre-crypto raw-JSON read above can see it), so
+        // this mirrors the module's established "duplicate the parse, don't extract"
+        // stance for the same reason.
+        let bundle: sigstore::bundle::Bundle = match serde_json::from_slice(bundle_bytes) {
+            Ok(b) => b,
+            Err(_) => return VerifierOutcome::BundleMalformed,
+        };
+
+        // Singleton tlog entry — clone it now, before `bundle` is moved into
+        // `verify_raw_digest`, so the SAME owned entry is used for the inclusion check
+        // below (composition binding — mirrors `index_trust.rs`'s `verify_crypto`).
+        let entry = match bundle.verification_material.as_ref() {
+            Some(vm) if vm.tlog_entries.len() == 1 => vm.tlog_entries[0].clone(),
+            _ => return VerifierOutcome::BundleMalformed,
+        };
+
+        // Map the embedded (or overridden) trust root. A malformed *override* fails
+        // closed as SignatureInvalid — mirrors `index_trust.rs`'s `verify_crypto`.
+        let trust_root = match map_trusted_root(trust_bundle.raw_json) {
+            Ok(t) => t,
+            Err(_) => return VerifierOutcome::SignatureInvalid,
+        };
+
+        // Look up the Rekor key for this entry's log by hex(log_id.key_id) — clone
+        // before the trust root is moved into the `Verifier` (which only consumes the
+        // fulcio + ctfe keys).
+        let rekor_key = match entry.log_id.as_ref() {
+            Some(log_id) => match trust_root.rekor_keys.get(&hex::encode(&log_id.key_id)) {
+                Some(k) => k.clone(),
+                None => return VerifierOutcome::SignatureInvalid, // untrusted transparency log
+            },
+            None => return VerifierOutcome::BundleMalformed,
+        };
+
+        let verifier = match Verifier::new(RekorConfiguration::default(), trust_root) {
+            Ok(v) => v,
+            Err(_) => return VerifierOutcome::SignatureInvalid,
+        };
+        let identity = Identity::new(expected_signer, DEFAULT_INDEX_ISSUER);
+        let recording = RecordingPolicy::new(&identity);
+
+        // `subject.sha256` was already verified (the pre-crypto stage above) to equal
+        // the bundle's own DSSE-claimed subject digest; decode it to raw bytes for the
+        // milpa `verify_raw_digest` patch entry point (module docstring, "Real crypto").
+        // Malformed hex here would mean `EntrySubject` itself was built wrong upstream —
+        // fail closed rather than panic.
+        let Ok(digest_bytes) = hex::decode(&subject.sha256) else {
+            return VerifierOutcome::DigestMismatch;
+        };
+
+        // offline = true: milpa never makes an online Rekor call (mirrors index_trust.rs).
+        if let Err(err) = verifier.verify_raw_digest(&digest_bytes, bundle, &recording, true) {
+            return match err {
+                // Policy rejected the cert → SAN/issuer mismatch.
+                _ if recording.rejected.get() => VerifierOutcome::SignerMismatch,
+                // A pre-verify input error (should not happen — digest already computed).
+                VerificationError::Input(_) => VerifierOutcome::SignatureInvalid,
+                // Everything else — bad signature, cert chain, envelope consistency.
+                _ => VerifierOutcome::SignatureInvalid,
+            };
+        }
+
+        // Offline transparency inclusion (mirrors `index_trust.rs`'s `verify_crypto`
+        // step 4) — the same singleton entry cloned above.
+        match verify_entry_inclusion(&entry, &rekor_key) {
+            AdapterOutcome::Included => VerifierOutcome::Trusted,
+            AdapterOutcome::CryptoInvalid(_) => VerifierOutcome::SignatureInvalid,
+            AdapterOutcome::Malformed(_) => VerifierOutcome::BundleMalformed,
+        }
     }
 }
 
@@ -860,13 +946,85 @@ mod tests {
     }
 
     #[test]
-    fn sigstore_entry_verifier_matching_subject_fails_closed_not_trusted() {
-        // A bundle that passes every pre-crypto check but was never
-        // cryptographically verified must NEVER report Trusted (P3b-gated).
+    fn sigstore_entry_verifier_matching_subject_but_no_tlog_material_is_malformed() {
+        // A bundle that passes every pre-crypto check (subject name + digest both
+        // match) but carries no `verificationMaterial` at all (no cert, no tlog
+        // entry) can never be cryptographically verified — real crypto correctly
+        // reports BundleMalformed (a structural failure), never Trusted.
         let subject = EntrySubject { name: "pkg:tianguis/ns1/bar@2.0.0".into(), sha256: "abcd".into() };
         let bundle = make_dsse_bundle("abcd", "pkg:tianguis/ns1/bar@2.0.0");
         let result = SigstoreEntryVerifier.verify(&subject, &bundle, &TrustBundle::test(), "signer");
-        assert_eq!(result, VerifierOutcome::SignatureInvalid);
+        assert_eq!(result, VerifierOutcome::BundleMalformed);
+    }
+
+    /// S-RustCrypto (RFC `rfc-attestation-v1-normative.md` D7) real-verifier negative:
+    /// starts from the REAL, structurally complete S5 fixture bundle
+    /// (`_oracle/attestation/index.kdl.bundle` — real Fulcio cert chain + real tlog
+    /// entry) so parsing and cert-chain/SCT verification succeed exactly as they do in
+    /// `index_trust`'s own real-bundle tests, then renames the DSSE payload's subject
+    /// to an entry-shaped `pkg:tianguis/...` purl (passing entry_trust's pre-crypto
+    /// subject checks) WITHOUT re-signing. Renaming changes the PAE bytes the
+    /// signature was computed over, so the real DSSE signature-verification step must
+    /// reject it — proving stages 5-7 run real crypto (not the removed hardcoded
+    /// stub) and fail closed on a bad signature specifically, not just on structurally
+    /// malformed input.
+    #[test]
+    fn sigstore_entry_verifier_real_crypto_rejects_tampered_signature() {
+        const FIXTURE_DIR: &str = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../../conformance/spec-v1/_oracle/attestation"
+        );
+        const FIXTURE_SIGNER: &str = "https://github.com/coreyleavitt/milpa/.github/workflows/generate-attestation-fixture.yaml@refs/heads/main";
+
+        let bundle_bytes =
+            std::fs::read(format!("{FIXTURE_DIR}/index.kdl.bundle")).expect("fixture bundle");
+        let mut bundle_json: serde_json::Value = serde_json::from_slice(&bundle_bytes).unwrap();
+
+        let payload_b64 = bundle_json["dsseEnvelope"]["payload"].as_str().unwrap().to_string();
+        let payload_bytes = base64::engine::general_purpose::STANDARD.decode(&payload_b64).unwrap();
+        let mut payload_json: serde_json::Value = serde_json::from_slice(&payload_bytes).unwrap();
+        let subject_sha256 =
+            payload_json["subject"][0]["digest"]["sha256"].as_str().unwrap().to_string();
+        // Rename the subject in place — the digest (and hence the signature material's
+        // binding target) is untouched, only the claimed name changes, which is enough
+        // to invalidate the DSSE signature computed over the original payload bytes.
+        payload_json["subject"][0]["name"] = serde_json::json!("pkg:tianguis/ns1/bar@2.0.0");
+        let tampered_payload_b64 =
+            base64::engine::general_purpose::STANDARD.encode(payload_json.to_string());
+        bundle_json["dsseEnvelope"]["payload"] = serde_json::json!(tampered_payload_b64);
+        let tampered_bundle_bytes = serde_json::to_vec(&bundle_json).unwrap();
+
+        let subject =
+            EntrySubject { name: "pkg:tianguis/ns1/bar@2.0.0".to_string(), sha256: subject_sha256 };
+
+        let result = SigstoreEntryVerifier.verify(
+            &subject,
+            &tampered_bundle_bytes,
+            &TrustBundle::production(),
+            FIXTURE_SIGNER,
+        );
+        assert_eq!(
+            result,
+            VerifierOutcome::SignatureInvalid,
+            "tampered-signature bundle must reject via real crypto, got {result:?}"
+        );
+    }
+
+    /// S6-GATED (RFC `rfc-attestation-v1-normative.md` §6 S6): the real end-to-end
+    /// Layer-2 positive — a real per-entry bundle whose subject is an actual
+    /// `pkg:tianguis/...` purl, minted and signed the way tianguis production mints
+    /// per-entry bundles — does not exist in this repo yet. Every fixture in the
+    /// shared conformance corpus drives `MockEntryVerifier`, and the only real bundle
+    /// committed here (`_oracle/attestation/index.kdl.bundle`) is a whole-INDEX
+    /// attestation with subject name `"index.kdl"`, not an entry attestation; it
+    /// cannot substitute for a real per-entry positive without fabricating a pass.
+    /// This test is intentionally `#[ignore]`d as a standing placeholder: S6 mints the
+    /// real per-entry bundle fixture (Corey-gated live minting, per the RFC), and the
+    /// real `Trusted` assertion lands with it.
+    #[test]
+    #[ignore = "S6-gated: no real per-entry bundle fixture exists yet (rfc-attestation-v1-normative.md S6)"]
+    fn sigstore_entry_verifier_real_bundle_trusted_end_to_end_pending_s6() {
+        unimplemented!("lands with S6's real per-entry bundle fixture");
     }
 
     #[test]
