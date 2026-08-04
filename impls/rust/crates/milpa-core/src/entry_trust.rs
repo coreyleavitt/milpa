@@ -85,8 +85,11 @@
 //! The shared conformance corpus still drives [`MockEntryVerifier`] exclusively
 //! (RFC §10.1: the corpus tests the policy state machine, not cryptography).
 //! The real end-to-end positive (a real per-entry bundle over a `pkg:tianguis/…`
-//! subject) is S6-gated — no such fixture exists yet; see this module's tests
-//! for the pending, explicitly-marked placeholder.
+//! subject, minted with sigstore-python's `sign_dsse` for signer-toolchain
+//! parity with tianguis production) landed at S6 — see this module's
+//! `sigstore_entry_verifier_real_bundle_trusted_end_to_end_pending_s6` test
+//! (name kept for history) and the sibling arming-commitment (D15) real-crypto
+//! test, both against the committed `_oracle/entry-attestation/` fixtures.
 //!
 //! RFC: `docs/rfc-per-entry-attestation.md` §1, §5, §6, §7;
 //! `docs/rfc-attestation-v1-normative.md` §6 S-RustCrypto / D7.
@@ -872,6 +875,30 @@ pub fn enforce_entry_trust(
 mod tests {
     use super::*;
 
+    /// The committed S6 real-crypto fixture directory (single source of truth; minted by
+    /// `generate-entry-attestation-fixtures.yaml`, Corey-gated live minting per the RFC).
+    /// Shared across the `sigstore_entry_verifier_real_bundle_trusted_end_to_end_pending_s6`
+    /// and `sigstore_commitment_bundle_real_crypto_trusted_end_to_end` tests below — the ONE
+    /// place these constants live, so S7's FAIL matrix can reuse them.
+    const ENTRY_FIXTURE_DIR: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../../conformance/spec-v1/_oracle/entry-attestation"
+    );
+    /// The GitHub Actions workflow identity that signed the S6 entry-attestation fixtures
+    /// (keyless, sigstore-python `sign_dsse` — signer-toolchain parity with tianguis
+    /// production, RFC S6 prerequisite (i)).
+    const ENTRY_FIXTURE_SIGNER: &str = "https://github.com/coreyleavitt/milpa/.github/workflows/generate-entry-attestation-fixtures.yaml@refs/heads/main";
+
+    fn entry_fixture_subject() -> EntrySubject {
+        build_entry_subject(
+            "testns",
+            "attested-pkg",
+            "1.0.0",
+            "dag-sha256:9141345c8bfa2251a85bd540e15f365d2dbdf02abd76d8b37d0ea727f5955772",
+        )
+        .expect("fixture content_hash is well-formed")
+    }
+
     #[test]
     fn to_slug_matches_spec_catalog() {
         assert_eq!(EntryVerificationResult::Unattested.to_slug(), "TNG-ENTRY-UNATTESTED");
@@ -1010,21 +1037,81 @@ mod tests {
         );
     }
 
-    /// S6-GATED (RFC `rfc-attestation-v1-normative.md` §6 S6): the real end-to-end
-    /// Layer-2 positive — a real per-entry bundle whose subject is an actual
-    /// `pkg:tianguis/...` purl, minted and signed the way tianguis production mints
-    /// per-entry bundles — does not exist in this repo yet. Every fixture in the
-    /// shared conformance corpus drives `MockEntryVerifier`, and the only real bundle
-    /// committed here (`_oracle/attestation/index.kdl.bundle`) is a whole-INDEX
-    /// attestation with subject name `"index.kdl"`, not an entry attestation; it
-    /// cannot substitute for a real per-entry positive without fabricating a pass.
-    /// This test is intentionally `#[ignore]`d as a standing placeholder: S6 mints the
-    /// real per-entry bundle fixture (Corey-gated live minting, per the RFC), and the
-    /// real `Trusted` assertion lands with it.
+    /// S6 (RFC `rfc-attestation-v1-normative.md` §6 S6): the real end-to-end Layer-2
+    /// positive. The committed fixture (`_oracle/entry-attestation/entry-attested-pkg.bundle`)
+    /// is a real per-entry Sigstore bundle, minted with sigstore-python's `sign_dsse` — the
+    /// same signer toolchain tianguis production uses (RFC S6 prerequisite (i),
+    /// signer-toolchain parity) — whose subject is a real `pkg:tianguis/testns/attested-pkg@1.0.0`
+    /// purl, verifiable offline against the embedded production trust root. Mirrors
+    /// `s5_real_bundle_verifies_trusted_end_to_end` in `index_trust.rs` but for the per-entry
+    /// verifier: proves stages 5-7 (real cert chain + DSSE signature + Rekor inclusion, wired
+    /// under S-RustCrypto/D7) accept a genuine bundle, not just reject tampered ones (the
+    /// negative already covered by `sigstore_entry_verifier_real_crypto_rejects_tampered_signature`
+    /// above).
     #[test]
-    #[ignore = "S6-gated: no real per-entry bundle fixture exists yet (rfc-attestation-v1-normative.md S6)"]
     fn sigstore_entry_verifier_real_bundle_trusted_end_to_end_pending_s6() {
-        unimplemented!("lands with S6's real per-entry bundle fixture");
+        let bundle_bytes = std::fs::read(format!("{ENTRY_FIXTURE_DIR}/entry-attested-pkg.bundle"))
+            .expect("fixture entry bundle");
+
+        let result = SigstoreEntryVerifier.verify(
+            &entry_fixture_subject(),
+            &bundle_bytes,
+            &TrustBundle::production(),
+            ENTRY_FIXTURE_SIGNER,
+        );
+        assert_eq!(
+            result,
+            VerifierOutcome::Trusted,
+            "real per-entry bundle must verify Trusted, got {result:?}"
+        );
+
+        // S7 preview (explicitly allowed in S6's scope — no new artifact needed, confirms
+        // the signer binding on the real bundle): wrong expected signer → SignerMismatch.
+        let result = SigstoreEntryVerifier.verify(
+            &entry_fixture_subject(),
+            &bundle_bytes,
+            &TrustBundle::production(),
+            "https://github.com/evil/repo/.github/workflows/x.yaml@refs/heads/main",
+        );
+        assert_eq!(
+            result,
+            VerifierOutcome::SignerMismatch,
+            "wrong signer must reject as SignerMismatch, got {result:?}"
+        );
+    }
+
+    /// S6 arming-commitment sidecar (D15): the commitment bundle is a whole-index-shaped
+    /// artifact over the canonical preimage of the committed pre-epoch set `S`, verified via
+    /// the SAME `SigstoreVerifier`/`verify_index_bundle` Layer-1 uses — proving signer-toolchain
+    /// parity extends to this third artifact type (RFC S6 round-3 addition).
+    #[test]
+    fn sigstore_commitment_bundle_real_crypto_trusted_end_to_end() {
+        use crate::epoch_commitment::{canonical_preimage, PreEpochIdentity};
+        use crate::index_trust::{IndexBundleVerifier, SigstoreVerifier, VerificationResult};
+
+        let bundle_bytes =
+            std::fs::read(format!("{ENTRY_FIXTURE_DIR}/commitment.bundle")).expect("fixture commitment bundle");
+        let identities = vec![PreEpochIdentity {
+            namespace: "testns".to_string(),
+            name: "legacy-pkg".to_string(),
+            version: "0.9.0".to_string(),
+            content_hash: "dag-sha256:862bb412668033e2f5665980220f9da2df20a3bb651dfe31b3cdae23725e06e4"
+                .to_string(),
+        }];
+        let preimage = canonical_preimage(&identities);
+
+        let result = SigstoreVerifier.verify(
+            &preimage,
+            &bundle_bytes,
+            &TrustBundle::production(),
+            ENTRY_FIXTURE_SIGNER,
+            None,
+        );
+        assert_eq!(
+            result,
+            VerificationResult::Trusted,
+            "real commitment bundle must verify Trusted over the canonical preimage of S, got {result:?}"
+        );
     }
 
     #[test]

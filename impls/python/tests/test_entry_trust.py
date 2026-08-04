@@ -26,6 +26,7 @@ from milpa.entry_trust import (
     BundleMissing,
     DigestMismatch,
     EntryGateOutcome,
+    EntrySubject,
     MockEntryVerifier,
     PostEpoch,
     PreEpoch,
@@ -42,7 +43,7 @@ from milpa.entry_trust import (
     evaluate_entry_attestation,
     _reset_warned_entries,
 )
-from milpa.epoch_commitment import Armed, ArmingInvalid, PreEpochIdentity, Unarmed
+from milpa.epoch_commitment import Armed, ArmingInvalid, PreEpochIdentity, Unarmed, canonical_preimage
 from milpa.errors import (
     TNG_ENTRY_BUNDLE_MALFORMED,
     TNG_ENTRY_BUNDLE_MISSING,
@@ -509,3 +510,145 @@ def test_sigstore_verifier_subject_mismatch_precrypto() -> None:
     # Right digest, wrong package coordinate — cross-package replay scenario (RFC §1).
     bundle_bytes = _fake_bundle("pkg:tianguis/ns2/mallory-widget@1.0.0", "a" * 64)
     assert v.verify(subj, bundle_bytes, TrustBundle.test(), "signer") is SubjectMismatch
+
+
+# ---------------------------------------------------------------------------
+# S6 — real-crypto strict-PASS fixtures (RFC rfc-attestation-v1-normative.md S6)
+# ---------------------------------------------------------------------------
+#
+# The committed fixtures (conformance/spec-v1/_oracle/entry-attestation/) are REAL
+# Sigstore v0.3 DSSE bundles minted by the generate-entry-attestation-fixtures GitHub
+# Actions workflow, signed with sigstore-python's ``sign_dsse`` — the SAME signer
+# toolchain tianguis production uses to mint per-entry bundles (RFC S6 prerequisite
+# (i), signer-toolchain parity; the Go-cosign-vs-Python-sign_dsse byte-serialization
+# risk is the #183 class of bug this fixture generation deliberately avoids).
+# Verifiable offline against the embedded production trust root, mirroring the
+# Layer-1 S5(a) real-bundle precedent above but for the per-entry (Layer-2) verifier
+# and the arming-commitment sidecar (D15) — a THIRD artifact type sharing the same
+# signer-parity requirement (round-3 addition).
+#
+# This is the per-impl real-crypto tier (not the shared mock ``conformance/`` corpus):
+# real crypto cannot be byte-identical-shared or mock-mapped across implementations,
+# so these fixtures are loaded directly here, same as the Layer-1 precedent.
+
+_ENTRY_FIXTURE_SIGNER = (
+    "https://github.com/coreyleavitt/milpa/.github/workflows/"
+    "generate-entry-attestation-fixtures.yaml@refs/heads/main"
+)
+
+_ENTRY_FIXTURE_NAMESPACE = "testns"
+_ENTRY_FIXTURE_NAME = "attested-pkg"
+_ENTRY_FIXTURE_VERSION = "1.0.0"
+_ENTRY_FIXTURE_CONTENT_HASH = (
+    "dag-sha256:9141345c8bfa2251a85bd540e15f365d2dbdf02abd76d8b37d0ea727f5955772"
+)
+
+
+def _entry_fixture_dir():
+    from pathlib import Path
+
+    return Path(__file__).parents[3] / "conformance" / "spec-v1" / "_oracle" / "entry-attestation"
+
+
+def _entry_fixture_subject() -> EntrySubject:
+    return build_entry_subject(
+        _ENTRY_FIXTURE_NAMESPACE,
+        _ENTRY_FIXTURE_NAME,
+        _ENTRY_FIXTURE_VERSION,
+        _ENTRY_FIXTURE_CONTENT_HASH,
+    )
+
+
+def test_s6_real_entry_bundle_verifies_trusted_end_to_end() -> None:
+    bundle_bytes = (_entry_fixture_dir() / "entry-attested-pkg.bundle").read_bytes()
+    v = SigstoreEntryVerifier()
+    assert (
+        v.verify(_entry_fixture_subject(), bundle_bytes, TrustBundle.production(), _ENTRY_FIXTURE_SIGNER)
+        is Trusted
+    ), "real per-entry bundle must verify Trusted against the embedded production trust root"
+
+
+def test_s6_real_entry_bundle_wrong_signer_is_signer_mismatch() -> None:
+    """S7 preview (explicitly allowed in S6's scope — needs no new artifact and
+    confirms the signer binding on the real bundle)."""
+    bundle_bytes = (_entry_fixture_dir() / "entry-attested-pkg.bundle").read_bytes()
+    v = SigstoreEntryVerifier()
+    assert (
+        v.verify(
+            _entry_fixture_subject(),
+            bundle_bytes,
+            TrustBundle.production(),
+            "https://github.com/evil/repo/.github/workflows/x.yaml@refs/heads/main",
+        )
+        is SignerMismatch
+    )
+
+
+def test_s6_real_commitment_bundle_verifies_trusted() -> None:
+    """The arming-commitment sidecar (D15) is a whole-index-shaped bundle over the
+    canonical preimage of the committed pre-epoch set S — verified via the SAME
+    ``verify_index_bundle`` Layer-1 uses (the commitment is structurally a
+    Layer-1-shaped artifact), proving signer-toolchain parity extends to this third
+    artifact type (RFC S6 round-3 addition)."""
+    from milpa.index_trust import VerificationResult, verify_index_bundle
+
+    bundle_bytes = (_entry_fixture_dir() / "commitment.bundle").read_bytes()
+    identities = [
+        PreEpochIdentity(
+            namespace="testns",
+            name="legacy-pkg",
+            version="0.9.0",
+            content_hash=(
+                "dag-sha256:862bb412668033e2f5665980220f9da2df20a3bb651dfe31b3cdae23725e06e4"
+            ),
+        )
+    ]
+    preimage = canonical_preimage(identities)
+    assert (
+        verify_index_bundle(
+            preimage,
+            bundle_bytes,
+            TrustBundle.production(),
+            _ENTRY_FIXTURE_SIGNER,
+            max_age_seconds=None,
+        )
+        == VerificationResult.TRUSTED
+    ), "real commitment bundle must verify Trusted over the canonical preimage of S"
+
+
+def test_s6_real_bundle_resolves_under_strict_via_gate(tmp_path) -> None:
+    """Higher-level composition proof: a post-epoch entry carrying this real bundle
+    passes the FULL gate (``evaluate_entry_attestation`` + ``enforce_entry_trust``)
+    under strict policy without raising — the actual end-to-end path a resolve
+    exercises, not just the verifier in isolation."""
+    import hashlib
+
+    bundle_bytes = (_entry_fixture_dir() / "entry-attested-pkg.bundle").read_bytes()
+    pin = hashlib.sha256(bundle_bytes).hexdigest()
+    (tmp_path / f"{pin}.bundle").write_bytes(bundle_bytes)
+    store = FileEntryBundleStore(tmp_path)
+
+    att = EntryAttestation(kind=AuthorSigned(signer=_ENTRY_FIXTURE_SIGNER), bundle_pin=pin)
+    outcome = evaluate_entry_attestation(
+        attestation=att,
+        content_hash=_ENTRY_FIXTURE_CONTENT_HASH,
+        namespace=_ENTRY_FIXTURE_NAMESPACE,
+        name=_ENTRY_FIXTURE_NAME,
+        version=_ENTRY_FIXTURE_VERSION,
+        verifier=SigstoreEntryVerifier(),
+        bundle_store=store,
+        trust_bundle=TrustBundle.production(),
+        expected_vendor_signer="unused-author-signed-uses-record-signer",
+        epoch_status=Unarmed(),
+    )
+    assert outcome.result is Trusted
+
+    # Must not raise under strict — a real post-epoch entry with a valid
+    # author-signed bundle resolves cleanly (RFC S6).
+    enforce_entry_trust(
+        outcome,
+        "strict",
+        namespace=_ENTRY_FIXTURE_NAMESPACE,
+        name=_ENTRY_FIXTURE_NAME,
+        version=_ENTRY_FIXTURE_VERSION,
+    )
