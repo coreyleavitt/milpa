@@ -165,6 +165,7 @@ from milpa.version import (
 from milpa.workspace import LoadedWorkspace
 
 if TYPE_CHECKING:
+    from milpa.epoch_commitment import EpochCommitmentStatus
     from milpa.lockfile import Lockfile
 
 
@@ -4020,6 +4021,7 @@ def resolve(
         solution, provider, deps_dir, params.strategy,
         aliases_map=aliases_map, entry_trust=params.entry_trust,
         binding_resolver=binding_resolver,
+        epoch_status=index.epoch_commitment_status,
     )
 
     # ------------------------------------------------------------------
@@ -4843,6 +4845,7 @@ def _run_entry_trust_gate(
     bare_name: str,
     version_str: str,
     entry_trust: "EntryTrustConfig | None",
+    epoch_status: "EpochCommitmentStatus",
 ) -> None:
     """Evaluate + enforce the entry-trust gate for one registry candidate.
 
@@ -4850,6 +4853,12 @@ def _run_entry_trust_gate(
     registry-resolved dep. A ``strict``-policy failure raises and aborts
     graph construction (RFC §3: "a failing selected version is a hard, late
     resolve failure with no automatic fallback").
+
+    ``epoch_status`` (S-EpochGate, RFC attestation-v1-normative.md §6,
+    D14/D17): this candidate's registry's once-per-resolve
+    ``Index.epoch_commitment_status`` — threaded straight through to
+    ``evaluate_entry_attestation``, which classifies membership and gates
+    the effective policy (spec §3.6.3).
 
     Shared by the canonical dep's own gate check and — RFC origin-as-
     identity.md §3.3/§4.5 (S4b) — an aliased-away registry candidate's: a
@@ -4862,7 +4871,7 @@ def _run_entry_trust_gate(
         return
     from milpa.entry_trust import enforce_entry_trust, evaluate_entry_attestation
 
-    _gate_result, _gate_cause = evaluate_entry_attestation(
+    outcome = evaluate_entry_attestation(
         attestation=cand.attestation,
         content_hash=cand.identity or "",
         namespace=cand.registry_namespace,
@@ -4872,14 +4881,14 @@ def _run_entry_trust_gate(
         bundle_store=entry_trust.bundle_store,
         trust_bundle=entry_trust.trust_bundle,
         expected_vendor_signer=entry_trust.expected_vendor_signer,
+        epoch_status=epoch_status,
     )
     enforce_entry_trust(
-        _gate_result,
+        outcome,
         entry_trust.policy,
         namespace=cand.registry_namespace,
         name=bare_name,
         version=version_str,
-        cause=_gate_cause,
         bundle_store=entry_trust.bundle_store,
     )
 
@@ -5250,6 +5259,7 @@ def _build_graph(
     aliases_map: dict[str, str] | None = None,
     entry_trust: "EntryTrustConfig | None" = None,
     binding_resolver: "BindingResolver | None" = None,
+    epoch_status: "EpochCommitmentStatus | None" = None,
 ) -> ResolvedGraph:
     """Map ``solve()``'s solution dict to a ``ResolvedGraph``.
 
@@ -5268,7 +5278,17 @@ def _build_graph(
     also runs for a registry candidate that S4b's dedup folded into a
     canonical peer (see the alias branch below) — merging away a dep's own
     ResolvedDep must never merge away its attestation obligation too.
+
+    ``epoch_status`` (S-EpochGate, RFC attestation-v1-normative.md §6,
+    D14/D17): the calling resolve's ``Index.epoch_commitment_status`` —
+    threaded to every ``_run_entry_trust_gate`` call below. Defaults to
+    ``Unarmed()`` (imported lazily to avoid a module-level cycle) when the
+    caller passes ``None``, matching ``Index``'s own default — a caller that
+    has no index has, by construction, no armed commitment either.
     """
+    from milpa.epoch_commitment import Unarmed as _Unarmed
+
+    _epoch_status: "EpochCommitmentStatus" = epoch_status if epoch_status is not None else _Unarmed()
     GP = GitProvenance
     MP = MemberProvenanceRecord
 
@@ -5306,6 +5326,7 @@ def _build_graph(
                 _alias_dk.name,
                 _version_str_for_candidate(cand, version),
                 entry_trust,
+                _epoch_status,
             )
             continue
 
@@ -5374,7 +5395,7 @@ def _build_graph(
         # post-solve, per selected registry-resolved dep. Runs BEFORE the
         # ResolvedDep is assembled so a strict-policy failure aborts graph
         # construction outright (no partially-built graph escapes).
-        _run_entry_trust_gate(cand, _bare_name, version_str, entry_trust)
+        _run_entry_trust_gate(cand, _bare_name, version_str, entry_trust, _epoch_status)
 
         # S4: build cond_requires from the candidate's requires_predicates dict.
         # requires_predicates maps name → list[predicate_tuple]; a dep in ≥2
@@ -6313,6 +6334,7 @@ def resolve_workspace(
         solution, provider, deps_dir, params.strategy,
         aliases_map=ws_aliases_map, entry_trust=params.entry_trust,
         binding_resolver=binding_resolver,
+        epoch_status=index.epoch_commitment_status,
     )
 
     # §13 attestation policy enforcement — mirrors single-package resolve().

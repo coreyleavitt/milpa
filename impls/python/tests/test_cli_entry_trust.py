@@ -475,14 +475,36 @@ _FIXTURE_120_MOCK = (
 _BAR_CONTENT_HASH = "dag-sha256:9497672a6e7b5af95064d5709cd2a7a0b6ccd07a209fd541eb1402dc7a9e0383"
 
 
-def _write_unattested_index(parent: Path) -> str:
+def _write_unattested_index(parent: Path, *, armed: bool = False) -> str:
     """Write an index whose bar@2.0.0 entry has NO attestation record.
+
+    ``armed`` (S-EpochGate, RFC attestation-v1-normative.md §6): when
+    ``True``, the index also arms an epoch commitment whose enumerated set
+    ``S`` deliberately does NOT include ``bar@2.0.0`` — this candidate is
+    then ``PostEpoch``, where the entry-trust mandate applies unchanged.
+    Without this, an ``Unarmed`` registry classifies every candidate as
+    ``epoch_membership=None``, which S-EpochGate caps at ``warn`` even under
+    a ``"strict"`` policy (spec §3.6.3 NORMATIVE) — callers exercising the
+    strict-raises path must arm the registry so the mandate is actually live.
 
     Returns the file:// URL for MILPA_INDEX_URL.
     """
+    from milpa.epoch_commitment import PreEpochIdentity, commitment_digest
+
     idx = parent / "index.kdl"
-    idx.write_text(
-        "schema_version 1\n"
+    text = "schema_version 1\n"
+    if armed:
+        # A committed set containing an UNRELATED identity — bar@2.0.0 is
+        # deliberately absent, so it classifies PostEpoch (mandate applies).
+        s = [
+            PreEpochIdentity(
+                namespace="ns1", name="someone-else", version="9.9.9",
+                content_hash="dag-sha256:" + "f" * 64,
+            )
+        ]
+        c = commitment_digest(s)
+        text += f'attestation-epoch-commitment "{c}"\n\n'
+    text += (
         'package "bar" {\n'
         '    namespace "ns1"\n'
         '    version "2.0.0" {\n'
@@ -494,9 +516,27 @@ def _write_unattested_index(parent: Path) -> str:
         '            commit_sha "cafef00dcafef00dcafef00dcafef00dcafef00d"\n'
         "        }\n"
         "    }\n"
-        "}\n",
-        encoding="utf-8",
+        "}\n"
     )
+    idx.write_text(text, encoding="utf-8")
+    if armed:
+        import json
+
+        sidecar = {
+            "identities": [
+                {
+                    "namespace": "ns1",
+                    "name": "someone-else",
+                    "version": "9.9.9",
+                    "content_hash": "dag-sha256:" + "f" * 64,
+                }
+            ],
+            "bundle": {
+                "verificationMaterial": {"tlogEntries": [{"integratedTime": 1700000000, "logIndex": 1}]},
+                "dsseEnvelope": {"payload": ""},
+            },
+        }
+        (parent / "index.kdl.epoch-commitment").write_bytes(json.dumps(sidecar).encode("utf-8"))
     return idx.as_uri()
 
 
@@ -518,6 +558,7 @@ def _setup_verb_project(
     *,
     policy: str,
     include_foo_mock: bool = False,
+    armed: bool = False,
 ) -> "tuple[Path, object]":
     """Common scaffolding for the cmd_add / cmd_update gate tests.
 
@@ -525,6 +566,9 @@ def _setup_verb_project(
     index entry) under the given entry-trust *policy*, a combined mocked-
     fetches dir, and a file:// index in MILPA_INDEX_URL. Returns
     ``(project_dir, env)``.
+
+    ``armed`` (S-EpochGate): passed through to ``_write_unattested_index`` —
+    see that function's docstring for why the strict-raises tests need it.
     """
     import shutil
 
@@ -533,10 +577,15 @@ def _setup_verb_project(
 
     project_dir = tmp_path / "project"
     project_dir.mkdir()
+    # D18 co-requirement (spec §3.4.8): an Armed commitment + entry-trust
+    # "strict" requires index-history "strict" too, else TNG-INDEX-EPOCH-
+    # RATCHET-REQUIRED aborts before the entry gate is ever reached.
+    index_history_line = 'index-history "strict"\n' if (armed and policy == "strict") else ""
     (project_dir / "milpa.kdl").write_text(
         'name "myapp"\n'
         'kind "application"\n'
         f'entry-trust "{policy}"\n'
+        f'{index_history_line}'
         "deps {\n"
         '    bar ">= 2.0.0"\n'
         "}\n",
@@ -548,12 +597,16 @@ def _setup_verb_project(
     if include_foo_mock:
         shutil.copytree(_FIXTURE_120_MOCK, mocked_dir / _FIXTURE_120_MOCK.name)
 
-    idx_url = _write_unattested_index(tmp_path)
+    idx_url = _write_unattested_index(tmp_path, armed=armed)
     monkeypatch.setenv("MILPA_INDEX_URL", idx_url)
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg"))
     monkeypatch.delenv("MILPA_ENTRY_TRUST", raising=False)
     monkeypatch.delenv("MILPA_ENTRY_TRUST_MOCK_MAP", raising=False)
     monkeypatch.delenv("MILPA_ENTRY_TRUST_MOCK_DEFAULT", raising=False)
+    if armed:
+        monkeypatch.setenv("MILPA_INDEX_EPOCH_MOCK_VERIFIER", "trusted")
+    else:
+        monkeypatch.delenv("MILPA_INDEX_EPOCH_MOCK_VERIFIER", raising=False)
     _reset_warned_entries()
     _reset_warned_urls()
 
@@ -571,7 +624,11 @@ class TestAddUpdateGateBehavior:
         from milpa.errors import TNG_ENTRY_UNATTESTED
         from milpa.version import Strategy
 
-        project_dir, env = _setup_verb_project(tmp_path, monkeypatch, policy="strict")
+        # S-EpochGate (spec §3.6.3): an UNARMED registry classifies every
+        # candidate epoch_membership=None, which caps "strict" at "warn" (D11
+        # warn-equivalence) — so the mandate this test exercises needs an
+        # ARMED registry whose committed set excludes "bar" (PostEpoch).
+        project_dir, env = _setup_verb_project(tmp_path, monkeypatch, policy="strict", armed=True)
         with pytest.raises(MilpaError) as exc_info:
             cmd_update(
                 project_dir,
@@ -613,8 +670,10 @@ class TestAddUpdateGateBehavior:
         from milpa.errors import TNG_ENTRY_UNATTESTED
         from milpa.version import Strategy
 
+        # S-EpochGate: see test_update_strict_unattested_raises's comment —
+        # the registry must be ARMED (PostEpoch) for "strict" to hard-fail.
         project_dir, env = _setup_verb_project(
-            tmp_path, monkeypatch, policy="strict", include_foo_mock=True
+            tmp_path, monkeypatch, policy="strict", include_foo_mock=True, armed=True
         )
         with pytest.raises(MilpaError) as exc_info:
             cmd_add(
@@ -653,6 +712,32 @@ class TestAddUpdateGateBehavior:
         )
         assert rc == 0
         assert "foo" in (project_dir / "milpa.kdl").read_text(encoding="utf-8")
+        assert (project_dir / "milpa.lock").exists()
+        err = capsys.readouterr().err
+        assert "entry-trust warning" in err
+        assert "TNG-ENTRY-UNATTESTED" in err
+
+    def test_update_strict_unattested_on_unarmed_registry_only_warns(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """S-EpochGate (spec §3.6.3 NORMATIVE): an UNARMED registry (the
+        default — no ``attestation-epoch-commitment``) is warn-equivalent for
+        EVERY candidate, even under a configured ``"strict"`` policy (D11 —
+        the same rule §3.4.0 already states for the whole-registry case).
+        This is the CLI-integration counterpart of the direct unit coverage
+        in ``tests/test_epoch_gate.py``."""
+        from milpa.cli import cmd_update
+        from milpa.version import Strategy
+
+        project_dir, env = _setup_verb_project(tmp_path, monkeypatch, policy="strict", armed=False)
+        rc = cmd_update(
+            project_dir,
+            env,
+            dep_name=None,
+            strategy=Strategy.MAXVER,
+            max_parallel=1,
+        )
+        assert rc == 0
         assert (project_dir / "milpa.lock").exists()
         err = capsys.readouterr().err
         assert "entry-trust warning" in err

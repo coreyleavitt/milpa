@@ -505,7 +505,14 @@ impl Target for MilpaTarget {
                         let itext = std::fs::read_to_string(&p)
                             .map_err(|e| format!("E2E-INDEX-UNREADABLE: {e}"))?;
                         match milpa_core::Index::parse(&itext) {
-                            Ok(i) => Some(i),
+                            Ok(mut i) => {
+                                // S-EpochGate: a no-op for the overwhelming majority
+                                // of fixtures (no `attestation-epoch-commitment` ->
+                                // Unarmed, the existing default).
+                                i.epoch_commitment_status =
+                                    fixture_epoch_commitment_status(&fx.dir, &itext)?;
+                                Some(i)
+                            }
                             Err(e) => return Err(e.code().to_string()),
                         }
                     } else {
@@ -2350,6 +2357,51 @@ fn fixture_require_attested_metadata(dir: &Path) -> bool {
     env.get("MILPA_REQUIRE_ATTESTED_METADATA")
         .map(|v| parse_env_bool(v))
         .unwrap_or(false)
+}
+
+/// S-EpochGate (RFC attestation-v1-normative.md §6, D14/D17): compute the
+/// `EpochCommitmentStatus` for a fixture's `index.kdl`, when it declares
+/// `attestation-epoch-commitment`. Mirrors the Python in-process adapter's
+/// `_fixture_epoch_commitment_status` — the impl-neutral fixture convention
+/// both runners share (mirrors the existing `index.kdl.bundle` sidecar
+/// convention already used for whole-index attestation): the sidecar lives
+/// at `index.kdl.epoch-commitment` next to `index.kdl`. Crypto is always
+/// `MockVerifier(Trusted)` here — the shared corpus tests the entry-trust
+/// POLICY STATE MACHINE (which membership classification feeds), not
+/// cryptographic correctness (same rationale as index-trust's own
+/// `MockVerifier` seam, RFC §10.1); S-EpochCommitment's OWN
+/// crypto-correctness matrix lives in each impl's dedicated, non-shared test
+/// suite, not this corpus.
+///
+/// Returns `Unarmed` when the pointer is absent — the default every
+/// pre-S-EpochGate fixture already relies on, so this function is a no-op
+/// extension for fixtures that never opt in.
+fn fixture_epoch_commitment_status(
+    fixture_dir: &Path,
+    index_text: &str,
+) -> Result<milpa_core::epoch_commitment::EpochCommitmentStatus, String> {
+    use milpa_core::epoch_commitment::{evaluate_epoch_commitment, EpochCommitmentStatus};
+    use milpa_core::index_trust::{MockVerifier, TrustBundle, VerificationResult};
+
+    let pointer = milpa_core::raw_attestation_epoch_commitment(index_text)
+        .map_err(|e| e.code().to_string())?;
+    let Some(pointer) = pointer else {
+        return Ok(EpochCommitmentStatus::Unarmed);
+    };
+
+    let sidecar_path = fixture_dir.join("index.kdl.epoch-commitment");
+    let sidecar_bytes = std::fs::read(&sidecar_path).ok();
+    let fetch_failed = sidecar_bytes.is_none();
+
+    let verifier = MockVerifier::new(VerificationResult::Trusted);
+    Ok(evaluate_epoch_commitment(
+        Some(&pointer),
+        sidecar_bytes.as_deref(),
+        fetch_failed,
+        &verifier,
+        &TrustBundle::test(),
+        "fixture-rearm-signer",
+    ))
 }
 
 /// P3a (RFC per-entry-attestation.md §3, §5, Conformance section): build the

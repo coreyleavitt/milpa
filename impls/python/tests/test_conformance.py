@@ -514,6 +514,49 @@ def _fixture_entry_trust_config(fixture_dir: Path, doc: object) -> "object | Non
     )
 
 
+def _fixture_epoch_commitment_status(fixture_dir: Path, index_path: Path) -> "object":
+    """S-EpochGate (RFC attestation-v1-normative.md §6, D14/D17): compute the
+    ``EpochCommitmentStatus`` for a fixture's ``index.kdl``, when it declares
+    ``attestation-epoch-commitment``.
+
+    Fixture convention (mirrors the existing ``index.kdl.bundle`` sidecar
+    convention already used for whole-index attestation): the sidecar lives
+    at ``index.kdl.epoch-commitment`` next to ``index.kdl``. Crypto is always
+    ``MockVerifier(TRUSTED)`` here — the shared corpus tests the entry-trust
+    POLICY STATE MACHINE (which membership classification feeds), not
+    cryptographic correctness (same rationale as index-trust's own
+    ``MockVerifier`` seam, RFC §10.1); S-EpochCommitment's OWN
+    crypto-correctness matrix (bad inclusion proof, wrong signer, `hash(S) !=
+    C`, ...) lives in each impl's dedicated, non-shared test suite
+    (``test_epoch_commitment.py`` / the Rust mirror), not this corpus.
+
+    Returns ``Unarmed()`` when the pointer is absent — the default every
+    pre-S-EpochGate fixture already relies on, so this function is a no-op
+    extension for fixtures that never opt in.
+    """
+    from milpa.epoch_commitment import Unarmed, evaluate_epoch_commitment
+    from milpa.index_ratchet_seam import _raw_attestation_epoch_commitment
+    from milpa.index_trust import MockVerifier, TrustBundle, VerificationResult
+    from milpa.kdl_io import parse_kdl
+
+    doc = parse_kdl(index_path.read_text(encoding="utf-8"), context="registry")
+    pointer = _raw_attestation_epoch_commitment(doc)
+    if pointer is None:
+        return Unarmed()
+
+    sidecar_path = fixture_dir / "index.kdl.epoch-commitment"
+    sidecar_bytes = sidecar_path.read_bytes() if sidecar_path.is_file() else None
+
+    return evaluate_epoch_commitment(
+        pointer=pointer,
+        sidecar_bytes=sidecar_bytes,
+        fetch_failed=sidecar_bytes is None,
+        verifier=MockVerifier(VerificationResult.TRUSTED),
+        trust_bundle=TrustBundle.test(),
+        expected_signer="fixture-rearm-signer",
+    )
+
+
 # ---------------------------------------------------------------------------
 # MilpaEnv construction for in-process conformance
 # ---------------------------------------------------------------------------
@@ -565,6 +608,13 @@ def _build_env(fixture_dir: Path, tmp_dir: Path, no_index: bool = False) -> Milp
             raise
         except Exception:
             index = None
+        if index is not None:
+            # S-EpochGate: a no-op for the overwhelming majority of fixtures
+            # (no ``attestation-epoch-commitment`` -> Unarmed, the existing
+            # default) — see _fixture_epoch_commitment_status's docstring.
+            index.epoch_commitment_status = _fixture_epoch_commitment_status(
+                fixture_dir, index_path
+            )
 
     # S3b: when the fixture ships a ``dep-decl/`` artifact dir, build a
     # ``FileDepDeclStore`` over it — the in-process mirror of the harness

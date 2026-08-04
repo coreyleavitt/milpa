@@ -39,10 +39,29 @@ Public surface:
   ``EntryTrustConfig``
       Frozen dataclass: policy + trust_bundle + expected_vendor_signer.
 
+  ``EpochMembership``
+      ``PreEpoch | PostEpoch`` — spec §3.6.3 NORMATIVE.  See
+      ``classify_epoch_membership``.
+
+  ``EntryGateOutcome``
+      The D9 composed gate diagnostic (spec §3.6.3): ``{result,
+      epoch_membership, cause}`` — the SOLE shape ``evaluate_entry_attestation``
+      returns.
+
+  ``classify_epoch_membership(status, identity)``
+      S-EpochGate (RFC §6, D14/D17): maps an ``EpochCommitmentStatus`` +
+      candidate identity to ``PreEpoch | PostEpoch | None`` — a local set
+      lookup against the already-verified ``Armed`` set, nothing else.
+
+  ``effective_epoch_policy(policy, membership)``
+      S-EpochGate: caps the configured ``entry-trust`` policy at ``warn`` for
+      ``PreEpoch``/``None`` (Unarmed) membership; ``PostEpoch`` gets the
+      configured policy unchanged (the mandate applies).
+
   ``evaluate_entry_attestation(...)``
       Runs gate stages 0–7 (RFC §5 table) for one selected registry-resolved
-      dep: I/O via ``bundle_store`` + ``verifier``.  Returns
-      ``(EntryVerificationResult, cause)`` — ``cause`` is only meaningful for
+      dep: I/O via ``bundle_store`` + ``verifier``.  Returns an
+      ``EntryGateOutcome`` (D9) — ``cause`` is only meaningful for
       ``BundleMissing`` (``"no-pin"`` | ``"unfetchable"``).  Stage 1b
       (``TNG-ENTRY-BUNDLE-PIN-MISMATCH``) is NOT representable in the return
       value — it is a security invariant raised directly by
@@ -50,7 +69,9 @@ Public surface:
       module's docstring); this function does not catch it.
 
   ``enforce_entry_trust(...)``
-      warn/strict slug dispatch (mirrors ``index_trust.enforce_index_trust``).
+      warn/strict slug dispatch (mirrors ``index_trust.enforce_index_trust``);
+      applies the S-EpochGate policy downgrade via ``effective_epoch_policy``
+      before dispatching.
 
 Type reuse decision (RFC §6: "``VerificationResult``... extends from Part 1"):
   Rather than adding entry-only variants (``UNATTESTED``, ``SUBJECT_MISMATCH``)
@@ -94,6 +115,7 @@ import sys as _sys
 from typing import Any, Protocol
 
 from milpa import identity
+from milpa.epoch_commitment import Armed, EpochCommitmentStatus, PreEpochIdentity
 from milpa.errors import (
     TNG_ENTRY_BUNDLE_MALFORMED,
     TNG_ENTRY_BUNDLE_MISSING,
@@ -202,6 +224,87 @@ def build_entry_subject(namespace: str, name: str, version: str, content_hash: s
         name=f"pkg:tianguis/{namespace}/{name}@{version}",
         sha256=hex_digest,
     )
+
+
+# ---------------------------------------------------------------------------
+# EpochMembership — S-EpochGate (RFC §6, D14/D17; spec §3.6.3 NORMATIVE)
+# ---------------------------------------------------------------------------
+
+
+class EpochMembership(enum.Enum):
+    """``PreEpoch | PostEpoch`` — spec §3.6.3 NORMATIVE (``EpochMembership``).
+
+    Populated (non-``None``) only when the index's ``EpochCommitmentStatus``
+    is ``Armed(S, E)``; ``Unarmed`` maps to ``None`` (no third variant — see
+    ``classify_epoch_membership``).
+    """
+
+    PRE_EPOCH = "pre-epoch"
+    POST_EPOCH = "post-epoch"
+
+
+PreEpoch = EpochMembership.PRE_EPOCH
+PostEpoch = EpochMembership.POST_EPOCH
+
+
+def classify_epoch_membership(
+    status: EpochCommitmentStatus,
+    identity_tuple: PreEpochIdentity,
+) -> "EpochMembership | None":
+    """S-EpochGate membership classification (RFC §6 D14/D17; spec §3.4.8
+    NORMATIVE "membership is a local set lookup" + §3.6.3 NORMATIVE
+    ``EpochMembership``).
+
+    ``Armed(S, E)`` + ``identity_tuple in S`` -> ``PreEpoch`` (a plain local
+    set-containment test against the already-verified ``S`` — no
+    recomputation, no proof machinery, D17). ``Armed(S, E)`` +
+    ``identity_tuple not in S`` -> ``PostEpoch``. ``Unarmed`` -> ``None``:
+    "no commitment is armed" is a fact about the INDEX, already fully
+    captured by ``EpochCommitmentStatus`` itself, not a per-entry
+    classification (D14) — every entry from that registry is then
+    warn-equivalent under the SAME D1/D11 rule §3.4.8 states normatively for
+    the whole registry (see ``effective_epoch_policy``).
+
+    ``ArmingInvalid`` never reaches this function in production — spec
+    §3.6.4 NORMATIVE cross-axis precedence: an ``ArmingInvalid`` aborts the
+    WHOLE resolve (``TNG-INDEX-EPOCH-COMMITMENT-INVALID``) before any
+    candidate is selected, so the entry gate never runs on that resolve at
+    all. Defensively treated identically to ``Unarmed`` (``None``) here
+    anyway, rather than raising, so this function stays total and pure —
+    matching ``evaluate_epoch_commitment``'s own "never raises" discipline.
+    """
+    if not isinstance(status, Armed):
+        return None
+    return PreEpoch if identity_tuple in status.identities else PostEpoch
+
+
+def effective_epoch_policy(
+    policy: TrustPolicy, membership: "EpochMembership | None"
+) -> TrustPolicy:
+    """S-EpochGate policy downgrade (RFC §6; spec §3.6.3 NORMATIVE).
+
+    ``PostEpoch`` -> the configured policy, UNCHANGED (the mandate applies:
+    under ``strict`` an unattested/unverifiable post-epoch entry hard-fails).
+
+    ``PreEpoch`` or ``None`` (``Unarmed``) -> capped at ``warn``: ``strict``
+    downgrades to ``warn``, ``warn`` stays ``warn``, ``off`` stays ``off``.
+    "``PreEpoch`` stays warn-territory even under entry-trust 'strict'" (a
+    fixed, shrinking grandfathered population) and "``Unarmed`` ... is
+    warn-equivalent for every candidate from that registry" (spec §3.6.3
+    NORMATIVE ``EpochMembership``).
+
+    SECURITY RATIONALE (why this downgrade cannot be exploited): membership
+    is decided over the frozen, composed-verified set ``S``, keyed on the
+    full ``(namespace, name, version, content_hash)`` identity tuple —
+    ``content_hash`` included. Tampering with a grandfathered entry's bytes
+    changes its ``content_hash``, so the tampered identity no longer matches
+    any member of ``S`` and reclassifies as ``PostEpoch`` on the next
+    resolve, where the mandate applies in full. A pre-epoch entry can only
+    ever be the SAME bytes the registry committed to at arming time.
+    """
+    if membership is PostEpoch:
+        return policy
+    return "off" if policy == "off" else "warn"  # type: ignore[return-value]
 
 
 # ---------------------------------------------------------------------------
@@ -436,6 +539,34 @@ class EntryTrustConfig:
 
 
 # ---------------------------------------------------------------------------
+# EntryGateOutcome — the D9 composed gate diagnostic (spec §3.6.3 NORMATIVE)
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class EntryGateOutcome:
+    """The gate's SOLE return shape (D9, spec §3.6.3 NORMATIVE
+    ``EntryGateOutcome``) — one composed diagnostic, not independently
+    threaded ``(result, cause)`` fields.
+
+    ``result``
+        ``EntryVerificationResult`` — ``Trusted`` or one of the seven
+        ``TNG-ENTRY-*`` failure variants.
+
+    ``epoch_membership``
+        ``EpochMembership | None`` — see ``classify_epoch_membership``.
+
+    ``cause``
+        Populated only when ``result`` is ``BundleMissing``
+        (``"no-pin"`` | ``"unfetchable"``).
+    """
+
+    result: EntryVerificationResult
+    epoch_membership: "EpochMembership | None"
+    cause: "str | None" = None
+
+
+# ---------------------------------------------------------------------------
 # evaluate_entry_attestation — the gate pipeline (RFC §5 stages 0-7)
 # ---------------------------------------------------------------------------
 
@@ -451,13 +582,25 @@ def evaluate_entry_attestation(
     bundle_store: "object | None",
     trust_bundle: TrustBundle,
     expected_vendor_signer: str,
-) -> "tuple[EntryVerificationResult, str | None]":
+    epoch_status: EpochCommitmentStatus,
+) -> EntryGateOutcome:
     """Run gate stages 0-7 for one selected registry-resolved dep.
 
-    Returns ``(result, cause)``. ``cause`` is populated only for
+    Returns an ``EntryGateOutcome`` (D9) — ``cause`` is populated only for
     ``BundleMissing`` (``"no-pin"`` when the entry is attested but carries no
     ``bundle`` pin yet; ``"unfetchable"`` when a pin is present but the
     bundle could not be fetched).
+
+    ``epoch_status`` (S-EpochGate, RFC §6 D14/D17): the once-per-resolve
+    ``EpochCommitmentStatus`` this candidate's registry produced
+    (``Index.epoch_commitment_status``) — classified into
+    ``EntryGateOutcome.epoch_membership`` via ``classify_epoch_membership``,
+    using the identity ``(namespace, name, version, content_hash)`` (spec
+    §3.4.8's identity tuple, byte-exact per S2/D16 hygiene). Classification
+    runs unconditionally, BEFORE stage 0 — membership is a fact about the
+    candidate's identity alone, independent of whether it happens to carry
+    an attestation record at all (an ``Unattested`` post-epoch entry is
+    still ``PostEpoch``, which is exactly the row the mandate must catch).
 
     Stage 1b (``TNG-ENTRY-BUNDLE-PIN-MISMATCH``) is NOT caught here — the
     bundle store raises it unconditionally (SECURITY INVARIANT, RFC §5); it
@@ -468,21 +611,34 @@ def evaluate_entry_attestation(
     from milpa.errors import TNG_ENTRY_BUNDLE_PIN_MISMATCH
     from milpa.registry import AuthorSigned
 
+    membership = classify_epoch_membership(
+        epoch_status,
+        PreEpochIdentity(
+            namespace=namespace, name=name, version=version, content_hash=content_hash
+        ),
+    )
+
     # Stage 0: attestation record absent (or collapsed to unattested at parse time).
     if attestation is None:
-        return Unattested, None
+        return EntryGateOutcome(result=Unattested, epoch_membership=membership)
 
     # Stage 1: bundle acquisition.
     if attestation.bundle_pin is None:
-        return BundleMissing, "no-pin"
+        return EntryGateOutcome(result=BundleMissing, epoch_membership=membership, cause="no-pin")
     if bundle_store is None:
-        return BundleMissing, "unfetchable"
+        return EntryGateOutcome(
+            result=BundleMissing, epoch_membership=membership, cause="unfetchable"
+        )
     try:
         bundle_bytes = bundle_store.get(attestation.bundle_pin)  # type: ignore[attr-defined]
     except MilpaError as exc:
         if exc.slug == TNG_ENTRY_BUNDLE_PIN_MISMATCH:
             raise  # stage 1b: unconditional hard error, never policy-gated
-        return BundleMissing, exc.context.get("cause", "unfetchable")
+        return EntryGateOutcome(
+            result=BundleMissing,
+            epoch_membership=membership,
+            cause=exc.context.get("cause", "unfetchable"),
+        )
 
     # Stages 2-7: bundle parse + subject binding + crypto, delegated to the verifier.
     subject = build_entry_subject(namespace, name, version, content_hash)
@@ -492,7 +648,7 @@ def evaluate_entry_attestation(
         else expected_vendor_signer
     )
     result = verifier.verify(subject, bundle_bytes, trust_bundle, expected_signer)
-    return result, None
+    return EntryGateOutcome(result=result, epoch_membership=membership)
 
 
 # ---------------------------------------------------------------------------
@@ -593,17 +749,40 @@ def _bundle_missing_hint(cause: "str | None", bundle_store: "object | None") -> 
     )
 
 
+def _epoch_membership_hint_suffix(membership: "EpochMembership | None") -> str:
+    """Pinned remediation prose keyed by epoch membership (RFC §6 S-EpochGate).
+
+    ``PostEpoch``: the mandate-context sentence a strict failure needs — WHY
+    this particular entry is not eligible for the grandfathered downgrade.
+    ``PreEpoch``: the symmetric explanation for why a failing pre-epoch entry
+    stays a warning even under ``entry-trust "strict"`` (observability for
+    the capped-policy case — not itself a failure explanation). ``None``
+    (``Unarmed``): no epoch context to add.
+    """
+    if membership is PostEpoch:
+        return (
+            " This version is not in the registry's committed pre-epoch "
+            "set, so it must carry a verifiable attestation."
+        )
+    if membership is PreEpoch:
+        return (
+            " This version is in the registry's committed pre-epoch "
+            "(grandfathered) set, so this stays a warning even under "
+            'entry-trust "strict".'
+        )
+    return ""
+
+
 def enforce_entry_trust(
-    result: EntryVerificationResult,
+    outcome: EntryGateOutcome,
     policy: TrustPolicy,
     *,
     namespace: str,
     name: str,
     version: str,
-    cause: "str | None" = None,
     bundle_store: "object | None" = None,
 ) -> None:
-    """warn/strict slug dispatch for one selected entry's gate outcome.
+    """warn/strict slug dispatch for one selected entry's gate outcome (D9).
 
     - ``off``     → silent; the caller should not even invoke the gate, but
                     this guard makes the function total regardless.
@@ -612,28 +791,43 @@ def enforce_entry_trust(
                     ``(namespace, name, version)`` per invocation; exit 0.
     - ``strict``  → raise ``MilpaError`` with the appropriate ``TNG-ENTRY-*`` slug.
 
+    S-EpochGate (RFC §6, spec §3.6.3 NORMATIVE): before dispatching, the
+    configured ``policy`` is passed through ``effective_epoch_policy`` with
+    ``outcome.epoch_membership`` — ``PostEpoch`` keeps the configured policy
+    (the mandate applies); ``PreEpoch``/``None`` (``Unarmed``) caps it at
+    ``warn`` (a fixed, shrinking grandfathered population never hard-fails).
+
     ``bundle_store`` is the concrete store instance the gate acquired bytes
     (or failed to acquire bytes) from — passed through ONLY so a
     ``BundleMissing`` result can select the D6 cause × backend hint text
     (``_bundle_missing_hint``); it has no bearing on any other result.
     """
-    if policy == "off" or result is Trusted:
+    if policy == "off" or outcome.result is Trusted:
         return
 
-    slug = result_to_slug(result)
-    coordinate = f"pkg:tianguis/{namespace}/{name}@{version}"
-    hint = _bundle_missing_hint(cause, bundle_store) if result is BundleMissing else _HINT_MAP[result]
-    if cause is not None:
-        hint = f"{hint} (cause: {cause})"
+    effective_policy = effective_epoch_policy(policy, outcome.epoch_membership)
+    if effective_policy == "off" or outcome.result is Trusted:
+        return
 
-    if policy == "strict":
+    slug = result_to_slug(outcome.result)
+    coordinate = f"pkg:tianguis/{namespace}/{name}@{version}"
+    hint = (
+        _bundle_missing_hint(outcome.cause, bundle_store)
+        if outcome.result is BundleMissing
+        else _HINT_MAP[outcome.result]
+    )
+    if outcome.cause is not None:
+        hint = f"{hint} (cause: {outcome.cause})"
+    hint = f"{hint}{_epoch_membership_hint_suffix(outcome.epoch_membership)}"
+
+    if effective_policy == "strict":
         raise MilpaError(
             slug,
             f"entry-trust strict: {slug} for {coordinate!r} — {hint}",
             namespace=namespace,
             name=name,
             version=version,
-            cause=cause,
+            cause=outcome.cause,
         )
 
     key = (namespace, name, version)

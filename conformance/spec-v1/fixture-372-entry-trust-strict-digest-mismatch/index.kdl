@@ -1,4 +1,5 @@
 schema_version 1
+attestation-epoch-commitment "880ee49b95966242a256bf6e2f5f5843448e7832f857d2f6425269a79b88eced"
 package "bar" {
     namespace "ns1"
     version "2.0.0" {

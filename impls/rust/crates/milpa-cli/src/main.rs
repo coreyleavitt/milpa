@@ -3767,6 +3767,14 @@ fn build_entry_trust_gate(
 /// must never do. A pin that is present but not cached is reported as
 /// `BundleMissing` (cause `unfetchable`), exactly as if the bundle had never
 /// been fetched.
+///
+/// S-EpochGate scope note: this offline, lockfile-driven path never loads an
+/// `Index` (that would require re-acquiring + re-verifying the index and its
+/// epoch-commitment sidecar, which the offline invariant above forbids). It
+/// always classifies as `Unarmed` (`epoch_membership = None`) — the same
+/// warn-equivalent treatment `effective_epoch_policy` gives a genuinely
+/// unarmed registry — rather than reconstructing a stale or unverifiable
+/// membership claim from the lockfile alone.
 fn reverify_cached_entry_attestations(
     lock: &milpa_core::Lockfile,
     entry_trust_policy: &milpa_manifest::TrustPolicy,
@@ -3776,7 +3784,8 @@ fn reverify_cached_entry_attestations(
     no_index: bool,
 ) -> Result<(), MilpaError> {
     use milpa_core::entry_trust::EntryVerificationResult;
-    use milpa_core::EntryAttestation;
+    use milpa_core::epoch_commitment::EpochCommitmentStatus;
+    use milpa_core::{EntryAttestation, EntryGateOutcome};
 
     let Some(cfg) = build_entry_trust_gate(
         entry_trust_policy,
@@ -3789,11 +3798,17 @@ fn reverify_cached_entry_attestations(
         return Ok(()); // policy off
     };
 
+    let epoch_status = EpochCommitmentStatus::default(); // Unarmed — see doc comment above.
+
     for dep in &lock.deps {
         let Some(att) = &dep.attestation else { continue };
 
-        let (result, cause): (EntryVerificationResult, Option<String>) = match &att.bundle_pin {
-            None => (EntryVerificationResult::BundleMissing, Some("no-pin".to_string())),
+        let outcome: EntryGateOutcome = match &att.bundle_pin {
+            None => EntryGateOutcome {
+                result: EntryVerificationResult::BundleMissing,
+                epoch_membership: None,
+                cause: Some("no-pin".to_string()),
+            },
             Some(pin) => match &cfg.bundle_store {
                 Some(store) if store.is_cached(pin) => {
                     // Cached: reuse the shared gate pipeline. get() on a
@@ -3813,21 +3828,25 @@ fn reverify_cached_entry_attestations(
                         cfg.bundle_store.as_deref(),
                         &cfg.trust_bundle,
                         &cfg.expected_vendor_signer,
+                        &epoch_status,
                     )?
                 }
                 // NEVER fetch — a present-but-uncached pin (or no store at
                 // all) is unfetchable-from-cache.
-                _ => (EntryVerificationResult::BundleMissing, Some("unfetchable".to_string())),
+                _ => EntryGateOutcome {
+                    result: EntryVerificationResult::BundleMissing,
+                    epoch_membership: None,
+                    cause: Some("unfetchable".to_string()),
+                },
             },
         };
 
         milpa_core::enforce_entry_trust(
-            result,
+            &outcome,
             &cfg.policy,
             &att.namespace,
             &dep.name,
             &dep.version,
-            cause.as_deref(),
             cfg.bundle_store.as_deref(),
         )?;
     }

@@ -86,6 +86,7 @@ use milpa_manifest::TrustPolicy;
 use milpa_types::{AttestationKind, EntryAttestation};
 
 use crate::entry_bundle_store::{BundleStoreBackend, EntryBundleStore};
+use crate::epoch_commitment::{EpochCommitmentStatus, PreEpochIdentity};
 use crate::error::CoreError;
 use crate::index_trust::TrustBundle;
 use crate::MilpaError;
@@ -239,6 +240,87 @@ pub fn build_entry_subject(
 }
 
 // ---------------------------------------------------------------------------
+// EpochMembership — S-EpochGate (RFC §6, D14/D17; spec §3.6.3 NORMATIVE)
+// ---------------------------------------------------------------------------
+
+/// `PreEpoch | PostEpoch` — spec §3.6.3 NORMATIVE (`EpochMembership`).
+///
+/// Populated (`Some`) only when the index's [`EpochCommitmentStatus`] is
+/// `Armed(S, E)`; `Unarmed` maps to `None` (no third variant — see
+/// [`classify_epoch_membership`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EpochMembership {
+    PreEpoch,
+    PostEpoch,
+}
+
+/// S-EpochGate membership classification (RFC §6 D14/D17; spec §3.4.8
+/// NORMATIVE "membership is a local set lookup" + §3.6.3 NORMATIVE
+/// `EpochMembership`).
+///
+/// `Armed(S, E)` + `identity in S` -> `PreEpoch` (a plain local
+/// set-containment test against the already-verified `S` — no
+/// recomputation, no proof machinery, D17). `Armed(S, E)` + `identity not in
+/// S` -> `PostEpoch`. `Unarmed` -> `None`: "no commitment is armed" is a
+/// fact about the INDEX, already fully captured by `EpochCommitmentStatus`
+/// itself, not a per-entry classification (D14) — every entry from that
+/// registry is then warn-equivalent under the SAME D1/D11 rule §3.4.8
+/// states normatively for the whole registry (see [`effective_epoch_policy`]).
+///
+/// `ArmingInvalid` never reaches this function in production — spec §3.6.4
+/// NORMATIVE cross-axis precedence: an `ArmingInvalid` aborts the WHOLE
+/// resolve (`TNG-INDEX-EPOCH-COMMITMENT-INVALID`) before any candidate is
+/// selected, so the entry gate never runs on that resolve at all.
+/// Defensively treated identically to `Unarmed` (`None`) here anyway,
+/// rather than panicking, so this function stays total and pure.
+pub fn classify_epoch_membership(
+    status: &EpochCommitmentStatus,
+    identity: &PreEpochIdentity,
+) -> Option<EpochMembership> {
+    match status {
+        EpochCommitmentStatus::Armed { identities, .. } => {
+            if identities.contains(identity) {
+                Some(EpochMembership::PreEpoch)
+            } else {
+                Some(EpochMembership::PostEpoch)
+            }
+        }
+        EpochCommitmentStatus::Unarmed | EpochCommitmentStatus::ArmingInvalid { .. } => None,
+    }
+}
+
+/// S-EpochGate policy downgrade (RFC §6; spec §3.6.3 NORMATIVE).
+///
+/// `PostEpoch` -> the configured policy, UNCHANGED (the mandate applies:
+/// under `Strict` an unattested/unverifiable post-epoch entry hard-fails).
+///
+/// `PreEpoch` or `None` (`Unarmed`) -> capped at `Warn`: `Strict` downgrades
+/// to `Warn`, `Warn` stays `Warn`, `Off` stays `Off`. "`PreEpoch` stays
+/// warn-territory even under entry-trust 'strict'" (a fixed, shrinking
+/// grandfathered population) and "`Unarmed` ... is warn-equivalent for
+/// every candidate from that registry" (spec §3.6.3 NORMATIVE
+/// `EpochMembership`).
+///
+/// SECURITY RATIONALE (why this downgrade cannot be exploited): membership
+/// is decided over the frozen, composed-verified set `S`, keyed on the full
+/// `(namespace, name, version, content_hash)` identity tuple —
+/// `content_hash` included. Tampering with a grandfathered entry's bytes
+/// changes its `content_hash`, so the tampered identity no longer matches
+/// any member of `S` and reclassifies as `PostEpoch` on the next resolve,
+/// where the mandate applies in full. A pre-epoch entry can only ever be
+/// the SAME bytes the registry committed to at arming time.
+pub fn effective_epoch_policy(policy: &TrustPolicy, membership: Option<EpochMembership>) -> TrustPolicy {
+    if membership == Some(EpochMembership::PostEpoch) {
+        return policy.clone();
+    }
+    if *policy == TrustPolicy::Off {
+        TrustPolicy::Off
+    } else {
+        TrustPolicy::Warn
+    }
+}
+
+// ---------------------------------------------------------------------------
 // EntryBundleVerifier — trait (RFC §6)
 // ---------------------------------------------------------------------------
 
@@ -389,15 +471,44 @@ pub struct EntryTrustConfig {
 }
 
 // ---------------------------------------------------------------------------
+// EntryGateOutcome — the D9 composed gate diagnostic (spec §3.6.3 NORMATIVE)
+// ---------------------------------------------------------------------------
+
+/// The gate's SOLE return shape (D9, spec §3.6.3 NORMATIVE
+/// `EntryGateOutcome`) — one composed diagnostic, not independently threaded
+/// `(result, cause)` fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntryGateOutcome {
+    /// `Trusted` or one of the seven `TNG-ENTRY-*` failure variants.
+    pub result: EntryVerificationResult,
+    /// See [`classify_epoch_membership`].
+    pub epoch_membership: Option<EpochMembership>,
+    /// Populated only when `result` is `BundleMissing`
+    /// (`"no-pin"` | `"unfetchable"`).
+    pub cause: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
 // evaluate_entry_attestation — the gate pipeline (RFC §5 stages 0-7)
 // ---------------------------------------------------------------------------
 
 /// Run gate stages 0-7 for one selected registry-resolved dep.
 ///
-/// Returns `Ok((result, cause))`. `cause` is populated only for
+/// Returns an [`EntryGateOutcome`] (D9) — `cause` is populated only for
 /// `BundleMissing` (`"no-pin"` when the entry is attested but carries no
 /// `bundle` pin yet; `"unfetchable"` when a pin is present but the bundle
 /// could not be fetched).
+///
+/// `epoch_status` (S-EpochGate, RFC §6 D14/D17): the once-per-resolve
+/// [`EpochCommitmentStatus`] this candidate's registry produced
+/// (`Index.epoch_commitment_status`) — classified into
+/// `EntryGateOutcome.epoch_membership` via [`classify_epoch_membership`],
+/// using the identity `(namespace, name, version, content_hash)` (spec
+/// §3.4.8's identity tuple, byte-exact per S2/D16 hygiene). Classification
+/// runs unconditionally, BEFORE stage 0 — membership is a fact about the
+/// candidate's identity alone, independent of whether it happens to carry
+/// an attestation record at all (an `Unattested` post-epoch entry is still
+/// `PostEpoch`, which is exactly the row the mandate must catch).
 ///
 /// Stage 1b (`TNG-ENTRY-BUNDLE-PIN-MISMATCH`) is NOT captured in the `Ok`
 /// return — the bundle store raises it unconditionally (SECURITY INVARIANT,
@@ -415,18 +526,35 @@ pub fn evaluate_entry_attestation(
     bundle_store: Option<&dyn EntryBundleStore>,
     trust_bundle: &TrustBundle,
     expected_vendor_signer: &str,
-) -> Result<(EntryVerificationResult, Option<String>), MilpaError> {
+    epoch_status: &EpochCommitmentStatus,
+) -> Result<EntryGateOutcome, MilpaError> {
+    let identity = PreEpochIdentity {
+        namespace: namespace.to_string(),
+        name: name.to_string(),
+        version: version.to_string(),
+        content_hash: content_hash.to_string(),
+    };
+    let epoch_membership = classify_epoch_membership(epoch_status, &identity);
+
     // Stage 0: attestation record absent (or collapsed to unattested at parse time).
     let Some(att) = attestation else {
-        return Ok((EntryVerificationResult::Unattested, None));
+        return Ok(EntryGateOutcome { result: EntryVerificationResult::Unattested, epoch_membership, cause: None });
     };
 
     // Stage 1: bundle acquisition.
     let Some(pin) = att.bundle_pin.as_deref() else {
-        return Ok((EntryVerificationResult::BundleMissing, Some("no-pin".to_string())));
+        return Ok(EntryGateOutcome {
+            result: EntryVerificationResult::BundleMissing,
+            epoch_membership,
+            cause: Some("no-pin".to_string()),
+        });
     };
     let Some(store) = bundle_store else {
-        return Ok((EntryVerificationResult::BundleMissing, Some("unfetchable".to_string())));
+        return Ok(EntryGateOutcome {
+            result: EntryVerificationResult::BundleMissing,
+            epoch_membership,
+            cause: Some("unfetchable".to_string()),
+        });
     };
     let bundle_bytes = match store.get(pin) {
         Ok(b) => b,
@@ -434,7 +562,11 @@ pub fn evaluate_entry_attestation(
             if e.code() == "TNG-ENTRY-BUNDLE-PIN-MISMATCH" {
                 return Err(e); // stage 1b: unconditional hard error, never policy-gated
             }
-            return Ok((EntryVerificationResult::BundleMissing, Some("unfetchable".to_string())));
+            return Ok(EntryGateOutcome {
+                result: EntryVerificationResult::BundleMissing,
+                epoch_membership,
+                cause: Some("unfetchable".to_string()),
+            });
         }
     };
 
@@ -447,7 +579,7 @@ pub fn evaluate_entry_attestation(
     // CR18: verifier.verify returns the narrower VerifierOutcome; widen to the
     // gate-level EntryVerificationResult here, at the one gate boundary.
     let result: EntryVerificationResult = verifier.verify(&subject, &bundle_bytes, trust_bundle, expected_signer).into();
-    Ok((result, None))
+    Ok(EntryGateOutcome { result, epoch_membership, cause: None })
 }
 
 // ---------------------------------------------------------------------------
@@ -560,7 +692,29 @@ fn bundle_missing_hint(cause: Option<&str>, backend: Option<BundleStoreBackend>)
     }
 }
 
-/// warn/strict slug dispatch for one selected entry's gate outcome.
+/// Pinned remediation prose keyed by epoch membership (RFC §6 S-EpochGate).
+///
+/// `PostEpoch`: the mandate-context sentence a strict failure needs — WHY
+/// this particular entry is not eligible for the grandfathered downgrade.
+/// `PreEpoch`: the symmetric explanation for why a failing pre-epoch entry
+/// stays a warning even under `entry-trust "strict"` (observability for the
+/// capped-policy case — not itself a failure explanation). `None`
+/// (`Unarmed`): no epoch context to add.
+fn epoch_membership_hint_suffix(membership: Option<EpochMembership>) -> &'static str {
+    match membership {
+        Some(EpochMembership::PostEpoch) => {
+            " This version is not in the registry's committed pre-epoch set, so it must \
+             carry a verifiable attestation."
+        }
+        Some(EpochMembership::PreEpoch) => {
+            " This version is in the registry's committed pre-epoch (grandfathered) set, \
+             so this stays a warning even under entry-trust \"strict\"."
+        }
+        None => "",
+    }
+}
+
+/// warn/strict slug dispatch for one selected entry's gate outcome (D9).
 ///
 /// - `Off`      → silent; the caller should not even invoke the gate, but
 ///                this guard makes the function total regardless.
@@ -569,36 +723,46 @@ fn bundle_missing_hint(cause: Option<&str>, backend: Option<BundleStoreBackend>)
 ///                version)` per invocation; return `Ok(())`.
 /// - `Strict`   → return `Err(MilpaError)` with the appropriate `TNG-ENTRY-*` slug.
 ///
+/// S-EpochGate (RFC §6, spec §3.6.3 NORMATIVE): before dispatching, the
+/// configured `policy` is passed through [`effective_epoch_policy`] with
+/// `outcome.epoch_membership` — `PostEpoch` keeps the configured policy (the
+/// mandate applies); `PreEpoch`/`None` (`Unarmed`) caps it at `Warn` (a
+/// fixed, shrinking grandfathered population never hard-fails).
+///
 /// `bundle_store` is the store the gate acquired (or failed to acquire)
 /// bytes from — passed through ONLY so a `BundleMissing` result can select
 /// the D6 cause × backend hint text (`bundle_missing_hint`); it has no
 /// bearing on any other result.
-#[allow(clippy::too_many_arguments)]
 pub fn enforce_entry_trust(
-    result: EntryVerificationResult,
+    outcome: &EntryGateOutcome,
     policy: &TrustPolicy,
     namespace: &str,
     name: &str,
     version: &str,
-    cause: Option<&str>,
     bundle_store: Option<&dyn EntryBundleStore>,
 ) -> Result<(), MilpaError> {
-    if *policy == TrustPolicy::Off || result == EntryVerificationResult::Trusted {
+    if *policy == TrustPolicy::Off || outcome.result == EntryVerificationResult::Trusted {
         return Ok(());
     }
 
-    let slug = result.to_slug();
-    let coordinate = format!("pkg:tianguis/{namespace}/{name}@{version}");
-    let mut hint = if result == EntryVerificationResult::BundleMissing {
-        bundle_missing_hint(cause, bundle_store.map(|s| s.backend()))
-    } else {
-        hint_for(result)
-    };
-    if let Some(c) = cause {
-        hint = format!("{hint} (cause: {c})");
+    let effective_policy = effective_epoch_policy(policy, outcome.epoch_membership);
+    if effective_policy == TrustPolicy::Off || outcome.result == EntryVerificationResult::Trusted {
+        return Ok(());
     }
 
-    if *policy == TrustPolicy::Strict {
+    let slug = outcome.result.to_slug();
+    let coordinate = format!("pkg:tianguis/{namespace}/{name}@{version}");
+    let mut hint = if outcome.result == EntryVerificationResult::BundleMissing {
+        bundle_missing_hint(outcome.cause.as_deref(), bundle_store.map(|s| s.backend()))
+    } else {
+        hint_for(outcome.result)
+    };
+    if let Some(c) = &outcome.cause {
+        hint = format!("{hint} (cause: {c})");
+    }
+    hint = format!("{hint}{}", epoch_membership_hint_suffix(outcome.epoch_membership));
+
+    if effective_policy == TrustPolicy::Strict {
         return Err(MilpaError::Core(CoreError::Tianguis(
             slug,
             format!("entry-trust strict: {slug} for {coordinate:?} — {hint}"),
@@ -748,27 +912,47 @@ mod tests {
         assert_eq!(outcome, VerifierOutcome::Trusted);
     }
 
+    /// Test helper: build an [`EntryGateOutcome`] with a given result,
+    /// defaulting ``epoch_membership`` to `PostEpoch` — the configured
+    /// policy applies unchanged (no S-EpochGate warn-cap in effect) — so the
+    /// many pre-existing policy-dispatch tests below (which predate
+    /// S-EpochGate and are about generic warn/strict/off behavior, not
+    /// epoch-membership gating) keep exercising that behavior unperturbed.
+    /// The dedicated S-EpochGate matrix overrides this explicitly per row.
+    fn outcome(result: EntryVerificationResult) -> EntryGateOutcome {
+        EntryGateOutcome { result, epoch_membership: Some(EpochMembership::PostEpoch), cause: None }
+    }
+
+    fn outcome_with(
+        result: EntryVerificationResult,
+        epoch_membership: Option<EpochMembership>,
+        cause: Option<&str>,
+    ) -> EntryGateOutcome {
+        EntryGateOutcome { result, epoch_membership, cause: cause.map(str::to_string) }
+    }
+
     #[test]
     fn evaluate_stage0_unattested() {
-        let (result, cause) = evaluate_entry_attestation(
+        let outcome = evaluate_entry_attestation(
             None, "dag-sha256:abcd", "ns1", "bar", "2.0.0",
             &MockEntryVerifier::new(VerifierOutcome::Trusted, HashMap::new()),
-            None, &TrustBundle::test(), "vendor-signer",
+            None, &TrustBundle::test(), "vendor-signer", &EpochCommitmentStatus::default(),
         ).unwrap();
-        assert_eq!(result, EntryVerificationResult::Unattested);
-        assert_eq!(cause, None);
+        assert_eq!(outcome.result, EntryVerificationResult::Unattested);
+        assert_eq!(outcome.cause, None);
+        assert_eq!(outcome.epoch_membership, None);
     }
 
     #[test]
     fn evaluate_stage1_bundle_missing_no_pin() {
         let att = EntryAttestation { kind: AttestationKind::MilpaVendored, rekor: None, bundle_pin: None };
-        let (result, cause) = evaluate_entry_attestation(
+        let outcome = evaluate_entry_attestation(
             Some(&att), "dag-sha256:abcd", "ns1", "bar", "2.0.0",
             &MockEntryVerifier::new(VerifierOutcome::Trusted, HashMap::new()),
-            None, &TrustBundle::test(), "vendor-signer",
+            None, &TrustBundle::test(), "vendor-signer", &EpochCommitmentStatus::default(),
         ).unwrap();
-        assert_eq!(result, EntryVerificationResult::BundleMissing);
-        assert_eq!(cause.as_deref(), Some("no-pin"));
+        assert_eq!(outcome.result, EntryVerificationResult::BundleMissing);
+        assert_eq!(outcome.cause.as_deref(), Some("no-pin"));
     }
 
     #[test]
@@ -778,13 +962,13 @@ mod tests {
             rekor: None,
             bundle_pin: Some("a".repeat(64)),
         };
-        let (result, cause) = evaluate_entry_attestation(
+        let outcome = evaluate_entry_attestation(
             Some(&att), "dag-sha256:abcd", "ns1", "bar", "2.0.0",
             &MockEntryVerifier::new(VerifierOutcome::Trusted, HashMap::new()),
-            None, &TrustBundle::test(), "vendor-signer",
+            None, &TrustBundle::test(), "vendor-signer", &EpochCommitmentStatus::default(),
         ).unwrap();
-        assert_eq!(result, EntryVerificationResult::BundleMissing);
-        assert_eq!(cause.as_deref(), Some("unfetchable"));
+        assert_eq!(outcome.result, EntryVerificationResult::BundleMissing);
+        assert_eq!(outcome.cause.as_deref(), Some("unfetchable"));
     }
 
     #[test]
@@ -805,7 +989,7 @@ mod tests {
         let err = evaluate_entry_attestation(
             Some(&att), "dag-sha256:abcd", "ns1", "bar", "2.0.0",
             &MockEntryVerifier::new(VerifierOutcome::Trusted, HashMap::new()),
-            Some(&store), &TrustBundle::test(), "vendor-signer",
+            Some(&store), &TrustBundle::test(), "vendor-signer", &EpochCommitmentStatus::default(),
         ).unwrap_err();
         assert_eq!(err.code(), "TNG-ENTRY-BUNDLE-PIN-MISMATCH");
     }
@@ -813,21 +997,21 @@ mod tests {
     #[test]
     fn enforce_off_is_silent() {
         enforce_entry_trust(
-            EntryVerificationResult::Unattested, &TrustPolicy::Off, "ns1", "bar", "2.0.0", None, None,
+            &outcome(EntryVerificationResult::Unattested), &TrustPolicy::Off, "ns1", "bar", "2.0.0", None,
         ).expect("off must never raise");
     }
 
     #[test]
     fn enforce_trusted_is_silent_even_under_strict() {
         enforce_entry_trust(
-            EntryVerificationResult::Trusted, &TrustPolicy::Strict, "ns1", "bar", "2.0.0", None, None,
+            &outcome(EntryVerificationResult::Trusted), &TrustPolicy::Strict, "ns1", "bar", "2.0.0", None,
         ).expect("trusted must never raise");
     }
 
     #[test]
     fn enforce_strict_raises_slug() {
         let err = enforce_entry_trust(
-            EntryVerificationResult::SignerMismatch, &TrustPolicy::Strict, "ns1", "bar", "2.0.0", None, None,
+            &outcome(EntryVerificationResult::SignerMismatch), &TrustPolicy::Strict, "ns1", "bar", "2.0.0", None,
         ).unwrap_err();
         assert_eq!(err.code(), "TNG-ENTRY-SIGNER-MISMATCH");
     }
@@ -836,7 +1020,7 @@ mod tests {
     fn enforce_warn_never_raises() {
         _reset_warned_entries();
         enforce_entry_trust(
-            EntryVerificationResult::Unattested, &TrustPolicy::Warn, "ns1", "warntest", "2.0.0", None, None,
+            &outcome(EntryVerificationResult::Unattested), &TrustPolicy::Warn, "ns1", "warntest", "2.0.0", None,
         ).expect("warn must not raise");
     }
 
@@ -873,7 +1057,7 @@ mod tests {
     fn unattested_hint_recommends_warn_not_off() {
         _reset_warned_entries();
         enforce_entry_trust(
-            EntryVerificationResult::Unattested, &TrustPolicy::Warn, "ns1", "foo", "1.0.0", None, None,
+            &outcome(EntryVerificationResult::Unattested), &TrustPolicy::Warn, "ns1", "foo", "1.0.0", None,
         ).unwrap();
         assert_eq!(hint_for(EntryVerificationResult::Unattested).contains("entry-trust \"warn\""), true);
         assert_eq!(hint_for(EntryVerificationResult::Unattested).contains("entry-trust \"off\""), false);
@@ -921,13 +1105,223 @@ mod tests {
         _reset_warned_entries();
         let store: Box<dyn EntryBundleStore> = Box::new(StubStore(BundleStoreBackend::File));
         enforce_entry_trust(
-            EntryVerificationResult::BundleMissing,
+            &outcome_with(EntryVerificationResult::BundleMissing, Some(EpochMembership::PostEpoch), Some("unfetchable")),
             &TrustPolicy::Warn,
             "ns1",
             "foo",
             "1.0.0",
-            Some("unfetchable"),
             Some(store.as_ref()),
         ).unwrap();
+    }
+
+    // -------------------------------------------------------------------
+    // S-EpochGate (RFC attestation-v1-normative.md §6, D14/D17): membership
+    // classification + the warn-cap downgrade. Spec: registry-protocol.md
+    // §3.4.8 (local set lookup) and §3.6.3 (EntryGateOutcome / EpochMembership
+    // NORMATIVE clauses).
+    // -------------------------------------------------------------------
+
+    fn id(namespace: &str, name: &str, version: &str, content_hash: &str) -> PreEpochIdentity {
+        PreEpochIdentity {
+            namespace: namespace.to_string(),
+            name: name.to_string(),
+            version: version.to_string(),
+            content_hash: content_hash.to_string(),
+        }
+    }
+
+    const CH: &str = "dag-sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const OTHER_CH: &str = "dag-sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    fn the_identity() -> PreEpochIdentity {
+        id("ns1", "foo", "1.0.0", CH)
+    }
+
+    mod classify_membership {
+        use super::*;
+
+        #[test]
+        fn armed_member_is_pre_epoch() {
+            let status = EpochCommitmentStatus::Armed {
+                identities: [the_identity()].into_iter().collect(),
+                integrated_time: 1700000000,
+            };
+            assert_eq!(classify_epoch_membership(&status, &the_identity()), Some(EpochMembership::PreEpoch));
+        }
+
+        #[test]
+        fn armed_non_member_is_post_epoch() {
+            let status = EpochCommitmentStatus::Armed {
+                identities: [id("ns1", "other", "2.0.0", OTHER_CH)].into_iter().collect(),
+                integrated_time: 1700000000,
+            };
+            assert_eq!(classify_epoch_membership(&status, &the_identity()), Some(EpochMembership::PostEpoch));
+        }
+
+        #[test]
+        fn armed_empty_set_is_post_epoch() {
+            let status = EpochCommitmentStatus::Armed { identities: Default::default(), integrated_time: 1700000000 };
+            assert_eq!(classify_epoch_membership(&status, &the_identity()), Some(EpochMembership::PostEpoch));
+        }
+
+        #[test]
+        fn unarmed_is_none() {
+            assert_eq!(classify_epoch_membership(&EpochCommitmentStatus::Unarmed, &the_identity()), None);
+        }
+
+        #[test]
+        fn arming_invalid_is_none_defensively() {
+            let status = EpochCommitmentStatus::ArmingInvalid { reason: "x".to_string() };
+            assert_eq!(classify_epoch_membership(&status, &the_identity()), None);
+        }
+
+        #[test]
+        fn sensitive_to_every_identity_field() {
+            let status = EpochCommitmentStatus::Armed {
+                identities: [the_identity()].into_iter().collect(),
+                integrated_time: 1700000000,
+            };
+            assert_eq!(classify_epoch_membership(&status, &id("ns2", "foo", "1.0.0", CH)), Some(EpochMembership::PostEpoch));
+            assert_eq!(classify_epoch_membership(&status, &id("ns1", "bar", "1.0.0", CH)), Some(EpochMembership::PostEpoch));
+            assert_eq!(classify_epoch_membership(&status, &id("ns1", "foo", "2.0.0", CH)), Some(EpochMembership::PostEpoch));
+            assert_eq!(classify_epoch_membership(&status, &id("ns1", "foo", "1.0.0", OTHER_CH)), Some(EpochMembership::PostEpoch));
+        }
+    }
+
+    mod effective_policy {
+        use super::*;
+
+        #[test]
+        fn post_epoch_is_unchanged() {
+            for policy in [TrustPolicy::Off, TrustPolicy::Warn, TrustPolicy::Strict] {
+                assert_eq!(effective_epoch_policy(&policy, Some(EpochMembership::PostEpoch)), policy);
+            }
+        }
+
+        #[test]
+        fn off_stays_off_regardless_of_membership() {
+            assert_eq!(effective_epoch_policy(&TrustPolicy::Off, Some(EpochMembership::PreEpoch)), TrustPolicy::Off);
+            assert_eq!(effective_epoch_policy(&TrustPolicy::Off, None), TrustPolicy::Off);
+        }
+
+        #[test]
+        fn warn_stays_warn_regardless_of_membership() {
+            assert_eq!(effective_epoch_policy(&TrustPolicy::Warn, Some(EpochMembership::PreEpoch)), TrustPolicy::Warn);
+            assert_eq!(effective_epoch_policy(&TrustPolicy::Warn, None), TrustPolicy::Warn);
+        }
+
+        #[test]
+        fn strict_downgrades_to_warn_for_pre_epoch_or_unarmed() {
+            assert_eq!(effective_epoch_policy(&TrustPolicy::Strict, Some(EpochMembership::PreEpoch)), TrustPolicy::Warn);
+            assert_eq!(effective_epoch_policy(&TrustPolicy::Strict, None), TrustPolicy::Warn);
+        }
+    }
+
+    /// The full impl-level unit matrix (RFC §6 S-EpochGate *Test*):
+    /// {PreEpoch, PostEpoch, Unarmed} x {Warn, Strict} x {attested, unattested}.
+    mod full_matrix {
+        use super::*;
+
+        fn status_for(membership: Option<EpochMembership>) -> EpochCommitmentStatus {
+            match membership {
+                None => EpochCommitmentStatus::Unarmed,
+                Some(EpochMembership::PreEpoch) => EpochCommitmentStatus::Armed {
+                    identities: [the_identity()].into_iter().collect(),
+                    integrated_time: 1700000000,
+                },
+                Some(EpochMembership::PostEpoch) => EpochCommitmentStatus::Armed {
+                    identities: [id("ns1", "other", "9.9.9", OTHER_CH)].into_iter().collect(),
+                    integrated_time: 1700000000,
+                },
+            }
+        }
+
+        fn evaluate_unattested(membership: Option<EpochMembership>) -> EntryGateOutcome {
+            evaluate_entry_attestation(
+                None, CH, "ns1", "foo", "1.0.0",
+                &MockEntryVerifier::new(VerifierOutcome::Trusted, HashMap::new()),
+                None, &TrustBundle::test(), "vendor-bot", &status_for(membership),
+            ).unwrap()
+        }
+
+        #[test]
+        fn post_epoch_strict_unattested_hard_fails() {
+            let outcome = evaluate_unattested(Some(EpochMembership::PostEpoch));
+            assert_eq!(outcome.result, EntryVerificationResult::Unattested);
+            assert_eq!(outcome.epoch_membership, Some(EpochMembership::PostEpoch));
+            let err = enforce_entry_trust(&outcome, &TrustPolicy::Strict, "ns1", "foo", "1.0.0", None).unwrap_err();
+            assert_eq!(err.code(), "TNG-ENTRY-UNATTESTED");
+        }
+
+        #[test]
+        fn pre_epoch_strict_unattested_warns_not_raises() {
+            _reset_warned_entries();
+            let outcome = evaluate_unattested(Some(EpochMembership::PreEpoch));
+            assert_eq!(outcome.epoch_membership, Some(EpochMembership::PreEpoch));
+            enforce_entry_trust(&outcome, &TrustPolicy::Strict, "ns1", "foo", "1.0.0", None)
+                .expect("PreEpoch must stay warn-territory even under strict");
+        }
+
+        #[test]
+        fn unarmed_strict_unattested_warns_not_raises() {
+            _reset_warned_entries();
+            let outcome = evaluate_unattested(None);
+            assert_eq!(outcome.epoch_membership, None);
+            enforce_entry_trust(&outcome, &TrustPolicy::Strict, "ns1", "foo", "1.0.0", None)
+                .expect("Unarmed must be warn-equivalent even under strict");
+        }
+
+        #[test]
+        fn post_epoch_mandate_hint_is_pinned() {
+            let outcome = evaluate_unattested(Some(EpochMembership::PostEpoch));
+            let err = enforce_entry_trust(&outcome, &TrustPolicy::Strict, "ns1", "foo", "1.0.0", None).unwrap_err();
+            let msg = err.message();
+            assert!(msg.contains("not in the registry's committed pre-epoch set"), "{msg}");
+            assert!(msg.contains("must carry a verifiable attestation"), "{msg}");
+        }
+
+        #[test]
+        fn attested_trusted_passes_under_strict_regardless_of_membership() {
+            for membership in [Some(EpochMembership::PreEpoch), Some(EpochMembership::PostEpoch), None] {
+                _reset_warned_entries();
+                let tmp = tempfile::tempdir().unwrap();
+                let bundle_bytes = b"any-bytes-mock-does-not-inspect".to_vec();
+                let pin = {
+                    use sha2::{Digest, Sha256};
+                    hex::encode(Sha256::digest(&bundle_bytes))
+                };
+                std::fs::write(tmp.path().join(format!("{pin}.bundle")), &bundle_bytes).unwrap();
+                let store = crate::entry_bundle_store::FileEntryBundleStore::new(tmp.path());
+                let att = EntryAttestation { kind: AttestationKind::MilpaVendored, rekor: None, bundle_pin: Some(pin) };
+
+                let outcome = evaluate_entry_attestation(
+                    Some(&att), CH, "ns1", "foo", "1.0.0",
+                    &MockEntryVerifier::new(VerifierOutcome::Trusted, HashMap::new()),
+                    Some(&store), &TrustBundle::test(), "vendor-bot", &status_for(membership),
+                ).unwrap();
+                assert_eq!(outcome.result, EntryVerificationResult::Trusted);
+                enforce_entry_trust(&outcome, &TrustPolicy::Strict, "ns1", "foo", "1.0.0", None)
+                    .expect("Trusted must never raise/warn regardless of membership");
+            }
+        }
+
+        #[test]
+        fn warn_policy_never_raises_regardless_of_membership() {
+            for membership in [Some(EpochMembership::PreEpoch), Some(EpochMembership::PostEpoch), None] {
+                _reset_warned_entries();
+                let outcome = evaluate_unattested(membership);
+                enforce_entry_trust(&outcome, &TrustPolicy::Warn, "ns1", "foo", "1.0.0", None)
+                    .expect("warn must never raise");
+            }
+        }
+
+        #[test]
+        fn off_policy_never_raises_regardless_of_membership() {
+            for membership in [Some(EpochMembership::PreEpoch), Some(EpochMembership::PostEpoch), None] {
+                let outcome = evaluate_unattested(membership);
+                enforce_entry_trust(&outcome, &TrustPolicy::Off, "ns1", "foo", "1.0.0", None)
+                    .expect("off must never raise");
+            }
+        }
     }
 }

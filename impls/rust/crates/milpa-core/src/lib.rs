@@ -67,9 +67,10 @@ pub use entry_bundle_store::{
     HttpEntryBundleStore,
 };
 pub use entry_trust::{
-    build_entry_subject, enforce_entry_trust, evaluate_entry_attestation, EntryBundleVerifier,
-    EntrySubject, EntryTrustConfig, EntryVerificationResult, MockEntryVerifier, SigstoreEntryVerifier,
-    VerifierOutcome,
+    build_entry_subject, classify_epoch_membership, effective_epoch_policy, enforce_entry_trust,
+    evaluate_entry_attestation, EntryBundleVerifier, EntryGateOutcome, EntrySubject,
+    EntryTrustConfig, EntryVerificationResult, EpochMembership, MockEntryVerifier,
+    SigstoreEntryVerifier, VerifierOutcome,
 };
 pub use error::{CoreError, MilpaError};
 pub use index_cache::{
@@ -79,7 +80,7 @@ pub use index_cache::{
 };
 pub use index_ratchet_seam::{
     build_index_state, evaluate_gate, iso_timestamp, parse_baseline, parse_baseline_meta,
-    print_yank_notice, BaselineMeta, GateDecision,
+    print_yank_notice, raw_attestation_epoch_commitment, BaselineMeta, GateDecision,
 };
 pub use ratchet::{canonical_digest, Baseline, EntryKey, RatchetOutcome, Violation};
 pub use lockfile::{

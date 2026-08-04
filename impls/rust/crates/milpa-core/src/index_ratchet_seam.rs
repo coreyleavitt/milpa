@@ -143,7 +143,7 @@ fn raw_attestation_epoch(text: &str) -> Result<Option<String>, MilpaError> {
 /// only site that extracts it, so it is also the only site that can
 /// charset-check it (registry-protocol §3.3 NORMATIVE). Mirrors
 /// `index_ratchet_seam.py::_raw_attestation_epoch_commitment`.
-pub(crate) fn raw_attestation_epoch_commitment(text: &str) -> Result<Option<String>, MilpaError> {
+pub fn raw_attestation_epoch_commitment(text: &str) -> Result<Option<String>, MilpaError> {
     let doc = KdlDocument::parse(text)
         .map_err(|e| tng("TNG-KDL-SYNTAX", format!("index KDL syntax error: {e}")))?;
     for node in doc.nodes() {

@@ -1,10 +1,13 @@
-"""Unit tests for entry_trust.py (P3a, RFC per-entry-attestation.md §5, §6).
+"""Unit tests for entry_trust.py (P3a, RFC per-entry-attestation.md §5, §6;
+S-EpochGate, RFC attestation-v1-normative.md §6, D14/D17).
 
 Covers:
   - build_entry_subject: RFC §1 coordinate format
   - evaluate_entry_attestation: gate stages 0, 1, 1b, and delegation to the
-    verifier for stages 2-7 (via MockEntryVerifier)
-  - enforce_entry_trust: warn (dedup) / strict / off dispatch
+    verifier for stages 2-7 (via MockEntryVerifier); returns EntryGateOutcome (D9)
+  - classify_epoch_membership / effective_epoch_policy: S-EpochGate membership
+    classification + the warn-cap downgrade
+  - enforce_entry_trust: warn (dedup) / strict / off dispatch, epoch-gated
   - MockEntryVerifier: keyed per-subject scripting + default
   - SigstoreEntryVerifier: pre-crypto malformed / digest-mismatch / subject-mismatch
     (no real bundle needed — these paths never reach crypto)
@@ -22,7 +25,10 @@ from milpa.entry_trust import (
     BundleMalformed,
     BundleMissing,
     DigestMismatch,
+    EntryGateOutcome,
     MockEntryVerifier,
+    PostEpoch,
+    PreEpoch,
     SignatureInvalid,
     SignerMismatch,
     SigstoreEntryVerifier,
@@ -30,10 +36,13 @@ from milpa.entry_trust import (
     Trusted,
     Unattested,
     build_entry_subject,
+    classify_epoch_membership,
+    effective_epoch_policy,
     enforce_entry_trust,
     evaluate_entry_attestation,
     _reset_warned_entries,
 )
+from milpa.epoch_commitment import Armed, ArmingInvalid, PreEpochIdentity, Unarmed
 from milpa.errors import (
     TNG_ENTRY_BUNDLE_MALFORMED,
     TNG_ENTRY_BUNDLE_MISSING,
@@ -47,6 +56,21 @@ from milpa.errors import (
 )
 from milpa.index_trust import TrustBundle
 from milpa.registry import AuthorSigned, EntryAttestation, MilpaVendored
+
+
+def _outcome(result, epoch_membership=PostEpoch, cause=None) -> EntryGateOutcome:
+    """Test helper: build an ``EntryGateOutcome`` directly for
+    ``enforce_entry_trust`` unit tests that don't need the full
+    ``evaluate_entry_attestation`` pipeline.
+
+    Defaults ``epoch_membership`` to ``PostEpoch`` — the configured policy
+    applies unchanged (no S-EpochGate warn-cap in effect) — so the many
+    pre-existing policy-dispatch tests in this file (which predate
+    S-EpochGate and are about generic warn/strict/off behavior, not
+    epoch-membership gating) keep exercising that behavior unperturbed. The
+    dedicated S-EpochGate matrix below overrides this explicitly per row.
+    """
+    return EntryGateOutcome(result=result, epoch_membership=epoch_membership, cause=cause)
 
 
 @pytest.fixture(autouse=True)
@@ -83,7 +107,7 @@ def test_build_entry_subject_rejects_missing_scheme_separator() -> None:
 
 
 def test_stage0_unattested_when_no_attestation() -> None:
-    result, cause = evaluate_entry_attestation(
+    outcome = evaluate_entry_attestation(
         attestation=None,
         content_hash="sha256:" + "a" * 64,
         namespace="ns1",
@@ -93,9 +117,11 @@ def test_stage0_unattested_when_no_attestation() -> None:
         bundle_store=None,
         trust_bundle=TrustBundle.test(),
         expected_vendor_signer="bot",
+        epoch_status=Unarmed(),
     )
-    assert result is Unattested
-    assert cause is None
+    assert outcome.result is Unattested
+    assert outcome.cause is None
+    assert outcome.epoch_membership is None
 
 
 # ---------------------------------------------------------------------------
@@ -105,7 +131,7 @@ def test_stage0_unattested_when_no_attestation() -> None:
 
 def test_stage1_bundle_missing_no_pin() -> None:
     att = EntryAttestation(kind=MilpaVendored(), bundle_pin=None)
-    result, cause = evaluate_entry_attestation(
+    outcome = evaluate_entry_attestation(
         attestation=att,
         content_hash="sha256:" + "a" * 64,
         namespace="ns1",
@@ -115,15 +141,16 @@ def test_stage1_bundle_missing_no_pin() -> None:
         bundle_store=None,
         trust_bundle=TrustBundle.test(),
         expected_vendor_signer="bot",
+        epoch_status=Unarmed(),
     )
-    assert result is BundleMissing
-    assert cause == "no-pin"
+    assert outcome.result is BundleMissing
+    assert outcome.cause == "no-pin"
 
 
 def test_stage1_bundle_missing_unfetchable(tmp_path) -> None:
     att = EntryAttestation(kind=MilpaVendored(), bundle_pin="b" * 64)
     store = FileEntryBundleStore(tmp_path)  # empty dir: pin not present
-    result, cause = evaluate_entry_attestation(
+    outcome = evaluate_entry_attestation(
         attestation=att,
         content_hash="sha256:" + "a" * 64,
         namespace="ns1",
@@ -133,9 +160,10 @@ def test_stage1_bundle_missing_unfetchable(tmp_path) -> None:
         bundle_store=store,
         trust_bundle=TrustBundle.test(),
         expected_vendor_signer="bot",
+        epoch_status=Unarmed(),
     )
-    assert result is BundleMissing
-    assert cause == "unfetchable"
+    assert outcome.result is BundleMissing
+    assert outcome.cause == "unfetchable"
 
 
 def test_stage1b_bundle_pin_mismatch_propagates_unconditionally(tmp_path) -> None:
@@ -155,6 +183,7 @@ def test_stage1b_bundle_pin_mismatch_propagates_unconditionally(tmp_path) -> Non
             bundle_store=store,
             trust_bundle=TrustBundle.test(),
             expected_vendor_signer="bot",
+            epoch_status=Unarmed(),
         )
     assert exc_info.value.slug == TNG_ENTRY_BUNDLE_PIN_MISMATCH
 
@@ -178,7 +207,7 @@ def test_stages_2_to_7_delegate_to_verifier_keyed_by_subject(tmp_path) -> None:
     subject_name = "pkg:tianguis/ns1/foo@1.0.0"
     verifier = MockEntryVerifier(default=Trusted, by_subject={subject_name: SignerMismatch})
 
-    result, cause = evaluate_entry_attestation(
+    outcome = evaluate_entry_attestation(
         attestation=att,
         content_hash="sha256:" + "a" * 64,
         namespace="ns1",
@@ -188,9 +217,10 @@ def test_stages_2_to_7_delegate_to_verifier_keyed_by_subject(tmp_path) -> None:
         bundle_store=store,
         trust_bundle=TrustBundle.test(),
         expected_vendor_signer="bot",
+        epoch_status=Unarmed(),
     )
-    assert result is SignerMismatch
-    assert cause is None
+    assert outcome.result is SignerMismatch
+    assert outcome.cause is None
 
 
 def test_author_signed_expected_signer_is_record_signer(tmp_path) -> None:
@@ -215,6 +245,7 @@ def test_author_signed_expected_signer_is_record_signer(tmp_path) -> None:
         bundle_store=store,
         trust_bundle=TrustBundle.test(),
         expected_vendor_signer="bot-default",
+        epoch_status=Unarmed(),
     )
     assert captured["expected_signer"] == "alice-signer"
 
@@ -242,6 +273,7 @@ def test_vendored_expected_signer_is_the_resolved_layer1_identity(tmp_path) -> N
         bundle_store=store,
         trust_bundle=TrustBundle.test(),
         expected_vendor_signer="the-resolved-vendor-bot-identity",
+        epoch_status=Unarmed(),
     )
     assert captured["expected_signer"] == "the-resolved-vendor-bot-identity"
 
@@ -252,20 +284,22 @@ def test_vendored_expected_signer_is_the_resolved_layer1_identity(tmp_path) -> N
 
 
 def test_enforce_off_never_raises_or_warns(capsys) -> None:
-    enforce_entry_trust(DigestMismatch, "off", namespace="ns1", name="foo", version="1.0.0")
+    enforce_entry_trust(_outcome(DigestMismatch), "off", namespace="ns1", name="foo", version="1.0.0")
     captured = capsys.readouterr()
     assert captured.err == ""
 
 
 def test_enforce_trusted_never_raises_or_warns(capsys) -> None:
-    enforce_entry_trust(Trusted, "strict", namespace="ns1", name="foo", version="1.0.0")
+    enforce_entry_trust(_outcome(Trusted), "strict", namespace="ns1", name="foo", version="1.0.0")
     captured = capsys.readouterr()
     assert captured.err == ""
 
 
 def test_enforce_strict_raises_mapped_slug() -> None:
     with pytest.raises(MilpaError) as exc_info:
-        enforce_entry_trust(SubjectMismatch, "strict", namespace="ns1", name="foo", version="1.0.0")
+        enforce_entry_trust(
+            _outcome(SubjectMismatch), "strict", namespace="ns1", name="foo", version="1.0.0"
+        )
     assert exc_info.value.slug == TNG_ENTRY_SUBJECT_MISMATCH
 
 
@@ -283,34 +317,38 @@ def test_enforce_strict_raises_mapped_slug() -> None:
 )
 def test_enforce_strict_all_slugs(result, slug) -> None:
     with pytest.raises(MilpaError) as exc_info:
-        enforce_entry_trust(result, "strict", namespace="ns1", name="foo", version="1.0.0")
+        enforce_entry_trust(_outcome(result), "strict", namespace="ns1", name="foo", version="1.0.0")
     assert exc_info.value.slug == slug
 
 
 def test_enforce_warn_emits_one_warning(capsys) -> None:
-    enforce_entry_trust(DigestMismatch, "warn", namespace="ns1", name="foo", version="1.0.0")
+    enforce_entry_trust(_outcome(DigestMismatch), "warn", namespace="ns1", name="foo", version="1.0.0")
     captured = capsys.readouterr()
     assert "entry-trust warning" in captured.err
     assert "TNG-ENTRY-DIGEST-MISMATCH" in captured.err
 
 
 def test_enforce_warn_dedups_per_coordinate(capsys) -> None:
-    enforce_entry_trust(DigestMismatch, "warn", namespace="ns1", name="foo", version="1.0.0")
-    enforce_entry_trust(DigestMismatch, "warn", namespace="ns1", name="foo", version="1.0.0")
+    enforce_entry_trust(_outcome(DigestMismatch), "warn", namespace="ns1", name="foo", version="1.0.0")
+    enforce_entry_trust(_outcome(DigestMismatch), "warn", namespace="ns1", name="foo", version="1.0.0")
     captured = capsys.readouterr()
     assert captured.err.count("entry-trust warning") == 1
 
 
 def test_enforce_warn_does_not_dedup_across_different_coordinates(capsys) -> None:
-    enforce_entry_trust(DigestMismatch, "warn", namespace="ns1", name="foo", version="1.0.0")
-    enforce_entry_trust(DigestMismatch, "warn", namespace="ns1", name="bar", version="1.0.0")
+    enforce_entry_trust(_outcome(DigestMismatch), "warn", namespace="ns1", name="foo", version="1.0.0")
+    enforce_entry_trust(_outcome(DigestMismatch), "warn", namespace="ns1", name="bar", version="1.0.0")
     captured = capsys.readouterr()
     assert captured.err.count("entry-trust warning") == 2
 
 
 def test_enforce_warn_bundle_missing_includes_cause(capsys) -> None:
     enforce_entry_trust(
-        BundleMissing, "warn", namespace="ns1", name="foo", version="1.0.0", cause="no-pin"
+        _outcome(BundleMissing, cause="no-pin"),
+        "warn",
+        namespace="ns1",
+        name="foo",
+        version="1.0.0",
     )
     captured = capsys.readouterr()
     assert "no-pin" in captured.err
@@ -339,7 +377,7 @@ def _hint_from_warning(capsys) -> str:
 
 
 def test_unattested_hint_recommends_warn_not_off(capsys) -> None:
-    enforce_entry_trust(Unattested, "warn", namespace="ns1", name="foo", version="1.0.0")
+    enforce_entry_trust(_outcome(Unattested), "warn", namespace="ns1", name="foo", version="1.0.0")
     err = _hint_from_warning(capsys)
     assert 'entry-trust "warn"' in err
     assert 'entry-trust "off"' not in err
@@ -347,7 +385,11 @@ def test_unattested_hint_recommends_warn_not_off(capsys) -> None:
 
 def test_bundle_missing_no_pin_hint_recommends_warn_not_off(capsys) -> None:
     enforce_entry_trust(
-        BundleMissing, "warn", namespace="ns1", name="foo", version="1.0.0", cause="no-pin"
+        _outcome(BundleMissing, cause="no-pin"),
+        "warn",
+        namespace="ns1",
+        name="foo",
+        version="1.0.0",
     )
     err = _hint_from_warning(capsys)
     assert "has not published" in err
@@ -361,12 +403,11 @@ def test_bundle_missing_unfetchable_http_backend_hint_is_transient(capsys) -> No
 
     store = HttpEntryBundleStore(base_url="https://example.com/registry/")
     enforce_entry_trust(
-        BundleMissing,
+        _outcome(BundleMissing, cause="unfetchable"),
         "warn",
         namespace="ns1",
         name="foo",
         version="1.0.0",
-        cause="unfetchable",
         bundle_store=store,
     )
     err = _hint_from_warning(capsys)
@@ -380,12 +421,11 @@ def test_bundle_missing_unfetchable_file_backend_hint_names_operator_mirror(
 ) -> None:
     store = FileEntryBundleStore(tmp_path)
     enforce_entry_trust(
-        BundleMissing,
+        _outcome(BundleMissing, cause="unfetchable"),
         "warn",
         namespace="ns1",
         name="foo",
         version="1.0.0",
-        cause="unfetchable",
         bundle_store=store,
     )
     err = _hint_from_warning(capsys)
@@ -399,12 +439,11 @@ def test_bundle_missing_unfetchable_file_backend_hint_names_operator_mirror(
 
 def test_bundle_missing_unfetchable_no_store_configured_hint(capsys) -> None:
     enforce_entry_trust(
-        BundleMissing,
+        _outcome(BundleMissing, cause="unfetchable"),
         "warn",
         namespace="ns1",
         name="foo",
         version="1.0.0",
-        cause="unfetchable",
         bundle_store=None,
     )
     err = _hint_from_warning(capsys)

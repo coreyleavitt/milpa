@@ -4437,7 +4437,7 @@ impl<'a> ResolveProvider<'a> {
                     if c.is_registry {
                         let dep_key = depkey_for_solved_name(name, &self.binding_resolver.borrow());
                         let version_str = c.version.to_string();
-                        let (gate_result, gate_cause) = crate::entry_trust::evaluate_entry_attestation(
+                        let outcome = crate::entry_trust::evaluate_entry_attestation(
                             c.attestation.as_ref(),
                             &c.identity,
                             &c.registry_namespace,
@@ -4447,14 +4447,14 @@ impl<'a> ResolveProvider<'a> {
                             cfg.bundle_store.as_deref(),
                             &cfg.trust_bundle,
                             &cfg.expected_vendor_signer,
+                            &self.index.epoch_commitment_status,
                         )?;
                         crate::entry_trust::enforce_entry_trust(
-                            gate_result,
+                            &outcome,
                             &cfg.policy,
                             &c.registry_namespace,
                             &dep_key.name,
                             &version_str,
-                            gate_cause.as_deref(),
                             cfg.bundle_store.as_deref(),
                         )?;
                     }
@@ -4520,7 +4520,7 @@ impl<'a> ResolveProvider<'a> {
                 // partially-built graph escapes).
                 if let Some(cfg) = entry_trust {
                     if c.is_registry {
-                        let (gate_result, gate_cause) = crate::entry_trust::evaluate_entry_attestation(
+                        let outcome = crate::entry_trust::evaluate_entry_attestation(
                             c.attestation.as_ref(),
                             &c.identity,
                             &c.registry_namespace,
@@ -4530,14 +4530,14 @@ impl<'a> ResolveProvider<'a> {
                             cfg.bundle_store.as_deref(),
                             &cfg.trust_bundle,
                             &cfg.expected_vendor_signer,
+                            &self.index.epoch_commitment_status,
                         )?;
                         crate::entry_trust::enforce_entry_trust(
-                            gate_result,
+                            &outcome,
                             &cfg.policy,
                             &c.registry_namespace,
                             &dep_key.name,
                             &version_str,
-                            gate_cause.as_deref(),
                             cfg.bundle_store.as_deref(),
                         )?;
                     }

@@ -1508,16 +1508,26 @@ def _reverify_cached_entry_attestations(
     ``milpa verify`` must never do. A pin that is present but not cached is
     reported as ``TNG-ENTRY-BUNDLE-MISSING`` (cause ``unfetchable``), exactly
     as if the bundle had never been fetched.
+
+    S-EpochGate scope note: this offline, lockfile-driven path never loads an
+    ``Index`` (that would require re-acquiring + re-verifying the index and
+    its epoch-commitment sidecar, which ``milpa verify``'s offline invariant
+    above forbids). It always classifies as ``Unarmed`` (``epoch_membership
+    = None``) — the same warn-equivalent treatment ``effective_epoch_policy``
+    gives a genuinely unarmed registry — rather than reconstructing a stale
+    or unverifiable membership claim from the lockfile alone.
     """
     if env is None or project_dir is None:
         return
 
     from milpa.entry_trust import (
         BundleMissing,
+        EntryGateOutcome,
         build_entry_subject,
         enforce_entry_trust,
         evaluate_entry_attestation,
     )
+    from milpa.epoch_commitment import Unarmed
     from milpa.registry import EntryAttestation
 
     config = _build_entry_trust(env, project_dir)
@@ -1529,19 +1539,21 @@ def _reverify_cached_entry_attestations(
         if att is None:
             continue
 
-        cause: "str | None" = None
+        # S-EpochGate scope note (see docstring above): this offline path
+        # never loads an Index, so membership is always None (Unarmed) — the
+        # two manually-constructed BundleMissing outcomes below carry that
+        # same ``epoch_membership=None`` for consistency with the delegated
+        # (evaluate_entry_attestation) branch, which also runs Unarmed().
         if att.bundle_pin is None:
-            result = BundleMissing
-            cause = "no-pin"
+            outcome = EntryGateOutcome(result=BundleMissing, epoch_membership=None, cause="no-pin")
         elif config.bundle_store is None or not config.bundle_store.is_cached(att.bundle_pin):
             # NEVER fetch — a present-but-uncached pin is unfetchable-from-cache.
-            result = BundleMissing
-            cause = "unfetchable"
+            outcome = EntryGateOutcome(result=BundleMissing, epoch_membership=None, cause="unfetchable")
         else:
             # Cached: reuse the shared gate pipeline. bundle_store.get() on a
             # cached pin never touches the network (verified is_cached above).
             reconstructed = EntryAttestation(kind=att.kind, rekor=att.rekor, bundle_pin=att.bundle_pin)
-            result, cause = evaluate_entry_attestation(
+            outcome = evaluate_entry_attestation(
                 attestation=reconstructed,
                 content_hash=dep.identity or "",
                 namespace=att.namespace,
@@ -1551,15 +1563,15 @@ def _reverify_cached_entry_attestations(
                 bundle_store=config.bundle_store,
                 trust_bundle=config.trust_bundle,
                 expected_vendor_signer=config.expected_vendor_signer,
+                epoch_status=Unarmed(),
             )
 
         enforce_entry_trust(
-            result,
+            outcome,
             config.policy,
             namespace=att.namespace,
             name=dep.name,
             version=dep.version,
-            cause=cause,
             bundle_store=config.bundle_store,
         )
 

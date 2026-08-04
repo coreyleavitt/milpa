@@ -1,0 +1,1 @@
+{"identities": [{"namespace": "ns1", "name": "someone-else", "version": "9.9.9", "content_hash": "dag-sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"}], "bundle": {"verificationMaterial": {"tlogEntries": [{"integratedTime": 1700000000, "logIndex": 1}]}, "dsseEnvelope": {"payload": ""}}}
