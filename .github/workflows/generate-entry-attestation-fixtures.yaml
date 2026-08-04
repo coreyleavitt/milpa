@@ -1,0 +1,81 @@
+# Regenerate the S6 Layer-2 (per-entry) real-crypto TEST FIXTURES
+# (RFC docs/rfc-attestation-v1-normative.md, slice S6).
+#
+# Layer-2 analogue of generate-attestation-fixture.yaml (which mints the
+# Layer-1 whole-index _oracle/attestation/index.kdl.bundle). ONE-TIME /
+# regenerate-only, over SYNTHETIC subjects — not a production signer. The
+# real, recurring per-package signing lives in tianguis (vendor.yaml /
+# backfill-attestation.yaml).
+#
+# Signs with sigstore-python `Signer.sign_dsse` — the IDENTICAL recipe tianguis
+# production uses (scripts/sign_statement.py), NOT cosign, so the fixtures match
+# production's DSSE envelope serialization (signer parity; the #183/differential
+# blind-spot class of bug). Keyless: the signer SAN is this workflow's ambient
+# GitHub Actions OIDC identity.
+#
+# SIGNER SAN pinned by the S6 fixtures (printed by the run for confirmation):
+#   https://github.com/coreyleavitt/milpa/.github/workflows/generate-entry-attestation-fixtures.yaml@refs/heads/main
+#
+# The bundles are uploaded as a workflow artifact (no bot commits — milpa uses
+# the global git identity); a maintainer downloads them (`gh run download`) and
+# commits them under conformance/spec-v1/_oracle/entry-attestation/.
+name: generate-entry-attestation-fixtures
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write # ambient OIDC token for keyless signing
+  contents: read
+
+jobs:
+  mint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install sigstore-python (pinned to tianguis's version for signer parity)
+        run: python -m pip install "sigstore==4.3.0"
+
+      - name: Mint the per-entry + commitment bundles (keyless sign_dsse)
+        run: |
+          set -euxo pipefail
+          python conformance/tools/mint_entry_fixtures.py --out out
+          echo "== minted files =="; ls -la out
+
+      - name: Structural sanity check (fail fast on a broken mint)
+        run: |
+          set -euxo pipefail
+          python - <<'PY'
+          import json, sys, pathlib
+          ok = True
+          for f in ("out/entry-attested-pkg.bundle", "out/commitment.bundle"):
+              b = json.loads(pathlib.Path(f).read_text())
+              env = b.get("dsseEnvelope") or b.get("dsse_envelope")
+              vm = b.get("verificationMaterial") or b.get("verification_material") or {}
+              tlog = vm.get("tlogEntries") or vm.get("tlog_entries") or []
+              if not env or not tlog:
+                  print(f"BROKEN: {f} missing dsseEnvelope or tlogEntries", file=sys.stderr); ok = False
+              else:
+                  print(f"OK: {f} has a DSSE envelope + {len(tlog)} Rekor tlog entry(ies)")
+          sys.exit(0 if ok else 1)
+          PY
+
+      - name: Print signer SAN for confirmation
+        run: |
+          echo "SIGNER SAN (pin this as expected_signer in the S6 fixtures):"
+          echo "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/generate-entry-attestation-fixtures.yaml@refs/heads/${GITHUB_REF_NAME}"
+
+      - name: Upload the minted fixtures
+        uses: actions/upload-artifact@v4
+        with:
+          name: entry-attestation-fixtures
+          path: |
+            out/entry-attested-pkg.bundle
+            out/commitment.bundle
+            out/manifest.json
+          if-no-files-found: error
