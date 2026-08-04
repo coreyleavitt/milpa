@@ -169,7 +169,12 @@ def main() -> int:
         {
             "bundle": "commitment.bundle",
             "kind": "commitment",
-            "subject_name": None,  # the commitment binds by digest only (like Layer-1)
+            # The commitment binds by DIGEST only — milpa's commitment verify
+            # (via verify_index_bundle) checks subject digest == C and ignores
+            # the name, exactly as Layer-1 does for the index bundle. But the
+            # in-toto Statement schema (enforced by sigstore-python) REQUIRES a
+            # subject name, so we set a fixed non-package marker.
+            "subject_name": "milpa-preepoch-set-commitment",
             "digest_hex": _COMMITMENT_C,
             "predicate_type": _COMMITMENT_PREDICATE_TYPE,
         },
