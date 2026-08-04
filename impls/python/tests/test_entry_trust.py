@@ -652,3 +652,368 @@ def test_s6_real_bundle_resolves_under_strict_via_gate(tmp_path) -> None:
         name=_ENTRY_FIXTURE_NAME,
         version=_ENTRY_FIXTURE_VERSION,
     )
+
+
+# ---------------------------------------------------------------------------
+# S7 — real-crypto strict-FAIL matrix (RFC rfc-attestation-v1-normative.md S7)
+# ---------------------------------------------------------------------------
+#
+# Every row below DERIVES from the two S6-minted real bundles
+# (entry-attested-pkg.bundle, commitment.bundle) — no new fixture is minted.
+# Each test states, in its docstring, whether it is:
+#   UNMODIFIED  — the real bundle bytes, verified against a deliberately
+#                  WRONG expected value (signer / digest / name / pin).
+#   TAMPERED    — the real bundle bytes, byte-corrupted (JSON truncation or
+#                  a single inclusion-proof byte flip), never re-signed.
+#   GATE-LEVEL  — no bundle bytes touched at all; the outcome comes from the
+#                  gate's own stage-0/stage-1/epoch-membership logic.
+#
+# Vector 10 (index-trust strict with a missing/forged whole-index bundle)
+# is NOT duplicated here — it is already fully covered by the Layer-1
+# ``test_index_trust.py`` real-bundle + parametrized-enforce suite
+# (``test_s5_real_bundle_wrong_signer_is_signer_mismatch``,
+# ``test_s6_tampered_inclusion_proof_is_rejected``, and the
+# ``enforce_index_trust`` strict-dispatch parametrization).
+
+
+def _real_armed_status():
+    """Build a REAL ``Armed`` status from the minted ``commitment.bundle`` fixture,
+    via ``evaluate_epoch_commitment`` — S7's pre-epoch/post-epoch rows need the
+    genuine composed-verified S-EpochCommitment (real Fulcio/Rekor crypto), not a
+    synthetic ``Armed(...)`` construction (that synthetic matrix already exists in
+    ``test_epoch_gate.py``). ``S`` = ``{testns/legacy-pkg@0.9.0}`` (the single
+    identity the S6 commitment bundle commits to)."""
+    from milpa.epoch_commitment import commitment_digest, evaluate_epoch_commitment
+    from milpa.index_trust import SigstoreVerifier
+
+    identities = (
+        PreEpochIdentity(
+            namespace="testns",
+            name="legacy-pkg",
+            version="0.9.0",
+            content_hash=(
+                "dag-sha256:862bb412668033e2f5665980220f9da2df20a3bb651dfe31b3cdae23725e06e4"
+            ),
+        ),
+    )
+    pointer = commitment_digest(identities)
+    bundle_bytes = (_entry_fixture_dir() / "commitment.bundle").read_bytes()
+    sidecar_bytes = json.dumps(
+        {
+            "identities": [
+                {
+                    "namespace": i.namespace,
+                    "name": i.name,
+                    "version": i.version,
+                    "content_hash": i.content_hash,
+                }
+                for i in identities
+            ],
+            "bundle": json.loads(bundle_bytes),
+        }
+    ).encode("utf-8")
+    status = evaluate_epoch_commitment(
+        pointer=pointer,
+        sidecar_bytes=sidecar_bytes,
+        fetch_failed=False,
+        verifier=SigstoreVerifier(),
+        trust_bundle=TrustBundle.production(),
+        expected_signer=_ENTRY_FIXTURE_SIGNER,
+    )
+    assert isinstance(status, Armed), f"commitment fixture must arm; got {status!r}"
+    return status
+
+
+def test_s7_post_epoch_unattested_fails_strict_real_armed() -> None:
+    """S7 vector 1: post-epoch unattested => TNG-ENTRY-UNATTESTED under strict.
+
+    GATE-LEVEL (no bundle at all). The epoch classification comes from a REAL
+    ``Armed`` status (the minted ``commitment.bundle``) so PostEpoch is genuine
+    here, not synthetic — this candidate's identity is not in S={legacy-pkg}.
+    """
+    status = _real_armed_status()
+    outcome = evaluate_entry_attestation(
+        attestation=None,
+        content_hash=_ENTRY_FIXTURE_CONTENT_HASH,
+        namespace=_ENTRY_FIXTURE_NAMESPACE,
+        name=_ENTRY_FIXTURE_NAME,  # "attested-pkg" — NOT a member of S
+        version=_ENTRY_FIXTURE_VERSION,
+        verifier=SigstoreEntryVerifier(),
+        bundle_store=None,
+        trust_bundle=TrustBundle.production(),
+        expected_vendor_signer="unused",
+        epoch_status=status,
+    )
+    assert outcome.result is Unattested
+    assert outcome.epoch_membership is PostEpoch
+
+    with pytest.raises(MilpaError) as exc_info:
+        enforce_entry_trust(
+            outcome,
+            "strict",
+            namespace=_ENTRY_FIXTURE_NAMESPACE,
+            name=_ENTRY_FIXTURE_NAME,
+            version=_ENTRY_FIXTURE_VERSION,
+        )
+    assert exc_info.value.slug == TNG_ENTRY_UNATTESTED
+
+
+def test_s7_wrong_signer_fails_strict_real_bundle(tmp_path) -> None:
+    """S7 vector 2: wrong-signer => TNG-ENTRY-SIGNER-MISMATCH under strict.
+
+    UNMODIFIED real bundle, composed through the FULL gate + enforce pipeline
+    (not just the verifier-level check S6 already asserts) against a wrong
+    ``AuthorSigned`` signer identity. Uses the REAL Armed status (PostEpoch
+    for this candidate — it is not a member of S) rather than ``Unarmed()``:
+    under D14/D11 an Unarmed registry is warn-equivalent for EVERY policy
+    value, which would silently swallow the strict failure this row exists
+    to prove."""
+    import hashlib
+
+    bundle_bytes = (_entry_fixture_dir() / "entry-attested-pkg.bundle").read_bytes()
+    pin = hashlib.sha256(bundle_bytes).hexdigest()
+    (tmp_path / f"{pin}.bundle").write_bytes(bundle_bytes)
+    store = FileEntryBundleStore(tmp_path)
+
+    att = EntryAttestation(
+        kind=AuthorSigned(
+            signer="https://github.com/evil/repo/.github/workflows/x.yaml@refs/heads/main"
+        ),
+        bundle_pin=pin,
+    )
+    status = _real_armed_status()
+    outcome = evaluate_entry_attestation(
+        attestation=att,
+        content_hash=_ENTRY_FIXTURE_CONTENT_HASH,
+        namespace=_ENTRY_FIXTURE_NAMESPACE,
+        name=_ENTRY_FIXTURE_NAME,
+        version=_ENTRY_FIXTURE_VERSION,
+        verifier=SigstoreEntryVerifier(),
+        bundle_store=store,
+        trust_bundle=TrustBundle.production(),
+        expected_vendor_signer="unused-author-signed-uses-record-signer",
+        epoch_status=status,
+    )
+    assert outcome.result is SignerMismatch
+    assert outcome.epoch_membership is PostEpoch
+
+    with pytest.raises(MilpaError) as exc_info:
+        enforce_entry_trust(
+            outcome,
+            "strict",
+            namespace=_ENTRY_FIXTURE_NAMESPACE,
+            name=_ENTRY_FIXTURE_NAME,
+            version=_ENTRY_FIXTURE_VERSION,
+        )
+    assert exc_info.value.slug == TNG_ENTRY_SIGNER_MISMATCH
+
+
+def test_s7_bundle_pin_mismatch_real_bundle_wrong_pin(tmp_path) -> None:
+    """S7 vector 3: bundle-pin-mismatch => TNG-ENTRY-BUNDLE-PIN-MISMATCH.
+
+    UNMODIFIED real bundle bytes, served under a pin that does NOT match
+    their own sha256 (delivery-path tampering / stale mirror) — stage 1b, a
+    security invariant raised unconditionally, never policy-gated."""
+    bundle_bytes = (_entry_fixture_dir() / "entry-attested-pkg.bundle").read_bytes()
+    wrong_pin = "0" * 64  # deliberately NOT sha256(bundle_bytes)
+    (tmp_path / f"{wrong_pin}.bundle").write_bytes(bundle_bytes)
+    store = FileEntryBundleStore(tmp_path)
+
+    att = EntryAttestation(kind=AuthorSigned(signer=_ENTRY_FIXTURE_SIGNER), bundle_pin=wrong_pin)
+    with pytest.raises(MilpaError) as exc_info:
+        evaluate_entry_attestation(
+            attestation=att,
+            content_hash=_ENTRY_FIXTURE_CONTENT_HASH,
+            namespace=_ENTRY_FIXTURE_NAMESPACE,
+            name=_ENTRY_FIXTURE_NAME,
+            version=_ENTRY_FIXTURE_VERSION,
+            verifier=SigstoreEntryVerifier(),
+            bundle_store=store,
+            trust_bundle=TrustBundle.production(),
+            expected_vendor_signer="unused",
+            epoch_status=Unarmed(),
+        )
+    assert exc_info.value.slug == TNG_ENTRY_BUNDLE_PIN_MISMATCH
+
+
+def test_s7_bundle_malformed_real_bundle_truncated() -> None:
+    """S7 vector 4: bundle-malformed => TNG-ENTRY-BUNDLE-MALFORMED.
+
+    TAMPERED: the real bundle truncated mid-JSON so it no longer parses."""
+    bundle_bytes = (_entry_fixture_dir() / "entry-attested-pkg.bundle").read_bytes()
+    tampered = bundle_bytes[: len(bundle_bytes) // 2]
+    v = SigstoreEntryVerifier()
+    assert (
+        v.verify(_entry_fixture_subject(), tampered, TrustBundle.production(), _ENTRY_FIXTURE_SIGNER)
+        is BundleMalformed
+    )
+
+
+def test_s7_digest_mismatch_real_bundle_wrong_expected_digest() -> None:
+    """S7 vector 5: digest-mismatch => TNG-ENTRY-DIGEST-MISMATCH.
+
+    UNMODIFIED real bundle, verified against a WRONG expected content_hash
+    (correct package name)."""
+    bundle_bytes = (_entry_fixture_dir() / "entry-attested-pkg.bundle").read_bytes()
+    wrong_subject = build_entry_subject(
+        _ENTRY_FIXTURE_NAMESPACE,
+        _ENTRY_FIXTURE_NAME,
+        _ENTRY_FIXTURE_VERSION,
+        "dag-sha256:" + "f" * 64,
+    )
+    v = SigstoreEntryVerifier()
+    assert (
+        v.verify(wrong_subject, bundle_bytes, TrustBundle.production(), _ENTRY_FIXTURE_SIGNER)
+        is DigestMismatch
+    )
+
+
+def test_s7_subject_mismatch_real_bundle_wrong_expected_name() -> None:
+    """S7 vector 6: subject-mismatch => TNG-ENTRY-SUBJECT-MISMATCH.
+
+    UNMODIFIED real bundle, verified against the RIGHT digest but a WRONG
+    expected package coordinate (cross-package replay scenario)."""
+    bundle_bytes = (_entry_fixture_dir() / "entry-attested-pkg.bundle").read_bytes()
+    wrong_subject = build_entry_subject(
+        "testns", "totally-different-pkg", "1.0.0", _ENTRY_FIXTURE_CONTENT_HASH
+    )
+    v = SigstoreEntryVerifier()
+    assert (
+        v.verify(wrong_subject, bundle_bytes, TrustBundle.production(), _ENTRY_FIXTURE_SIGNER)
+        is SubjectMismatch
+    )
+
+
+def test_s7_signature_invalid_real_bundle_tampered_inclusion_proof() -> None:
+    """S7 vector 7: signature-invalid => TNG-ENTRY-SIGNATURE-INVALID.
+
+    TAMPERED: mirrors the Layer-1 precedent (test_index_trust.py's
+    ``test_s6_tampered_inclusion_proof_is_rejected``) — corrupt ONLY the
+    Rekor inclusion proof's ``rootHash`` byte, leaving the DSSE payload
+    (subject digest + name) and signature bytes untouched. Subject binding
+    (stages 3-4) still matches the real fixture subject, so the failure is
+    isolated to the crypto/inclusion stage rather than conflated with a
+    subject-binding failure."""
+    bundle_bytes = (_entry_fixture_dir() / "entry-attested-pkg.bundle").read_bytes()
+    data = json.loads(bundle_bytes)
+    proof = data["verificationMaterial"]["tlogEntries"][0]["inclusionProof"]
+    root_hash = proof["rootHash"]
+    proof["rootHash"] = ("a" if root_hash[0] != "a" else "b") + root_hash[1:]
+    tampered = json.dumps(data).encode()
+
+    v = SigstoreEntryVerifier()
+    result = v.verify(
+        _entry_fixture_subject(), tampered, TrustBundle.production(), _ENTRY_FIXTURE_SIGNER
+    )
+    assert result is SignatureInvalid, (
+        f"tampered inclusion proof must reject as SignatureInvalid, got {result!r} — "
+        "offline Rekor inclusion is not being enforced"
+    )
+
+
+def test_s7_bundle_unfetchable_fails_strict_d2(tmp_path) -> None:
+    """S7 vector 8: bundle-unfetchable-under-strict => TNG-ENTRY-BUNDLE-MISSING
+    (cause unfetchable), D2 fail-closed.
+
+    GATE-LEVEL: the attestation record carries a pin, but the store cannot
+    produce the bytes (empty local mirror). Uses the REAL Armed status
+    (PostEpoch for this candidate) rather than ``Unarmed()`` — see the
+    wrong-signer test above for why Unarmed would silently downgrade this
+    to warn instead of exercising D2's fail-closed strict behavior."""
+    att = EntryAttestation(kind=AuthorSigned(signer=_ENTRY_FIXTURE_SIGNER), bundle_pin="a" * 64)
+    store = FileEntryBundleStore(tmp_path)  # empty dir: pin not present
+    status = _real_armed_status()
+    outcome = evaluate_entry_attestation(
+        attestation=att,
+        content_hash=_ENTRY_FIXTURE_CONTENT_HASH,
+        namespace=_ENTRY_FIXTURE_NAMESPACE,
+        name=_ENTRY_FIXTURE_NAME,
+        version=_ENTRY_FIXTURE_VERSION,
+        verifier=SigstoreEntryVerifier(),
+        bundle_store=store,
+        trust_bundle=TrustBundle.production(),
+        expected_vendor_signer="unused",
+        epoch_status=status,
+    )
+    assert outcome.result is BundleMissing
+    assert outcome.cause == "unfetchable"
+    assert outcome.epoch_membership is PostEpoch
+
+    with pytest.raises(MilpaError) as exc_info:
+        enforce_entry_trust(
+            outcome,
+            "strict",
+            namespace=_ENTRY_FIXTURE_NAMESPACE,
+            name=_ENTRY_FIXTURE_NAME,
+            version=_ENTRY_FIXTURE_VERSION,
+            bundle_store=store,
+        )
+    assert exc_info.value.slug == TNG_ENTRY_BUNDLE_MISSING
+
+
+def test_s7_pre_epoch_legacy_unattested_warns_not_fails_real_commitment(capsys) -> None:
+    """S7 vector 9: pre-epoch legacy unattested => WARN, not fail, under strict.
+
+    GATE-LEVEL classification, but driven by a REAL ``Armed`` status from the
+    minted ``commitment.bundle`` (D14/D15/D17) — the row S7 explicitly calls
+    out as needing S-EpochCommitment's real crypto (a ``published_at`` field
+    alone can no longer produce it under D-Watermark)."""
+    status = _real_armed_status()
+    outcome = evaluate_entry_attestation(
+        attestation=None,
+        content_hash=(
+            "dag-sha256:862bb412668033e2f5665980220f9da2df20a3bb651dfe31b3cdae23725e06e4"
+        ),
+        namespace="testns",
+        name="legacy-pkg",  # member of S
+        version="0.9.0",
+        verifier=SigstoreEntryVerifier(),
+        bundle_store=None,
+        trust_bundle=TrustBundle.production(),
+        expected_vendor_signer="unused",
+        epoch_status=status,
+    )
+    assert outcome.result is Unattested
+    assert outcome.epoch_membership is PreEpoch
+
+    # Must NOT raise under strict — capped to warn by effective_epoch_policy.
+    enforce_entry_trust(outcome, "strict", namespace="testns", name="legacy-pkg", version="0.9.0")
+    err = capsys.readouterr().err
+    assert "entry-trust warning" in err
+    assert "TNG-ENTRY-UNATTESTED" in err
+    assert "grandfathered" in err
+
+
+def test_s7_interregnum_membership_ignores_publication_timing() -> None:
+    """S7 vector 11 (interregnum, F-op): a candidate not in the committed set S
+    classifies PostEpoch (mandated) regardless of when it was "published" —
+    there is no third interregnum bucket. Membership is decided PURELY by
+    set-containment against the real, composed-verified S (D17); neither
+    ``classify_epoch_membership`` nor ``evaluate_entry_attestation`` accepts a
+    ``published_at`` parameter at all, which is the structural proof this
+    can't silently reintroduce a timing-based carve-out for an entry
+    published after the epoch's own ``integrated_time`` but never added to S.
+    """
+    status = _real_armed_status()
+    assert isinstance(status, Armed)
+
+    # A hypothetical identity "published" long after the epoch's own Rekor SET
+    # integrated_time (status.integrated_time) but never added to S.
+    late_identity = PreEpochIdentity(
+        namespace="testns",
+        name="brand-new-pkg",
+        version="9.9.9",
+        content_hash="dag-sha256:" + "e" * 64,
+    )
+    assert late_identity not in status.identities
+
+    membership = classify_epoch_membership(status, late_identity)
+    assert membership is PostEpoch, (
+        "a non-member identity must classify PostEpoch regardless of when it was "
+        "published — membership is set-only (D17), not a published_at comparison"
+    )
+
+    import inspect
+
+    assert "published_at" not in inspect.signature(classify_epoch_membership).parameters
+    assert "published_at" not in inspect.signature(evaluate_entry_attestation).parameters

@@ -1569,4 +1569,420 @@ mod tests {
             }
         }
     }
+
+    // -------------------------------------------------------------------
+    // S7 — real-crypto strict-FAIL matrix (RFC rfc-attestation-v1-normative.md S7)
+    //
+    // Every row below DERIVES from the two S6-minted real bundles
+    // (entry-attested-pkg.bundle, commitment.bundle) — no new fixture is
+    // minted. Each test states, in its doc comment, whether it is:
+    //   UNMODIFIED — the real bundle bytes, verified against a deliberately
+    //                 WRONG expected value (signer / digest / name / pin).
+    //   TAMPERED   — the real bundle bytes, byte-corrupted (JSON truncation
+    //                 or a single inclusion-proof byte flip), never re-signed.
+    //   GATE-LEVEL — no bundle bytes touched at all; the outcome comes from
+    //                the gate's own stage-0/stage-1/epoch-membership logic.
+    //
+    // Vector 10 (index-trust strict with a missing/forged whole-index
+    // bundle) is NOT duplicated here — it is already fully covered by
+    // `index_cache_tests.rs`'s `strict_*_raises` / `strict_bundle_404_raises_
+    // bundle_missing` suite (Layer-1's own real-bundle + enforce coverage).
+    // -------------------------------------------------------------------
+    mod s7_real_crypto_fail_matrix {
+        use super::*;
+
+        const ENTRY_FIXTURE_NAMESPACE: &str = "testns";
+        const ENTRY_FIXTURE_NAME: &str = "attested-pkg";
+        const ENTRY_FIXTURE_VERSION: &str = "1.0.0";
+        const ENTRY_FIXTURE_CONTENT_HASH: &str =
+            "dag-sha256:9141345c8bfa2251a85bd540e15f365d2dbdf02abd76d8b37d0ea727f5955772";
+
+        /// Build a REAL `Armed` status from the minted `commitment.bundle`
+        /// fixture via `evaluate_epoch_commitment` — S7's pre/post-epoch rows
+        /// need the genuine composed-verified S-EpochCommitment (real
+        /// Fulcio/Rekor crypto), not a synthetic `Armed { .. }` construction
+        /// (that synthetic matrix already exists in `full_matrix` above).
+        /// `S` = `{testns/legacy-pkg@0.9.0}`, the single identity the S6
+        /// commitment bundle commits to.
+        fn real_armed_status() -> EpochCommitmentStatus {
+            use crate::epoch_commitment::{commitment_digest, evaluate_epoch_commitment};
+            use crate::index_trust::SigstoreVerifier;
+
+            let identities = vec![PreEpochIdentity {
+                namespace: "testns".to_string(),
+                name: "legacy-pkg".to_string(),
+                version: "0.9.0".to_string(),
+                content_hash:
+                    "dag-sha256:862bb412668033e2f5665980220f9da2df20a3bb651dfe31b3cdae23725e06e4"
+                        .to_string(),
+            }];
+            let pointer = commitment_digest(&identities);
+            let bundle_bytes = std::fs::read(format!("{ENTRY_FIXTURE_DIR}/commitment.bundle"))
+                .expect("fixture commitment bundle");
+            let bundle_json: serde_json::Value = serde_json::from_slice(&bundle_bytes).unwrap();
+            let sidecar = serde_json::json!({
+                "identities": identities.iter().map(|i| serde_json::json!({
+                    "namespace": i.namespace,
+                    "name": i.name,
+                    "version": i.version,
+                    "content_hash": i.content_hash,
+                })).collect::<Vec<_>>(),
+                "bundle": bundle_json,
+            });
+            let sidecar_bytes = serde_json::to_vec(&sidecar).unwrap();
+
+            let status = evaluate_epoch_commitment(
+                Some(&pointer),
+                Some(&sidecar_bytes),
+                false,
+                &SigstoreVerifier,
+                &TrustBundle::production(),
+                ENTRY_FIXTURE_SIGNER,
+            );
+            assert!(
+                matches!(status, EpochCommitmentStatus::Armed { .. }),
+                "commitment fixture must arm; got {status:?}"
+            );
+            status
+        }
+
+        /// S7 vector 1: post-epoch unattested => TNG-ENTRY-UNATTESTED under strict.
+        /// GATE-LEVEL (no bundle at all). The epoch classification comes from a
+        /// REAL `Armed` status (the minted `commitment.bundle`) so PostEpoch is
+        /// genuine here — this candidate's identity is not in S={legacy-pkg}.
+        #[test]
+        fn post_epoch_unattested_fails_strict_real_armed() {
+            let status = real_armed_status();
+            let outcome = evaluate_entry_attestation(
+                None,
+                ENTRY_FIXTURE_CONTENT_HASH,
+                ENTRY_FIXTURE_NAMESPACE,
+                ENTRY_FIXTURE_NAME,
+                ENTRY_FIXTURE_VERSION,
+                &SigstoreEntryVerifier,
+                None,
+                &TrustBundle::production(),
+                "unused",
+                &status,
+            )
+            .unwrap();
+            assert_eq!(outcome.result, EntryVerificationResult::Unattested);
+            assert_eq!(outcome.epoch_membership, Some(EpochMembership::PostEpoch));
+
+            let err = enforce_entry_trust(
+                &outcome,
+                &TrustPolicy::Strict,
+                ENTRY_FIXTURE_NAMESPACE,
+                ENTRY_FIXTURE_NAME,
+                ENTRY_FIXTURE_VERSION,
+                None,
+            )
+            .unwrap_err();
+            assert_eq!(err.code(), "TNG-ENTRY-UNATTESTED");
+        }
+
+        /// S7 vector 2: wrong-signer => TNG-ENTRY-SIGNER-MISMATCH under strict.
+        /// UNMODIFIED real bundle, composed through the FULL gate + enforce
+        /// pipeline (not just the verifier-level check S6 already asserts)
+        /// against a wrong `AuthorSigned` signer identity. Uses the REAL Armed
+        /// status (PostEpoch for this candidate) rather than `Unarmed` — under
+        /// D14/D11 an Unarmed registry is warn-equivalent for EVERY policy
+        /// value, which would silently swallow the strict failure this row
+        /// exists to prove.
+        #[test]
+        fn wrong_signer_fails_strict_real_bundle() {
+            use sha2::{Digest, Sha256};
+
+            let bundle_bytes = std::fs::read(format!("{ENTRY_FIXTURE_DIR}/entry-attested-pkg.bundle"))
+                .expect("fixture entry bundle");
+            let pin = hex::encode(Sha256::digest(&bundle_bytes));
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(tmp.path().join(format!("{pin}.bundle")), &bundle_bytes).unwrap();
+            let store = crate::entry_bundle_store::FileEntryBundleStore::new(tmp.path());
+
+            let att = EntryAttestation {
+                kind: AttestationKind::AuthorSigned {
+                    signer: "https://github.com/evil/repo/.github/workflows/x.yaml@refs/heads/main"
+                        .to_string(),
+                },
+                rekor: None,
+                bundle_pin: Some(pin),
+            };
+            let status = real_armed_status();
+            let outcome = evaluate_entry_attestation(
+                Some(&att),
+                ENTRY_FIXTURE_CONTENT_HASH,
+                ENTRY_FIXTURE_NAMESPACE,
+                ENTRY_FIXTURE_NAME,
+                ENTRY_FIXTURE_VERSION,
+                &SigstoreEntryVerifier,
+                Some(&store),
+                &TrustBundle::production(),
+                "unused-author-signed-uses-record-signer",
+                &status,
+            )
+            .unwrap();
+            assert_eq!(outcome.result, EntryVerificationResult::SignerMismatch);
+            assert_eq!(outcome.epoch_membership, Some(EpochMembership::PostEpoch));
+
+            let err = enforce_entry_trust(
+                &outcome,
+                &TrustPolicy::Strict,
+                ENTRY_FIXTURE_NAMESPACE,
+                ENTRY_FIXTURE_NAME,
+                ENTRY_FIXTURE_VERSION,
+                None,
+            )
+            .unwrap_err();
+            assert_eq!(err.code(), "TNG-ENTRY-SIGNER-MISMATCH");
+        }
+
+        /// S7 vector 3: bundle-pin-mismatch => TNG-ENTRY-BUNDLE-PIN-MISMATCH.
+        /// UNMODIFIED real bundle bytes, served under a pin that does NOT match
+        /// their own sha256 (delivery-path tampering / stale mirror) — stage
+        /// 1b, a security invariant raised unconditionally, never policy-gated.
+        #[test]
+        fn bundle_pin_mismatch_real_bundle_wrong_pin() {
+            let bundle_bytes = std::fs::read(format!("{ENTRY_FIXTURE_DIR}/entry-attested-pkg.bundle"))
+                .expect("fixture entry bundle");
+            let wrong_pin = "0".repeat(64); // deliberately NOT sha256(bundle_bytes)
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(tmp.path().join(format!("{wrong_pin}.bundle")), &bundle_bytes).unwrap();
+            let store = crate::entry_bundle_store::FileEntryBundleStore::new(tmp.path());
+
+            let att = EntryAttestation {
+                kind: AttestationKind::AuthorSigned { signer: ENTRY_FIXTURE_SIGNER.to_string() },
+                rekor: None,
+                bundle_pin: Some(wrong_pin),
+            };
+            let err = evaluate_entry_attestation(
+                Some(&att),
+                ENTRY_FIXTURE_CONTENT_HASH,
+                ENTRY_FIXTURE_NAMESPACE,
+                ENTRY_FIXTURE_NAME,
+                ENTRY_FIXTURE_VERSION,
+                &SigstoreEntryVerifier,
+                Some(&store),
+                &TrustBundle::production(),
+                "unused",
+                &EpochCommitmentStatus::Unarmed,
+            )
+            .unwrap_err();
+            assert_eq!(err.code(), "TNG-ENTRY-BUNDLE-PIN-MISMATCH");
+        }
+
+        /// S7 vector 4: bundle-malformed => TNG-ENTRY-BUNDLE-MALFORMED.
+        /// TAMPERED: the real bundle truncated mid-JSON so it no longer parses.
+        #[test]
+        fn bundle_malformed_real_bundle_truncated() {
+            let bundle_bytes = std::fs::read(format!("{ENTRY_FIXTURE_DIR}/entry-attested-pkg.bundle"))
+                .expect("fixture entry bundle");
+            let tampered = &bundle_bytes[..bundle_bytes.len() / 2];
+            let result = SigstoreEntryVerifier.verify(
+                &entry_fixture_subject(),
+                tampered,
+                &TrustBundle::production(),
+                ENTRY_FIXTURE_SIGNER,
+            );
+            assert_eq!(result, VerifierOutcome::BundleMalformed);
+        }
+
+        /// S7 vector 5: digest-mismatch => TNG-ENTRY-DIGEST-MISMATCH.
+        /// UNMODIFIED real bundle, verified against a WRONG expected
+        /// content_hash (correct package name).
+        #[test]
+        fn digest_mismatch_real_bundle_wrong_expected_digest() {
+            let bundle_bytes = std::fs::read(format!("{ENTRY_FIXTURE_DIR}/entry-attested-pkg.bundle"))
+                .expect("fixture entry bundle");
+            let wrong_digest = format!("dag-sha256:{}", "f".repeat(64));
+            let wrong_subject = build_entry_subject(
+                ENTRY_FIXTURE_NAMESPACE,
+                ENTRY_FIXTURE_NAME,
+                ENTRY_FIXTURE_VERSION,
+                &wrong_digest,
+            )
+            .unwrap();
+            let result = SigstoreEntryVerifier.verify(
+                &wrong_subject,
+                &bundle_bytes,
+                &TrustBundle::production(),
+                ENTRY_FIXTURE_SIGNER,
+            );
+            assert_eq!(result, VerifierOutcome::DigestMismatch);
+        }
+
+        /// S7 vector 6: subject-mismatch => TNG-ENTRY-SUBJECT-MISMATCH.
+        /// UNMODIFIED real bundle, verified against the RIGHT digest but a
+        /// WRONG expected package coordinate (cross-package replay scenario).
+        #[test]
+        fn subject_mismatch_real_bundle_wrong_expected_name() {
+            let bundle_bytes = std::fs::read(format!("{ENTRY_FIXTURE_DIR}/entry-attested-pkg.bundle"))
+                .expect("fixture entry bundle");
+            let wrong_subject = build_entry_subject(
+                "testns",
+                "totally-different-pkg",
+                "1.0.0",
+                ENTRY_FIXTURE_CONTENT_HASH,
+            )
+            .unwrap();
+            let result = SigstoreEntryVerifier.verify(
+                &wrong_subject,
+                &bundle_bytes,
+                &TrustBundle::production(),
+                ENTRY_FIXTURE_SIGNER,
+            );
+            assert_eq!(result, VerifierOutcome::SubjectMismatch);
+        }
+
+        /// S7 vector 7: signature-invalid => TNG-ENTRY-SIGNATURE-INVALID.
+        /// TAMPERED: mirrors the Layer-1 precedent
+        /// (`index_trust.rs`'s `s6_tampered_inclusion_proof...` shape, via the
+        /// Python mirror `test_s6_tampered_inclusion_proof_is_rejected`) —
+        /// corrupt ONLY the Rekor inclusion proof's `rootHash` byte, leaving
+        /// the DSSE payload (subject digest + name) and signature bytes
+        /// untouched. Subject binding (stages 3-4) still matches the real
+        /// fixture subject, so the failure is isolated to the crypto/
+        /// inclusion stage rather than conflated with a subject-binding
+        /// failure.
+        #[test]
+        fn signature_invalid_real_bundle_tampered_inclusion_proof() {
+            let bundle_bytes = std::fs::read(format!("{ENTRY_FIXTURE_DIR}/entry-attested-pkg.bundle"))
+                .expect("fixture entry bundle");
+            let mut data: serde_json::Value = serde_json::from_slice(&bundle_bytes).unwrap();
+            let root_hash = data["verificationMaterial"]["tlogEntries"][0]["inclusionProof"]["rootHash"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            let flipped = if root_hash.starts_with('a') {
+                format!("b{}", &root_hash[1..])
+            } else {
+                format!("a{}", &root_hash[1..])
+            };
+            data["verificationMaterial"]["tlogEntries"][0]["inclusionProof"]["rootHash"] =
+                serde_json::json!(flipped);
+            let tampered = serde_json::to_vec(&data).unwrap();
+
+            let result = SigstoreEntryVerifier.verify(
+                &entry_fixture_subject(),
+                &tampered,
+                &TrustBundle::production(),
+                ENTRY_FIXTURE_SIGNER,
+            );
+            assert_eq!(
+                result,
+                VerifierOutcome::SignatureInvalid,
+                "tampered inclusion proof must reject as SignatureInvalid, got {result:?}"
+            );
+        }
+
+        /// S7 vector 8: bundle-unfetchable-under-strict => TNG-ENTRY-BUNDLE-MISSING
+        /// (cause unfetchable), D2 fail-closed. GATE-LEVEL: the attestation
+        /// record carries a pin, but the store cannot produce the bytes (empty
+        /// local mirror). Uses the REAL Armed status (PostEpoch for this
+        /// candidate) rather than `Unarmed` — see the wrong-signer test above
+        /// for why Unarmed would silently downgrade this to warn instead of
+        /// exercising D2's fail-closed strict behavior.
+        #[test]
+        fn bundle_unfetchable_fails_strict_d2() {
+            let tmp = tempfile::tempdir().unwrap();
+            let store = crate::entry_bundle_store::FileEntryBundleStore::new(tmp.path()); // empty dir
+            let att = EntryAttestation {
+                kind: AttestationKind::AuthorSigned { signer: ENTRY_FIXTURE_SIGNER.to_string() },
+                rekor: None,
+                bundle_pin: Some("a".repeat(64)),
+            };
+            let status = real_armed_status();
+            let outcome = evaluate_entry_attestation(
+                Some(&att),
+                ENTRY_FIXTURE_CONTENT_HASH,
+                ENTRY_FIXTURE_NAMESPACE,
+                ENTRY_FIXTURE_NAME,
+                ENTRY_FIXTURE_VERSION,
+                &SigstoreEntryVerifier,
+                Some(&store),
+                &TrustBundle::production(),
+                "unused",
+                &status,
+            )
+            .unwrap();
+            assert_eq!(outcome.result, EntryVerificationResult::BundleMissing);
+            assert_eq!(outcome.cause.as_deref(), Some("unfetchable"));
+            assert_eq!(outcome.epoch_membership, Some(EpochMembership::PostEpoch));
+
+            let err = enforce_entry_trust(
+                &outcome,
+                &TrustPolicy::Strict,
+                ENTRY_FIXTURE_NAMESPACE,
+                ENTRY_FIXTURE_NAME,
+                ENTRY_FIXTURE_VERSION,
+                Some(&store),
+            )
+            .unwrap_err();
+            assert_eq!(err.code(), "TNG-ENTRY-BUNDLE-MISSING");
+        }
+
+        /// S7 vector 9: pre-epoch legacy unattested => WARN, not fail, under
+        /// strict. GATE-LEVEL classification, but driven by a REAL `Armed`
+        /// status from the minted `commitment.bundle` (D14/D15/D17) — the row
+        /// S7 explicitly calls out as needing S-EpochCommitment's real crypto
+        /// (a `published_at` field alone can no longer produce it under
+        /// D-Watermark).
+        #[test]
+        fn pre_epoch_legacy_unattested_warns_not_fails_real_commitment() {
+            _reset_warned_entries();
+            let status = real_armed_status();
+            let outcome = evaluate_entry_attestation(
+                None,
+                "dag-sha256:862bb412668033e2f5665980220f9da2df20a3bb651dfe31b3cdae23725e06e4",
+                "testns",
+                "legacy-pkg",
+                "0.9.0",
+                &SigstoreEntryVerifier,
+                None,
+                &TrustBundle::production(),
+                "unused",
+                &status,
+            )
+            .unwrap();
+            assert_eq!(outcome.result, EntryVerificationResult::Unattested);
+            assert_eq!(outcome.epoch_membership, Some(EpochMembership::PreEpoch));
+
+            enforce_entry_trust(&outcome, &TrustPolicy::Strict, "testns", "legacy-pkg", "0.9.0", None)
+                .expect("pre-epoch legacy unattested must stay warn-territory even under strict");
+        }
+
+        /// S7 vector 11 (interregnum, F-op): a candidate not in the committed
+        /// set S classifies PostEpoch (mandated) regardless of when it was
+        /// "published" — there is no third interregnum bucket. Membership is
+        /// decided PURELY by set-containment against the real,
+        /// composed-verified S (D17). `classify_epoch_membership`'s signature
+        /// `(&EpochCommitmentStatus, &PreEpochIdentity) -> Option<EpochMembership>`
+        /// has no `published_at` parameter at all — a COMPILE-TIME structural
+        /// proof (stronger than a runtime check) that this can't silently
+        /// reintroduce a timing-based carve-out for an entry published after
+        /// the epoch's own `integrated_time` but never added to S.
+        #[test]
+        fn interregnum_membership_ignores_publication_timing() {
+            let status = real_armed_status();
+            let late_identity = PreEpochIdentity {
+                namespace: "testns".to_string(),
+                name: "brand-new-pkg".to_string(),
+                version: "9.9.9".to_string(),
+                content_hash: format!("dag-sha256:{}", "e".repeat(64)),
+            };
+            if let EpochCommitmentStatus::Armed { identities, .. } = &status {
+                assert!(!identities.contains(&late_identity));
+            } else {
+                panic!("expected Armed status, got {status:?}");
+            }
+
+            let membership = classify_epoch_membership(&status, &late_identity);
+            assert_eq!(
+                membership,
+                Some(EpochMembership::PostEpoch),
+                "a non-member identity must classify PostEpoch regardless of when it was \
+                 published — membership is set-only (D17), not a published_at comparison"
+            );
+        }
+    }
 }
