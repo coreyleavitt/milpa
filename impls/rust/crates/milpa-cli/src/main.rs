@@ -3105,6 +3105,27 @@ fn no_index_requested(flag: bool) -> bool {
     matches!(std::env::var("MILPA_INDEX_URL"), Ok(s) if s.trim().is_empty())
 }
 
+/// Three-way `MILPA_INDEX_URL` semantics as an `Option<String>`
+/// (cli-contract.md §8.1 NORMATIVE): **absent** → `Some(DEFAULT_INDEX_URL)`;
+/// **present but empty** → `None` (explicitly no index); **present and
+/// non-empty** → `Some(that value)`.
+///
+/// SSOT for call sites that need this as an `Option` to hand to a
+/// `*_store_from_paths` selector — `maybe_dep_decl_store` and
+/// `build_entry_trust_gate` (S-Acq: the latter used to hand-inline a buggy
+/// two-way collapse, `Ok().filter(|s| !s.is_empty())`, which folded the
+/// absent case into the same `None` as the empty case, so no bundle store
+/// was ever built in the normal no-override case). `maybe_index` is NOT
+/// routed through this helper: it needs `Result`-shaped early-return control
+/// flow (`Ok(None)` on empty) that this `Option`-returning helper doesn't fit.
+fn resolve_index_url_three_way() -> Option<String> {
+    match std::env::var("MILPA_INDEX_URL") {
+        Err(_) => Some(DEFAULT_INDEX_URL.to_string()), // absent → production default
+        Ok(s) if s.trim().is_empty() => None,          // empty → no index
+        Ok(s) => Some(s),                              // non-empty → that URL
+    }
+}
+
 /// Read `MILPA_INDEX_TRUST` env var as a `TrustPolicy`. Returns `None` if unset or unrecognized.
 fn read_env_index_trust_policy() -> Option<milpa_manifest::TrustPolicy> {
     use milpa_manifest::TrustPolicy;
@@ -3484,12 +3505,18 @@ fn build_entry_trust_gate(
     // Reuse index-trust's trust-root + expected-signer resolution (RFC §5).
     let (trust_bundle, expected_signer) = resolve_trust_bundle_and_signer(manifest_signer, manifest_bundle)?;
 
-    // Build the bundle-acquisition store.
+    // Build the bundle-acquisition store. Three-way MILPA_INDEX_URL semantics
+    // (S-Acq, RFC attestation-v1-normative.md): absent → DEFAULT_INDEX_URL (so
+    // a store IS built and acquisition is actually attempted in the normal
+    // no-override case — the bug this slice fixes: the old
+    // `.ok().filter(|s| !s.is_empty())` collapsed absent and empty to the
+    // same `None`); empty → None (explicitly no index); non-empty → that URL.
+    // Same SSOT helper `maybe_dep_decl_store` uses.
     let entry_bundle_dir = std::env::var("MILPA_ENTRY_BUNDLE_DIR")
         .ok()
         .filter(|s| !s.is_empty())
         .map(PathBuf::from);
-    let raw_index_url = std::env::var("MILPA_INDEX_URL").ok().filter(|s| !s.is_empty());
+    let raw_index_url = resolve_index_url_three_way();
     let bundle_store = milpa_core::entry_bundle_store_from_paths(
         entry_bundle_dir.as_deref(),
         raw_index_url.as_deref(),
@@ -3658,6 +3685,7 @@ fn reverify_cached_entry_attestations(
             &dep.name,
             &dep.version,
             cause.as_deref(),
+            cfg.bundle_store.as_deref(),
         )?;
     }
     Ok(())
@@ -3819,13 +3847,7 @@ fn maybe_dep_decl_store(no_index: bool) -> Option<Box<dyn DepDeclStore>> {
     if !dep_decl_dir.is_empty() {
         return Some(Box::new(FileDepDeclStore::new(PathBuf::from(dep_decl_dir))));
     }
-    // Three-way semantics: absent → default URL, empty → no index, non-empty → that URL.
-    let raw = std::env::var("MILPA_INDEX_URL");
-    let index_url = match &raw {
-        Err(_) => DEFAULT_INDEX_URL.to_string(), // absent → production default
-        Ok(s) if s.trim().is_empty() => return None, // empty → no index
-        Ok(s) => s.clone(), // non-empty → that URL
-    };
+    let index_url = resolve_index_url_three_way()?;
     Some(Box::new(make_dep_decl_store(&index_url)))
 }
 
@@ -7535,6 +7557,99 @@ mod tests {
             Err(e) => assert_eq!(e.code(), "MILPA-INTERNAL"),
             Ok(_) => panic!("gate-only value in MOCK_MAP must be rejected"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // S-Acq — MILPA_INDEX_URL three-way acquisition-wiring fix
+    // (RFC attestation-v1-normative.md §6 S-Acq). Before the fix,
+    // `build_entry_trust_gate` collapsed an ABSENT MILPA_INDEX_URL to the
+    // same `None` as a present-but-EMPTY one (`.ok().filter(|s|
+    // !s.is_empty())`), so `entry_bundle_store_from_paths` never built a
+    // store in the normal (no override) case — every attested entry
+    // silently resolved BundleMissing/unfetchable with no acquisition
+    // attempt. These tests pin the corrected three-way semantics directly on
+    // `cfg.bundle_store` (mirrors `maybe_dep_decl_store`'s already-correct
+    // three-way, `resolve_index_url_three_way` SSOT).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn entry_trust_gate_absent_index_url_builds_store_from_default() {
+        use milpa_core::{BundleStoreBackend, EntryBundleStore as _};
+        let _guard = ENV_MUTEX.lock().unwrap();
+        unsafe { std::env::remove_var("MILPA_INDEX_URL") };
+        unsafe { std::env::remove_var("MILPA_ENTRY_BUNDLE_DIR") };
+        let result = build_entry_trust_gate(&milpa_manifest::TrustPolicy::Warn, None, None, false, false);
+        match result {
+            Ok(Some(cfg)) => {
+                let store = cfg.bundle_store.expect(
+                    "absent MILPA_INDEX_URL must build a store from DEFAULT_INDEX_URL, not None",
+                );
+                assert_eq!(store.backend(), BundleStoreBackend::Http);
+            }
+            Ok(None) => panic!("entry-trust warn must build an active gate, got None"),
+            Err(e) => panic!("unexpected error: {}", e.code()),
+        }
+    }
+
+    #[test]
+    fn entry_trust_gate_empty_index_url_is_explicitly_no_store() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        unsafe { std::env::set_var("MILPA_INDEX_URL", "") };
+        unsafe { std::env::remove_var("MILPA_ENTRY_BUNDLE_DIR") };
+        let result = build_entry_trust_gate(&milpa_manifest::TrustPolicy::Warn, None, None, false, false);
+        unsafe { std::env::remove_var("MILPA_INDEX_URL") };
+        match result {
+            Ok(Some(cfg)) => assert!(cfg.bundle_store.is_none()),
+            Ok(None) => panic!("entry-trust warn must build an active gate, got None"),
+            Err(e) => panic!("unexpected error: {}", e.code()),
+        }
+    }
+
+    #[test]
+    fn entry_trust_gate_nonempty_index_url_builds_store_from_that_url() {
+        use milpa_core::{BundleStoreBackend, EntryBundleStore as _};
+        let _guard = ENV_MUTEX.lock().unwrap();
+        unsafe { std::env::set_var("MILPA_INDEX_URL", "file:///some/index.kdl") };
+        unsafe { std::env::remove_var("MILPA_ENTRY_BUNDLE_DIR") };
+        let result = build_entry_trust_gate(&milpa_manifest::TrustPolicy::Warn, None, None, false, false);
+        unsafe { std::env::remove_var("MILPA_INDEX_URL") };
+        match result {
+            Ok(Some(cfg)) => {
+                let store = cfg.bundle_store.expect("non-empty MILPA_INDEX_URL must build a store");
+                assert_eq!(store.backend(), BundleStoreBackend::Http);
+            }
+            Ok(None) => panic!("entry-trust warn must build an active gate, got None"),
+            Err(e) => panic!("unexpected error: {}", e.code()),
+        }
+    }
+
+    #[test]
+    fn entry_trust_gate_acquires_bundle_via_index_url_derived_http_store() {
+        // A plain gate run against a REAL served bundle (HttpEntryBundleStore's
+        // file:// transport, derived purely from MILPA_INDEX_URL — no
+        // MILPA_ENTRY_BUNDLE_DIR involved) must now fetch and hash-verify it,
+        // proving acquisition is genuinely attempted rather than
+        // short-circuited to BundleMissing/unfetchable by a `None` store.
+        use milpa_core::EntryBundleStore as _;
+        use sha2::{Digest, Sha256};
+        let _guard = ENV_MUTEX.lock().unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let bundle_bytes = br#"{"dsseEnvelope": {"payload": "", "signatures": []}}"#;
+        let pin: String = Sha256::digest(bundle_bytes).iter().map(|b| format!("{b:02x}")).collect();
+        std::fs::create_dir_all(tmp.path().join("attestation")).unwrap();
+        std::fs::write(tmp.path().join("attestation").join(format!("{pin}.bundle")), bundle_bytes).unwrap();
+        let index_url = format!("file://{}/index.kdl", tmp.path().display());
+
+        unsafe { std::env::set_var("MILPA_INDEX_URL", &index_url) };
+        unsafe { std::env::remove_var("MILPA_ENTRY_BUNDLE_DIR") };
+        let result = build_entry_trust_gate(&milpa_manifest::TrustPolicy::Warn, None, None, false, false);
+        unsafe { std::env::remove_var("MILPA_INDEX_URL") };
+
+        let cfg = result.unwrap().expect("entry-trust warn must build an active gate");
+        let store = cfg.bundle_store.expect("must build a store from the file:// index URL");
+        let got = store.get(&pin).expect("acquisition must succeed against the served bundle");
+        assert_eq!(got, bundle_bytes);
     }
 
     // -----------------------------------------------------------------------

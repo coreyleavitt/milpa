@@ -4455,6 +4455,7 @@ impl<'a> ResolveProvider<'a> {
                             &dep_key.name,
                             &version_str,
                             gate_cause.as_deref(),
+                            cfg.bundle_store.as_deref(),
                         )?;
                     }
                 }
@@ -4537,6 +4538,7 @@ impl<'a> ResolveProvider<'a> {
                             &dep_key.name,
                             &version_str,
                             gate_cause.as_deref(),
+                            cfg.bundle_store.as_deref(),
                         )?;
                     }
                 }

@@ -737,6 +737,28 @@ def _build_env(no_index: bool = False) -> MilpaEnv:
     )
 
 
+def _resolve_index_url_three_way() -> "str | None":
+    """Resolve ``MILPA_INDEX_URL`` to the three-way store-selection URL.
+
+    - **absent** → ``DEFAULT_INDEX_URL`` (the live tianguis index).
+    - **present but empty** (``""``) → ``None`` (explicitly no index).
+    - **present and non-empty** → that URL (stripped).
+
+    SSOT for call sites that need an ``Optional[str]`` to hand to a
+    ``*_store_from_paths`` selector (``_build_dep_decl_store``,
+    ``_build_entry_trust``) — distinct from ``index_cache.index_url_from_env``,
+    whose non-Optional contract ("always resolves to something") serves
+    ``_load_index_for_verb``'s different absent-vs-present distinction.
+    """
+    from milpa.index_cache import DEFAULT_INDEX_URL
+
+    raw = os.environ.get("MILPA_INDEX_URL")  # None if absent, str if set
+    if raw is None:
+        return DEFAULT_INDEX_URL
+    stripped = raw.strip()
+    return stripped if stripped else None  # empty → explicitly no index
+
+
 def _build_dep_decl_store(no_index: bool = False) -> object | None:
     """Build the dep_decl_store from environment variables (S3b).
 
@@ -757,24 +779,14 @@ def _build_dep_decl_store(no_index: bool = False) -> object | None:
     flag forces case 4 regardless of env.
     """
     from milpa.dep_decl_store import dep_decl_store_from_paths
-    from milpa.index_cache import DEFAULT_INDEX_URL
 
     # Resolve env vars to canonical values before handing to the shared helper.
     dep_decl_dir_str = os.environ.get("MILPA_DEP_DECL_DIR", "").strip()
     dep_decl_dir = Path(dep_decl_dir_str) if dep_decl_dir_str else None
 
-    raw = os.environ.get("MILPA_INDEX_URL")  # None if absent, str if set
-    # Three-way semantics: absent → DEFAULT_INDEX_URL; empty → None (no index);
-    # non-empty → that URL.
-    if raw is None:
-        index_url: str | None = DEFAULT_INDEX_URL
-    else:
-        stripped = raw.strip()
-        index_url = stripped if stripped else None  # empty → explicitly no index
-
     return dep_decl_store_from_paths(
         dep_decl_dir=dep_decl_dir,
-        index_url=index_url,
+        index_url=_resolve_index_url_three_way(),
         no_index=_no_index_requested(no_index),
     )
 
@@ -1124,11 +1136,16 @@ def _build_entry_trust(
         env_bundle_path, manifest_bundle, env_signer, manifest_signer
     )
 
-    # 5. Build the bundle-acquisition store.
+    # 5. Build the bundle-acquisition store. Three-way MILPA_INDEX_URL
+    # semantics (S-Acq, RFC attestation-v1-normative.md): absent →
+    # DEFAULT_INDEX_URL (so a store IS built and acquisition is actually
+    # attempted in the normal no-override case — the bug this slice fixes,
+    # a plain `raw_index_url if raw_index_url else None` collapsed absent
+    # and empty to the same `None`); empty → None (explicitly no index);
+    # non-empty → that URL. Same SSOT helper `_build_dep_decl_store` uses.
     entry_bundle_dir_str = os.environ.get("MILPA_ENTRY_BUNDLE_DIR", "").strip()
     entry_bundle_dir = Path(entry_bundle_dir_str) if entry_bundle_dir_str else None
-    raw_index_url = os.environ.get("MILPA_INDEX_URL")
-    index_url = raw_index_url if raw_index_url else None
+    index_url = _resolve_index_url_three_way()
     bundle_store = entry_bundle_store_from_paths(
         entry_bundle_dir, index_url, no_index=env.no_index
     )
@@ -1148,7 +1165,7 @@ def _build_entry_trust(
     verifier: object
     if mock_map_raw or mock_default_raw:
         # Guard: mock seam is conformance-internal; ONLY honored for file:// indexes.
-        if not (raw_index_url or "").startswith("file://"):
+        if not (index_url or "").startswith("file://"):
             raise MilpaError(
                 MILPA_INTERNAL,
                 "MILPA_ENTRY_TRUST_MOCK_MAP / MILPA_ENTRY_TRUST_MOCK_DEFAULT are "
@@ -1406,6 +1423,7 @@ def _reverify_cached_entry_attestations(
             name=dep.name,
             version=dep.version,
             cause=cause,
+            bundle_store=config.bundle_store,
         )
 
 

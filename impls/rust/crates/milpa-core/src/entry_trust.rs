@@ -85,7 +85,7 @@ use base64::Engine;
 use milpa_manifest::TrustPolicy;
 use milpa_types::{AttestationKind, EntryAttestation};
 
-use crate::entry_bundle_store::EntryBundleStore;
+use crate::entry_bundle_store::{BundleStoreBackend, EntryBundleStore};
 use crate::error::CoreError;
 use crate::index_trust::TrustBundle;
 use crate::MilpaError;
@@ -467,37 +467,96 @@ pub fn _reset_warned_entries() {
     WARNED_ENTRIES.with(|w| w.borrow_mut().clear());
 }
 
-fn hint_for(result: EntryVerificationResult) -> &'static str {
+/// Static hints for results whose remediation text does not depend on
+/// `cause`/bundle-store backend. `BundleMissing` is deliberately absent —
+/// its hint is cause- and backend-dependent (see `bundle_missing_hint`, D6).
+///
+/// D6 audit: every "escape" hint below recommends the NARROWER
+/// `entry-trust "warn"` (preserves the audit trail strict exists to
+/// produce), never the permanent kill-switch `entry-trust "off"` — reserve
+/// `"off"` language for genuinely-permanent deliberate opt-outs, which none
+/// of these are.
+fn hint_for(result: EntryVerificationResult) -> String {
     match result {
         EntryVerificationResult::Unattested => {
-            "no attestation record for this entry. Set 'entry-trust \"off\"' in \
-             milpa.kdl to suppress, or wait for the author/vendor-bot to publish \
-             an attested entry."
-        }
-        EntryVerificationResult::BundleMissing => {
-            "the entry is attested but its Sigstore bundle is unavailable. \
-             Run 'milpa fetch --refresh-index' to retry, or set 'entry-trust \
-             \"off\"' in milpa.kdl to suppress."
+            "no attestation record for this entry. Set 'entry-trust \"warn\"' in \
+             milpa.kdl to accept it without an attestation while still recording \
+             a warning, or wait for the author/vendor-bot to publish an attested \
+             entry."
+                .to_string()
         }
         EntryVerificationResult::BundleMalformed => {
             "the per-entry Sigstore bundle is not valid JSON or missing required fields."
+                .to_string()
         }
         EntryVerificationResult::DigestMismatch => {
             "the bundle's attested subject digest does not match this entry's \
              content_hash (tampering or mismatched bundle/entry pair)."
+                .to_string()
         }
         EntryVerificationResult::SubjectMismatch => {
             "the bundle's attested subject package identity does not match this \
              entry's coordinate (possible cross-package replay)."
+                .to_string()
         }
         EntryVerificationResult::SignatureInvalid => {
-            "cryptographic verification of the per-entry Sigstore bundle failed."
+            "cryptographic verification of the per-entry Sigstore bundle failed.".to_string()
         }
         EntryVerificationResult::SignerMismatch => {
             "the bundle signer identity does not match the expected signer for \
              this entry's attestation kind."
+                .to_string()
+        }
+        EntryVerificationResult::BundleMissing => {
+            unreachable!("BundleMissing routes through bundle_missing_hint, not hint_for")
         }
         EntryVerificationResult::Trusted => unreachable!("handled by caller"),
+    }
+}
+
+/// D6 cause × store-backend hint for `BundleMissing` (RFC S-Acq).
+///
+/// `cause == "no-pin"`: the registry itself has not published a bundle for
+/// this entry yet — independent of which store backend is configured.
+///
+/// `cause == "unfetchable"`: the remediation depends on the store backend
+/// that failed to produce bytes:
+/// - `HttpEntryBundleStore` (production mirror): a fetch failure is usually
+///   a transient network condition — retrying via `milpa fetch` is
+///   meaningful remediation. `--refresh-index` is NOT recommended: it only
+///   bypasses the INDEX cache TTL and is a no-op for the content-addressed
+///   bundle store (which has no TTL to bypass).
+/// - `FileEntryBundleStore` (`MILPA_ENTRY_BUNDLE_DIR`, air-gapped): a
+///   genuinely-absent local file is NOT transient — retrying deterministically
+///   re-fails. The hint names the operator-populated mirror instead.
+/// - No store configured at all (`--no-index`, an explicitly-empty
+///   `MILPA_INDEX_URL`, and no `MILPA_ENTRY_BUNDLE_DIR`): neither retrying
+///   nor an operator mirror applies — the hint says to configure a source.
+fn bundle_missing_hint(cause: Option<&str>, backend: Option<BundleStoreBackend>) -> String {
+    if cause == Some("no-pin") {
+        return "the registry has not published a Sigstore bundle for this entry \
+                yet. Set 'entry-trust \"warn\"' in milpa.kdl, or wait for the \
+                registry's attestation backfill to publish one."
+            .to_string();
+    }
+    match backend {
+        Some(BundleStoreBackend::File) => {
+            "the attestation bundle is missing from the local mirror \
+             (MILPA_ENTRY_BUNDLE_DIR); this will not resolve itself — ask the \
+             operator to populate the mirror with this entry's bundle, or set \
+             'entry-trust \"warn\"' in milpa.kdl to suppress."
+                .to_string()
+        }
+        Some(BundleStoreBackend::Http) => {
+            "the attestation mirror was unreachable; this is usually transient \
+             — re-run 'milpa fetch'. If it keeps failing, set 'entry-trust \
+             \"warn\"' in milpa.kdl to suppress."
+                .to_string()
+        }
+        None => "no attestation-bundle source is configured for this invocation \
+                  (no index, and MILPA_ENTRY_BUNDLE_DIR is unset) — configure one, \
+                  or set 'entry-trust \"warn\"' in milpa.kdl to suppress."
+            .to_string(),
     }
 }
 
@@ -509,6 +568,12 @@ fn hint_for(result: EntryVerificationResult) -> &'static str {
 /// - `Warn`     → emit ONE warning to stderr per unique `(namespace, name,
 ///                version)` per invocation; return `Ok(())`.
 /// - `Strict`   → return `Err(MilpaError)` with the appropriate `TNG-ENTRY-*` slug.
+///
+/// `bundle_store` is the store the gate acquired (or failed to acquire)
+/// bytes from — passed through ONLY so a `BundleMissing` result can select
+/// the D6 cause × backend hint text (`bundle_missing_hint`); it has no
+/// bearing on any other result.
+#[allow(clippy::too_many_arguments)]
 pub fn enforce_entry_trust(
     result: EntryVerificationResult,
     policy: &TrustPolicy,
@@ -516,6 +581,7 @@ pub fn enforce_entry_trust(
     name: &str,
     version: &str,
     cause: Option<&str>,
+    bundle_store: Option<&dyn EntryBundleStore>,
 ) -> Result<(), MilpaError> {
     if *policy == TrustPolicy::Off || result == EntryVerificationResult::Trusted {
         return Ok(());
@@ -523,7 +589,11 @@ pub fn enforce_entry_trust(
 
     let slug = result.to_slug();
     let coordinate = format!("pkg:tianguis/{namespace}/{name}@{version}");
-    let mut hint = hint_for(result).to_string();
+    let mut hint = if result == EntryVerificationResult::BundleMissing {
+        bundle_missing_hint(cause, bundle_store.map(|s| s.backend()))
+    } else {
+        hint_for(result)
+    };
     if let Some(c) = cause {
         hint = format!("{hint} (cause: {c})");
     }
@@ -743,21 +813,21 @@ mod tests {
     #[test]
     fn enforce_off_is_silent() {
         enforce_entry_trust(
-            EntryVerificationResult::Unattested, &TrustPolicy::Off, "ns1", "bar", "2.0.0", None,
+            EntryVerificationResult::Unattested, &TrustPolicy::Off, "ns1", "bar", "2.0.0", None, None,
         ).expect("off must never raise");
     }
 
     #[test]
     fn enforce_trusted_is_silent_even_under_strict() {
         enforce_entry_trust(
-            EntryVerificationResult::Trusted, &TrustPolicy::Strict, "ns1", "bar", "2.0.0", None,
+            EntryVerificationResult::Trusted, &TrustPolicy::Strict, "ns1", "bar", "2.0.0", None, None,
         ).expect("trusted must never raise");
     }
 
     #[test]
     fn enforce_strict_raises_slug() {
         let err = enforce_entry_trust(
-            EntryVerificationResult::SignerMismatch, &TrustPolicy::Strict, "ns1", "bar", "2.0.0", None,
+            EntryVerificationResult::SignerMismatch, &TrustPolicy::Strict, "ns1", "bar", "2.0.0", None, None,
         ).unwrap_err();
         assert_eq!(err.code(), "TNG-ENTRY-SIGNER-MISMATCH");
     }
@@ -766,7 +836,98 @@ mod tests {
     fn enforce_warn_never_raises() {
         _reset_warned_entries();
         enforce_entry_trust(
-            EntryVerificationResult::Unattested, &TrustPolicy::Warn, "ns1", "warntest", "2.0.0", None,
+            EntryVerificationResult::Unattested, &TrustPolicy::Warn, "ns1", "warntest", "2.0.0", None, None,
         ).expect("warn must not raise");
+    }
+
+    // -----------------------------------------------------------------------
+    // D6 remediation-hint audit (RFC attestation-v1-normative.md §6 S-Acq).
+    //
+    // Two changes under test:
+    //   1. Every "escape" hint that used to recommend the permanent
+    //      kill-switch 'entry-trust "off"' now recommends the narrower
+    //      'entry-trust "warn"' (preserves the audit trail strict exists to
+    //      produce). A deliberate behavior change, not a regression.
+    //   2. BundleMissing's hint now varies by (cause, bundle-store backend):
+    //      no-pin is backend-independent; unfetchable splits HTTP (transient,
+    //      "re-run fetch") vs File (operator-populated air-gapped mirror, NOT
+    //      transient) vs no-store-configured. '--refresh-index' is never
+    //      recommended — it bypasses the INDEX cache TTL only, a no-op for
+    //      the content-addressed bundle store.
+    // -----------------------------------------------------------------------
+
+    struct StubStore(BundleStoreBackend);
+    impl EntryBundleStore for StubStore {
+        fn get(&self, _bundle_pin: &str) -> Result<Vec<u8>, MilpaError> {
+            unreachable!("hint tests never call get()")
+        }
+        fn is_cached(&self, _bundle_pin: &str) -> bool {
+            false
+        }
+        fn backend(&self) -> BundleStoreBackend {
+            self.0
+        }
+    }
+
+    #[test]
+    fn unattested_hint_recommends_warn_not_off() {
+        _reset_warned_entries();
+        enforce_entry_trust(
+            EntryVerificationResult::Unattested, &TrustPolicy::Warn, "ns1", "foo", "1.0.0", None, None,
+        ).unwrap();
+        assert_eq!(hint_for(EntryVerificationResult::Unattested).contains("entry-trust \"warn\""), true);
+        assert_eq!(hint_for(EntryVerificationResult::Unattested).contains("entry-trust \"off\""), false);
+    }
+
+    #[test]
+    fn bundle_missing_no_pin_hint_recommends_warn_not_off() {
+        let hint = bundle_missing_hint(Some("no-pin"), None);
+        assert!(hint.contains("has not published"));
+        assert!(hint.contains("entry-trust \"warn\""));
+        assert!(!hint.contains("entry-trust \"off\""));
+        assert!(!hint.contains("--refresh-index"));
+    }
+
+    #[test]
+    fn bundle_missing_unfetchable_http_backend_hint_is_transient() {
+        let hint = bundle_missing_hint(Some("unfetchable"), Some(BundleStoreBackend::Http));
+        assert!(hint.contains("re-run 'milpa fetch'"));
+        assert!(!hint.contains("--refresh-index"));
+        assert!(!hint.contains("entry-trust \"off\""));
+    }
+
+    #[test]
+    fn bundle_missing_unfetchable_file_backend_hint_names_operator_mirror() {
+        let hint = bundle_missing_hint(Some("unfetchable"), Some(BundleStoreBackend::File));
+        assert!(hint.contains("MILPA_ENTRY_BUNDLE_DIR"));
+        assert!(hint.contains("operator"));
+        // A genuinely-absent local mirror file is not transient: retrying
+        // deterministically re-fails, so the hint must not suggest re-fetching.
+        assert!(!hint.contains("re-run 'milpa fetch'"));
+        assert!(!hint.contains("entry-trust \"off\""));
+    }
+
+    #[test]
+    fn bundle_missing_unfetchable_no_store_configured_hint() {
+        let hint = bundle_missing_hint(Some("unfetchable"), None);
+        assert!(hint.contains("no attestation-bundle source is configured"));
+        assert!(!hint.contains("entry-trust \"off\""));
+    }
+
+    #[test]
+    fn enforce_bundle_missing_threads_backend_into_hint() {
+        // End-to-end: enforce_entry_trust (not just bundle_missing_hint
+        // directly) selects the File-backend hint when given a File store.
+        _reset_warned_entries();
+        let store: Box<dyn EntryBundleStore> = Box::new(StubStore(BundleStoreBackend::File));
+        enforce_entry_trust(
+            EntryVerificationResult::BundleMissing,
+            &TrustPolicy::Warn,
+            "ns1",
+            "foo",
+            "1.0.0",
+            Some("unfetchable"),
+            Some(store.as_ref()),
+        ).unwrap();
     }
 }

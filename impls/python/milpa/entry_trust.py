@@ -511,16 +511,20 @@ def _reset_warned_entries() -> None:
     _warned_entries.clear()
 
 
+#: Static hints for results whose remediation text does not depend on
+#: ``cause``/bundle-store backend. ``BundleMissing`` is deliberately absent —
+#: its hint is cause- and backend-dependent (see ``_bundle_missing_hint``,
+#: D6). D6 audit: every "escape" hint below recommends the NARROWER
+#: ``entry-trust "warn"`` (preserves the audit trail strict exists to
+#: produce), never the permanent kill-switch ``entry-trust "off"`` — reserve
+#: ``"off"`` language for genuinely-permanent deliberate opt-outs, which none
+#: of these are.
 _HINT_MAP: dict[EntryVerificationResult, str] = {
     Unattested: (
         "no attestation record for this entry. "
-        "Set 'entry-trust \"off\"' in milpa.kdl to suppress, or wait for the "
+        "Set 'entry-trust \"warn\"' in milpa.kdl to accept it without an "
+        "attestation while still recording a warning, or wait for the "
         "author/vendor-bot to publish an attested entry."
-    ),
-    BundleMissing: (
-        "the entry is attested but its Sigstore bundle is unavailable. "
-        "Run 'milpa fetch --refresh-index' to retry, or set "
-        "'entry-trust \"off\"' in milpa.kdl to suppress."
     ),
     BundleMalformed: "the per-entry Sigstore bundle is not valid JSON or missing required fields.",
     DigestMismatch: (
@@ -539,6 +543,56 @@ _HINT_MAP: dict[EntryVerificationResult, str] = {
 }
 
 
+def _bundle_missing_hint(cause: "str | None", bundle_store: "object | None") -> str:
+    """D6 cause × store-backend hint for ``BundleMissing`` (RFC S-Acq).
+
+    ``cause == "no-pin"``: the registry itself has not published a bundle for
+    this entry yet — independent of which store backend is configured.
+
+    ``cause == "unfetchable"``: the remediation depends on the store backend
+    that failed to produce bytes:
+
+    - ``HttpEntryBundleStore`` (production mirror): a fetch failure is
+      usually a transient network condition — retrying via ``milpa fetch``
+      is meaningful remediation. ``--refresh-index`` is NOT recommended here:
+      it only bypasses the INDEX cache TTL and is a no-op for the
+      content-addressed bundle store (which has no TTL to bypass).
+    - ``FileEntryBundleStore`` (``MILPA_ENTRY_BUNDLE_DIR``, air-gapped): a
+      genuinely-absent local file is NOT transient — retrying deterministically
+      re-fails. The hint names the operator-populated mirror, not "re-run fetch".
+    - No store configured at all (``bundle_store is None`` — ``--no-index``,
+      an explicitly-empty ``MILPA_INDEX_URL``, and no
+      ``MILPA_ENTRY_BUNDLE_DIR``): neither retrying nor an operator mirror
+      applies — the hint says to configure a source.
+    """
+    from milpa.entry_bundle_store import FileEntryBundleStore, HttpEntryBundleStore
+
+    if cause == "no-pin":
+        return (
+            "the registry has not published a Sigstore bundle for this entry "
+            "yet. Set 'entry-trust \"warn\"' in milpa.kdl, or wait for the "
+            "registry's attestation backfill to publish one."
+        )
+    if isinstance(bundle_store, FileEntryBundleStore):
+        return (
+            "the attestation bundle is missing from the local mirror "
+            "(MILPA_ENTRY_BUNDLE_DIR); this will not resolve itself — ask "
+            "the operator to populate the mirror with this entry's bundle, "
+            "or set 'entry-trust \"warn\"' in milpa.kdl to suppress."
+        )
+    if isinstance(bundle_store, HttpEntryBundleStore):
+        return (
+            "the attestation mirror was unreachable; this is usually "
+            "transient — re-run 'milpa fetch'. If it keeps failing, set "
+            "'entry-trust \"warn\"' in milpa.kdl to suppress."
+        )
+    return (
+        "no attestation-bundle source is configured for this invocation (no "
+        "index, and MILPA_ENTRY_BUNDLE_DIR is unset) — configure one, or set "
+        "'entry-trust \"warn\"' in milpa.kdl to suppress."
+    )
+
+
 def enforce_entry_trust(
     result: EntryVerificationResult,
     policy: TrustPolicy,
@@ -547,6 +601,7 @@ def enforce_entry_trust(
     name: str,
     version: str,
     cause: "str | None" = None,
+    bundle_store: "object | None" = None,
 ) -> None:
     """warn/strict slug dispatch for one selected entry's gate outcome.
 
@@ -556,13 +611,18 @@ def enforce_entry_trust(
     - ``warn``    → emit ONE warning to stderr per unique
                     ``(namespace, name, version)`` per invocation; exit 0.
     - ``strict``  → raise ``MilpaError`` with the appropriate ``TNG-ENTRY-*`` slug.
+
+    ``bundle_store`` is the concrete store instance the gate acquired bytes
+    (or failed to acquire bytes) from — passed through ONLY so a
+    ``BundleMissing`` result can select the D6 cause × backend hint text
+    (``_bundle_missing_hint``); it has no bearing on any other result.
     """
     if policy == "off" or result is Trusted:
         return
 
     slug = result_to_slug(result)
     coordinate = f"pkg:tianguis/{namespace}/{name}@{version}"
-    hint = _HINT_MAP[result]
+    hint = _bundle_missing_hint(cause, bundle_store) if result is BundleMissing else _HINT_MAP[result]
     if cause is not None:
         hint = f"{hint} (cause: {cause})"
 

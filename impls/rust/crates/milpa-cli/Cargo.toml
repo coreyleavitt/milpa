@@ -21,3 +21,8 @@ tempfile = "3"
 # previously a dev-only dependency (tampered-bundle test fixtures); now also
 # needed by production CLI code, so it moves out of [dev-dependencies].
 serde_json = "1"
+
+[dev-dependencies]
+# S-Acq test-only: hashing a fixture bundle's bytes to compute its content-
+# addressed pin (mirrors milpa-core's own sha2 usage; workspace-pinned version).
+sha2 = { workspace = true }

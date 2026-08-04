@@ -4880,6 +4880,7 @@ def _run_entry_trust_gate(
         name=bare_name,
         version=version_str,
         cause=_gate_cause,
+        bundle_store=entry_trust.bundle_store,
     )
 
 

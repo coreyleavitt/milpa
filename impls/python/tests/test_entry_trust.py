@@ -317,6 +317,112 @@ def test_enforce_warn_bundle_missing_includes_cause(capsys) -> None:
 
 
 # ---------------------------------------------------------------------------
+# D6 remediation-hint audit (RFC attestation-v1-normative.md §6 S-Acq).
+#
+# Two changes under test:
+#   1. Every "escape" hint that used to recommend the permanent kill-switch
+#      'entry-trust "off"' now recommends the narrower 'entry-trust "warn"'
+#      (preserves the audit trail strict exists to produce). This is a
+#      DELIBERATE behavior change, not a regression — no prior test pinned
+#      the old "off" text (grepped clean before this slice).
+#   2. BundleMissing's hint now varies by (cause, bundle-store backend):
+#      no-pin is backend-independent; unfetchable splits HTTP (transient,
+#      "re-run fetch") vs File (operator-populated air-gapped mirror, NOT
+#      transient) vs no-store-configured. '--refresh-index' is never
+#      recommended — it bypasses the INDEX cache TTL only, a no-op for the
+#      content-addressed bundle store.
+# ---------------------------------------------------------------------------
+
+
+def _hint_from_warning(capsys) -> str:
+    return capsys.readouterr().err
+
+
+def test_unattested_hint_recommends_warn_not_off(capsys) -> None:
+    enforce_entry_trust(Unattested, "warn", namespace="ns1", name="foo", version="1.0.0")
+    err = _hint_from_warning(capsys)
+    assert 'entry-trust "warn"' in err
+    assert 'entry-trust "off"' not in err
+
+
+def test_bundle_missing_no_pin_hint_recommends_warn_not_off(capsys) -> None:
+    enforce_entry_trust(
+        BundleMissing, "warn", namespace="ns1", name="foo", version="1.0.0", cause="no-pin"
+    )
+    err = _hint_from_warning(capsys)
+    assert "has not published" in err
+    assert 'entry-trust "warn"' in err
+    assert 'entry-trust "off"' not in err
+    assert "--refresh-index" not in err
+
+
+def test_bundle_missing_unfetchable_http_backend_hint_is_transient(capsys) -> None:
+    from milpa.entry_bundle_store import HttpEntryBundleStore
+
+    store = HttpEntryBundleStore(base_url="https://example.com/registry/")
+    enforce_entry_trust(
+        BundleMissing,
+        "warn",
+        namespace="ns1",
+        name="foo",
+        version="1.0.0",
+        cause="unfetchable",
+        bundle_store=store,
+    )
+    err = _hint_from_warning(capsys)
+    assert "re-run 'milpa fetch'" in err
+    assert "--refresh-index" not in err
+    assert 'entry-trust "off"' not in err
+
+
+def test_bundle_missing_unfetchable_file_backend_hint_names_operator_mirror(
+    capsys, tmp_path
+) -> None:
+    store = FileEntryBundleStore(tmp_path)
+    enforce_entry_trust(
+        BundleMissing,
+        "warn",
+        namespace="ns1",
+        name="foo",
+        version="1.0.0",
+        cause="unfetchable",
+        bundle_store=store,
+    )
+    err = _hint_from_warning(capsys)
+    assert "MILPA_ENTRY_BUNDLE_DIR" in err
+    assert "operator" in err
+    # A genuinely-absent local mirror file is not transient: retrying
+    # deterministically re-fails, so the hint must not suggest re-fetching.
+    assert "re-run 'milpa fetch'" not in err
+    assert 'entry-trust "off"' not in err
+
+
+def test_bundle_missing_unfetchable_no_store_configured_hint(capsys) -> None:
+    enforce_entry_trust(
+        BundleMissing,
+        "warn",
+        namespace="ns1",
+        name="foo",
+        version="1.0.0",
+        cause="unfetchable",
+        bundle_store=None,
+    )
+    err = _hint_from_warning(capsys)
+    assert "no attestation-bundle source is configured" in err
+    assert 'entry-trust "off"' not in err
+
+
+def test_hint_map_audit_no_static_hint_recommends_off():
+    """Full ``_HINT_MAP`` audit (D6): none of the remaining static hints
+    (``BundleMissing`` is dynamic, checked separately above) recommend the
+    permanent kill-switch."""
+    from milpa.entry_trust import _HINT_MAP
+
+    for result, hint in _HINT_MAP.items():
+        assert 'entry-trust "off"' not in hint, f"{result} hint still recommends off: {hint!r}"
+
+
+# ---------------------------------------------------------------------------
 # MockEntryVerifier
 # ---------------------------------------------------------------------------
 

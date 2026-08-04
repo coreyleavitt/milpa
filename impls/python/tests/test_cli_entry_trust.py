@@ -296,6 +296,165 @@ class TestBuildEntryTrust:
 
 
 # ---------------------------------------------------------------------------
+# S-Acq — MILPA_INDEX_URL three-way acquisition-wiring fix
+# (RFC attestation-v1-normative.md §6 S-Acq). Before the fix,
+# ``_build_entry_trust`` collapsed an ABSENT MILPA_INDEX_URL to the same
+# ``None`` as a present-but-EMPTY one, so ``entry_bundle_store_from_paths``
+# never built a store in the normal (no override) case — every attested
+# entry silently resolved BundleMissing/unfetchable with no acquisition
+# attempt. These tests pin the corrected three-way semantics directly on
+# ``config.bundle_store`` (mirrors ``_build_dep_decl_store``'s already-correct
+# three-way, cli.py's ``_resolve_index_url_three_way`` SSOT).
+# ---------------------------------------------------------------------------
+
+
+class TestBundleStoreAcquisitionWiring:
+    def test_absent_index_url_builds_store_from_default(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The bug this slice fixes: MILPA_INDEX_URL absent must build a real
+        HttpEntryBundleStore from DEFAULT_INDEX_URL, not silently return
+        ``None`` (which made acquisition unreachable for the common no-override
+        case)."""
+        from milpa.entry_bundle_store import HttpEntryBundleStore
+        from milpa.index_cache import DEFAULT_INDEX_URL
+
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+        _write_project(project_dir, _MINIMAL_MILPA_KDL + 'entry-trust "warn"\n')
+        monkeypatch.delenv("MILPA_INDEX_URL", raising=False)
+        monkeypatch.delenv("MILPA_ENTRY_BUNDLE_DIR", raising=False)
+
+        from milpa.cli import _build_entry_trust
+        env = _make_minimal_env()
+        config = _build_entry_trust(env, project_dir)
+        assert config is not None
+        assert isinstance(config.bundle_store, HttpEntryBundleStore)
+        assert config.bundle_store._base_url.startswith(DEFAULT_INDEX_URL.rsplit("/", 1)[0])
+
+    def test_empty_index_url_is_explicitly_no_store(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+        _write_project(project_dir, _MINIMAL_MILPA_KDL + 'entry-trust "warn"\n')
+        monkeypatch.setenv("MILPA_INDEX_URL", "")
+        monkeypatch.delenv("MILPA_ENTRY_BUNDLE_DIR", raising=False)
+
+        from milpa.cli import _build_entry_trust
+        env = _make_minimal_env()
+        config = _build_entry_trust(env, project_dir)
+        assert config is not None
+        assert config.bundle_store is None
+
+    def test_nonempty_index_url_builds_store_from_that_url(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from milpa.entry_bundle_store import HttpEntryBundleStore
+
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+        _write_project(project_dir, _MINIMAL_MILPA_KDL + 'entry-trust "warn"\n')
+        idx_url = _write_local_index(tmp_path)
+        monkeypatch.setenv("MILPA_INDEX_URL", idx_url)
+        monkeypatch.delenv("MILPA_ENTRY_BUNDLE_DIR", raising=False)
+
+        from milpa.cli import _build_entry_trust
+        env = _make_minimal_env()
+        config = _build_entry_trust(env, project_dir)
+        assert config is not None
+        assert isinstance(config.bundle_store, HttpEntryBundleStore)
+        assert config.bundle_store._base_url.startswith(idx_url.rsplit("/", 1)[0])
+
+
+class TestAcquisitionActuallyAttempted:
+    """A plain gate run against a REAL served bundle (HttpEntryBundleStore's
+    ``file://`` transport, derived purely from ``MILPA_INDEX_URL`` — no
+    ``MILPA_ENTRY_BUNDLE_DIR`` involved) must now fetch and verify it, proving
+    acquisition is genuinely attempted rather than short-circuited to
+    BundleMissing/unfetchable by a ``None`` store."""
+
+    def test_fetch_gate_acquires_bundle_via_index_url_derived_http_store(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import hashlib
+        import shutil
+
+        from milpa.cli import cmd_update
+        from milpa.entry_trust import _reset_warned_entries
+        from milpa.index_trust import _reset_warned_urls
+        from milpa.version import Strategy
+
+        bundle_bytes = b'{"dsseEnvelope": {"payload": "", "signatures": []}}'
+        bundle_pin = hashlib.sha256(bundle_bytes).hexdigest()
+
+        index_dir = tmp_path / "registry"
+        index_dir.mkdir()
+        (index_dir / "attestation").mkdir()
+        (index_dir / "attestation" / f"{bundle_pin}.bundle").write_bytes(bundle_bytes)
+        idx_file = index_dir / "index.kdl"
+        idx_file.write_text(
+            "schema_version 1\n"
+            'package "bar" {\n'
+            '    namespace "ns1"\n'
+            '    version "2.0.0" {\n'
+            f'        content_hash "{_BAR_CONTENT_HASH}"\n'
+            "        provenance {\n"
+            '            kind "git"\n'
+            '            url "https://github.com/example/bar.git"\n'
+            '            ref "v2.0.0"\n'
+            '            commit_sha "cafef00dcafef00dcafef00dcafef00dcafef00d"\n'
+            "        }\n"
+            '        attestation "author-signed"\n'
+            '        signed_by "alice"\n'
+            f'        bundle sha256="{bundle_pin}"\n'
+            "    }\n"
+            "}\n",
+            encoding="utf-8",
+        )
+
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+        (project_dir / "milpa.kdl").write_text(
+            'name "myapp"\n'
+            'kind "application"\n'
+            'entry-trust "strict"\n'
+            "deps {\n"
+            '    bar ">= 2.0.0"\n'
+            "}\n",
+            encoding="utf-8",
+        )
+
+        mocked_dir = tmp_path / "mocked-fetches"
+        shutil.copytree(_FIXTURE_061_MOCK, mocked_dir / _FIXTURE_061_MOCK.name)
+
+        monkeypatch.setenv("MILPA_INDEX_URL", idx_file.as_uri())
+        monkeypatch.setenv("MILPA_ENTRY_TRUST_MOCK_DEFAULT", "trusted")
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg"))
+        monkeypatch.delenv("MILPA_ENTRY_BUNDLE_DIR", raising=False)
+        monkeypatch.delenv("MILPA_ENTRY_TRUST", raising=False)
+        monkeypatch.delenv("MILPA_ENTRY_TRUST_MOCK_MAP", raising=False)
+        _reset_warned_entries()
+        _reset_warned_urls()
+
+        env = _mutation_env(mocked_dir, tmp_path / "cas")
+        rc = cmd_update(
+            project_dir,
+            env,
+            dep_name=None,
+            strategy=Strategy.MAXVER,
+            max_parallel=1,
+        )
+        # Trusted under strict: no raise, no warning — the bundle was
+        # genuinely fetched (via the file:// HttpEntryBundleStore derived
+        # from MILPA_INDEX_URL) and hash-verified, not silently skipped.
+        assert rc == 0
+        assert (project_dir / "milpa.lock").exists()
+        err = capsys.readouterr().err
+        assert "entry-trust warning" not in err
+
+
+# ---------------------------------------------------------------------------
 # Verb-level behavior: the gate fires through cmd_add / cmd_update
 # (RFC per-entry-attestation.md §8 Command Coverage — all four online,
 # index-loading verbs run the gate at selection; fetch/lock are covered by

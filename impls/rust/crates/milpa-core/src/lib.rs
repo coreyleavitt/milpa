@@ -62,7 +62,8 @@ pub use dep_decl_store::{
 };
 pub use discovery::{discover_manifest, load_manifest};
 pub use entry_bundle_store::{
-    entry_bundle_store_from_paths, EntryBundleStore, FileEntryBundleStore, HttpEntryBundleStore,
+    entry_bundle_store_from_paths, BundleStoreBackend, EntryBundleStore, FileEntryBundleStore,
+    HttpEntryBundleStore,
 };
 pub use entry_trust::{
     build_entry_subject, enforce_entry_trust, evaluate_entry_attestation, EntryBundleVerifier,

@@ -33,6 +33,18 @@ use crate::MilpaError;
 // EntryBundleStore trait
 // ---------------------------------------------------------------------------
 
+/// Discriminates which concrete `EntryBundleStore` backend is configured —
+/// used ONLY for the D6 `BundleMissing` remediation-hint text
+/// (`entry_trust::enforce_entry_trust`), never for acquisition/verification
+/// logic. The hint differs because retrying is meaningful for the HTTP
+/// mirror (a plausibly transient network failure) but not for a local
+/// air-gapped mirror (a genuinely-absent file re-fails deterministically).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BundleStoreBackend {
+    Http,
+    File,
+}
+
 /// Sealed fetch-or-cache + hash-verify seam for per-entry attestation bundles.
 ///
 /// `get` is the ONE site where `sha256(bytes) == bundle_pin` is verified.
@@ -50,6 +62,9 @@ pub trait EntryBundleStore: Send + Sync {
     /// Return `true` iff the bundle is present locally (no network probe).
     /// Used by `milpa verify`'s offline re-verification (RFC §7).
     fn is_cached(&self, bundle_pin: &str) -> bool;
+
+    /// Which concrete backend this is (D6 remediation-hint selection only).
+    fn backend(&self) -> BundleStoreBackend;
 }
 
 // ---------------------------------------------------------------------------
@@ -123,6 +138,10 @@ impl EntryBundleStore for FileEntryBundleStore {
 
     fn is_cached(&self, bundle_pin: &str) -> bool {
         self.path_for(bundle_pin).is_file()
+    }
+
+    fn backend(&self) -> BundleStoreBackend {
+        BundleStoreBackend::File
     }
 }
 
@@ -213,6 +232,10 @@ impl EntryBundleStore for HttpEntryBundleStore {
         self.cache_path(bundle_pin)
             .map(|p| p.is_file())
             .unwrap_or(false)
+    }
+
+    fn backend(&self) -> BundleStoreBackend {
+        BundleStoreBackend::Http
     }
 }
 
