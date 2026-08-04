@@ -1296,7 +1296,9 @@ class TestFixture118ByteExact:
             declared_version_source="nimble",
             # S5 (rfc-origin-as-identity.md §4.1/§7): the structured on-disk
             # source_id — normalize_source strips the trailing .git suffix.
-            source_id=normalize_source(GitSourceId(url="https://github.com/example/foo.git")),
+            # DE2-ref: the pinned ref is part of the source-id (and exercises
+            # string-escaping in the source block too).
+            source_id=normalize_source(GitSourceId(url="https://github.com/example/foo.git", ref='v1"x\\y')),
         )
         graph = ResolvedGraph(deps=(dep,))
         lf = from_graph(graph, strategy="maxver")

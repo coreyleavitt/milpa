@@ -38,6 +38,7 @@ dep "lib-shared" {
     source {
         kind "git"
         url (url)"https://example.com/lib-shared"
+        ref "v0.6.0"
     }
     identity "dag-sha256:07affa6a7a51a040200e4ef1c696d4e203ed2f1df81d5481888513e98b8e70c2"
     version "0.6.0"

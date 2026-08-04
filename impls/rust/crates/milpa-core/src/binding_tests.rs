@@ -10,7 +10,7 @@ use super::*;
 use milpa_types::{DepKey, FetchableOrigin, SourceId};
 
 fn git(url: &str) -> SourceId {
-    SourceId::Fetchable(FetchableOrigin::Git { url: url.to_string(), subpath: None })
+    SourceId::Fetchable(FetchableOrigin::Git { git_ref: None, url: url.to_string(), subpath: None })
 }
 
 fn registry(reg: &str, ns: Option<&str>, name: &str) -> SourceId {
@@ -345,6 +345,7 @@ fn canonical_key_for_requirement_url_matches_git_source_id_canonical() {
         "foo",
         None,
         Some("https://github.com/coreyleavitt/nim-z3"),
+        None,
         &std::collections::BTreeMap::new(),
         &index,
         None,
@@ -359,6 +360,7 @@ fn canonical_key_for_requirement_named_matches_registry_source_id_canonical() {
     let index = Index { packages: vec![] };
     let key = canonical_key_for_requirement(
         "chronos",
+        None,
         None,
         None,
         &std::collections::BTreeMap::new(),
@@ -388,8 +390,16 @@ fn canonical_key_for_requirement_override_wins_over_own_declared_source() {
             version: None,
         },
     );
-    let key = canonical_key_for_requirement("chronos", None, None, &overrides, &index, None, None).unwrap();
-    assert_eq!(key, canonical(&zevv_z3()));
+    let key = canonical_key_for_requirement("chronos", None, None, None, &overrides, &index, None, None).unwrap();
+    // DE2-ref: the override pins git_ref="main", so it is part of the source pin.
+    assert_eq!(
+        key,
+        canonical(&SourceId::Fetchable(FetchableOrigin::Git {
+            url: "https://github.com/zevv/nimz3".to_string(),
+            git_ref: Some("main".to_string()),
+            subpath: None,
+        }))
+    );
 }
 
 #[test]
@@ -401,7 +411,7 @@ fn canonical_key_for_requirement_two_labels_same_url_produce_the_same_canonical_
     let index = Index { packages: vec![] };
     let empty = std::collections::BTreeMap::new();
     let url = "https://github.com/coreyleavitt/nim-z3";
-    let key_foo = canonical_key_for_requirement("foo", None, Some(url), &empty, &index, None, None).unwrap();
-    let key_bar = canonical_key_for_requirement("bar", None, Some(url), &empty, &index, None, None).unwrap();
+    let key_foo = canonical_key_for_requirement("foo", None, Some(url), None, &empty, &index, None, None).unwrap();
+    let key_bar = canonical_key_for_requirement("bar", None, Some(url), None, &empty, &index, None, None).unwrap();
     assert_eq!(key_foo, key_bar);
 }

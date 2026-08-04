@@ -791,8 +791,13 @@ treatment is in `docs/identity-and-provenance.md`.
 
 > NORMATIVE: Git URL, git ref, commit SHA, OCI registry/repository/digest,
 > tarball URL, and archive sha256 are **provenance** — metadata about how to
-> obtain or verify the source. They are stored in the lockfile's provenance
-> block, not in the identity field.
+> obtain or verify the source — and are stored in the lockfile's provenance
+> block, never in the identity field. DE2-ref (RFC §3 amendment) additionally
+> makes a DIRECT dep's DECLARED pin (git `ref` / OCI `digest`) part of its
+> **source-id** (the `source` block, §3.10) — the same string appears in two
+> roles: the declared pin selects the source, the RESOLVED commit/digest in
+> provenance records what was fetched. Neither is `identity` (content_hash),
+> which stays recomputable from bytes alone.
 
 > NORMATIVE: Identity MUST be computed by the **fetcher registry** after the
 > source tree is materialized on disk. Individual fetcher implementations
@@ -903,9 +908,11 @@ The downstream consequences, each keyed to the axis it actually depends on:
 > NORMATIVE: **Vocabulary discipline.** The bare word "identity" is reserved,
 > everywhere in this spec, for `content_hash` (§1). A **source-id**
 > (`SourceId` — `rfc-origin-as-identity.md` §3.1/§4.1) is an **origin**: a
-> version-independent description of *where a dep comes from* (a registry
-> coordinate, a normalized git/tarball URL, an OCI coordinate, a local path,
-> or a workspace-member name), used as the PubGrub solver variable
+> description of *where a dep comes from* (a registry coordinate, a normalized
+> git/tarball URL, an OCI coordinate, a local path, or a workspace-member
+> name) — plus, for a DIRECT dep, its declared `ref`/`digest` **pin** (DE2-ref,
+> RFC §3; a registry/member origin stays version-independent). Used as the
+> PubGrub solver variable
 > (`spec/resolver-semantics.md` §6b) and as the lockfile's grouping key
 > (`spec/lockfile-schema.md` §3.10). A source-id is never called an
 > "identity," and `content_hash` is never called an "origin" — the two

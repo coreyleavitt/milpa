@@ -6,6 +6,7 @@ dep "optlib" {
     source {
         kind "git"
         url (url)"https://example.com/optlib"
+        ref "main"
     }
     identity "dag-sha256:706e36e278fa62c0ae27c5ff67dc1443422c6974fb6b0894d3e902a26b8a3840"
     version "0.0.0"

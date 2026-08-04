@@ -392,11 +392,13 @@ fn parse_source_block(node: &KdlNode, dep_name: &str) -> LockResult<SourceId> {
     let raw = match kind.as_str() {
         "git" => SourceId::Fetchable(FetchableOrigin::Git {
             url: required("url")?,
+            git_ref: get("ref"),
             subpath: get("subpath"),
         }),
         "oci" => SourceId::Fetchable(FetchableOrigin::Oci {
             registry: required("registry")?,
             repository: required("repository")?,
+            digest: get("digest"),
             subpath: get("subpath"),
         }),
         "tarball" => SourceId::Fetchable(FetchableOrigin::Tarball {
@@ -1134,19 +1136,25 @@ fn format_cond_require(cr: &milpa_types::CondRequire) -> Vec<String> {
 /// of tag.
 fn format_source_fields(sid: &SourceId) -> Vec<String> {
     match sid {
-        SourceId::Fetchable(FetchableOrigin::Git { url, subpath }) => {
+        SourceId::Fetchable(FetchableOrigin::Git { url, git_ref, subpath }) => {
             let mut out = vec![format!("kind {}", kdl_str("git")), format!("url (url){}", kdl_str(url))];
+            if let Some(r) = git_ref {  // DE2-ref: the pin
+                out.push(format!("ref {}", kdl_str(r)));
+            }
             if let Some(sp) = subpath {
                 out.push(format!("subpath {}", kdl_str(sp)));
             }
             out
         }
-        SourceId::Fetchable(FetchableOrigin::Oci { registry, repository, subpath }) => {
+        SourceId::Fetchable(FetchableOrigin::Oci { registry, repository, digest, subpath }) => {
             let mut out = vec![
                 format!("kind {}", kdl_str("oci")),
                 format!("registry {}", kdl_str(registry)),
                 format!("repository {}", kdl_str(repository)),
             ];
+            if let Some(d) = digest {  // DE2-ref: the pin
+                out.push(format!("digest {}", kdl_str(d)));
+            }
             if let Some(sp) = subpath {
                 out.push(format!("subpath {}", kdl_str(sp)));
             }
@@ -4504,6 +4512,7 @@ mod tests {
     fn git_source(url: &str) -> milpa_types::SourceId {
         milpa_types::SourceId::Fetchable(milpa_types::FetchableOrigin::Git {
             url: url.into(),
+            git_ref: None,
             subpath: None,
         })
     }

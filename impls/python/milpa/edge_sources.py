@@ -866,6 +866,7 @@ def edgeset_to_terms(
                 name=dep_name,
                 namespace=None,
                 url=entry.url,
+                ref=entry.ref,
                 overrides_by_name=overrides_by_name,
                 index=index,
                 root_self_name=root_self_name,

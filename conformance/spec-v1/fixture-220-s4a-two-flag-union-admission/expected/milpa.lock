@@ -6,6 +6,7 @@ dep "lib-a" {
     source {
         kind "git"
         url (url)"https://example.com/lib-a"
+        ref "main"
     }
     identity "dag-sha256:c6929b65cb8fdef836f9ac3de5cd48489214b83ce059275b9fe86e3ff30716fc"
     version "0.0.0"
@@ -25,6 +26,7 @@ dep "lib-b" {
     source {
         kind "git"
         url (url)"https://example.com/lib-b"
+        ref "main"
     }
     identity "dag-sha256:3c0b72564db5d5ef8ffe0c8167f113edf75be80d736a1b7cb8065c8b44847f4f"
     version "0.0.0"
@@ -44,6 +46,7 @@ dep "lib-end" {
     source {
         kind "git"
         url (url)"https://example.com/lib-end"
+        ref "main"
     }
     identity "dag-sha256:2fbe28e6dde1b7f20399d700d54607c62c73d689242b331c7d71662ed30bcf96"
     version "0.0.0"
@@ -62,6 +65,7 @@ dep "lib-target" {
     source {
         kind "git"
         url (url)"https://example.com/lib-target"
+        ref "main"
     }
     identity "dag-sha256:e9c174849cbb386ac156b03d03a7ce448cf4b1864c328588de00aa47beea7768"
     version "0.0.0"

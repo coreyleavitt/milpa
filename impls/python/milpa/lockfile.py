@@ -1317,11 +1317,14 @@ def _parse_source_block(node: KdlNode, dep_name: str) -> SourceId:
         return val
 
     if kind == "git":
-        raw_sid: SourceId = GitSourceId(url=_req("url"), subpath=fields.get("subpath"))
+        raw_sid: SourceId = GitSourceId(
+            url=_req("url"), ref=fields.get("ref"), subpath=fields.get("subpath")
+        )
     elif kind == "oci":
         raw_sid = OciSourceId(
             registry=_req("registry"),
             repository=_req("repository"),
+            digest=fields.get("digest"),
             subpath=fields.get("subpath"),
         )
     elif kind == "tarball":
@@ -1850,6 +1853,8 @@ def _format_source_fields(sid: SourceId) -> list[str]:
     """
     if isinstance(sid, GitSourceId):
         out = [f'kind {_kdl_str("git")}', f"url (url){_kdl_str(sid.url)}"]
+        if sid.ref is not None:  # DE2-ref: the pin
+            out.append(f"ref {_kdl_str(sid.ref)}")
         if sid.subpath is not None:
             out.append(f"subpath {_kdl_str(sid.subpath)}")
         return out
@@ -1859,6 +1864,8 @@ def _format_source_fields(sid: SourceId) -> list[str]:
             f"registry {_kdl_str(sid.registry)}",
             f"repository {_kdl_str(sid.repository)}",
         ]
+        if sid.digest is not None:  # DE2-ref: the pin
+            out.append(f"digest {_kdl_str(sid.digest)}")
         if sid.subpath is not None:
             out.append(f"subpath {_kdl_str(sid.subpath)}")
         return out

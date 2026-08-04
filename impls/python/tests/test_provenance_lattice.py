@@ -1074,16 +1074,17 @@ class TestOciSourceUrlMismatchConflicts:
         assert not env.store.contains(foo_fork_hash)
 
 
-class TestTwoAgreeingUrlPinsOfSameRegistryNameCoexist:
-    """Two DIFFERENT transitives each pin ``foo`` — a registry-known name —
-    at the registry's OWN repository, but at two DIFFERENT refs. Both
-    AGREE with the registry (same repo), so BOTH are accepted: they must
-    coexist as independent candidates, never conflict with EACH OTHER
-    (agreement is validated per-claim against the static registry record,
-    never between claims). Ordinary solver version-negotiation (maxver)
-    then picks the higher version."""
+class TestTwoTransitivePinsSameUrlDifferentRefsConflict:
+    """DE2-ref (RFC §3 amendment): two DIFFERENT transitives each pin ``foo``
+    at the SAME repository but at two DIFFERENT refs (``v2.0.0`` vs
+    ``v3.0.0``). A ref is a SOURCE PIN, not a version, so the two are
+    DISAGREEING claims for one origin — and with no ROOT arbiter this is a
+    hard ``RES-BINDING-CONFLICT`` (the author must ``overrides {}``-pin
+    ``foo`` to pick one). The pre-DE2-ref model wrongly treated the two refs
+    as version candidates and let maxver silently pick the higher one; a
+    direct pin is exact, not a range."""
 
-    def test_both_accepted_solver_picks_higher_version(self, tmp_path: Path) -> None:
+    def test_two_transitive_pins_different_refs_conflict(self, tmp_path: Path) -> None:
         mocked_dir = tmp_path / "mocked-fetches"
         mocked_dir.mkdir()
 
@@ -1127,16 +1128,14 @@ class TestTwoAgreeingUrlPinsOfSameRegistryNameCoexist:
             f'    t2 git=(url)"{t2_url}" ref="main"\n'
             "}\n"
         )
-        graph = _resolve(root_kdl, env, tmp_path)
+        # DE2-ref: foo@v2.0.0 and foo@v3.0.0 are different source pins → the
+        # two transitive claims disagree, and no root pins foo → hard conflict.
+        from milpa.errors import RES_BINDING_CONFLICT, MilpaError
 
-        foo = _dep(graph, "foo")
-        assert foo.version == "3.0.0"
-        assert foo.identity == foo_v3_hash
-
-        # Both agreeing pins were genuinely fetched (peacefully coexisting
-        # candidates) — neither was blocked by the other.
-        assert env.store.contains(foo_v2_hash)
-        assert env.store.contains(foo_v3_hash)
+        with pytest.raises(MilpaError) as exc:
+            _resolve(root_kdl, env, tmp_path)
+        assert exc.value.slug == RES_BINDING_CONFLICT
+        assert "foo" in str(exc.value)
 
 
 class TestLoneUrlPinOfNonRegistryNameStands:

@@ -544,10 +544,10 @@ def test_edgeset_to_terms_overridden_named_becomes_full_self_term() -> None:
     )
     dep_terms, requires_names, requires_predicates = edgeset_to_terms(es, {"stew": ov}, Index())
 
-    assert requires_names == ["git+https://github.com/example/stew"]
+    assert requires_names == ["git+https://github.com/example/stew#ref=main"]  # DE2-ref: override pins ref="main"
     assert len(dep_terms) == 1
     t = dep_terms[0]
-    assert t.package == "git+https://github.com/example/stew"
+    assert t.package == "git+https://github.com/example/stew#ref=main"
     # full() self-term: unconditionally satisfied by any real candidate version.
     assert t.versions == VersionSet.full()
     assert requires_predicates == {}
@@ -593,7 +593,7 @@ def test_edgeset_to_terms_url_require() -> None:
     )
     dep_terms, requires_names, requires_predicates = edgeset_to_terms(es, {}, Index())
 
-    assert "git+https://github.com/status-im/nim-chronos" in requires_names
+    assert "git+https://github.com/status-im/nim-chronos#ref=v3" in requires_names  # DE2-ref: UrlRequire ref="v3"
     assert len(dep_terms) == 1
     assert dep_terms[0].versions == VersionSet.full()
     assert requires_predicates == {}

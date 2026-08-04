@@ -2395,6 +2395,7 @@ impl<'a> ResolveProvider<'a> {
                                 &cpe.dep,
                                 None,
                                 None,
+                                None,
                                 &self.overrides,
                                 self.index,
                                 self.root_self_name.as_deref(),
@@ -2669,7 +2670,11 @@ impl<'a> ResolveProvider<'a> {
             let url_claim = Claim {
                 name: name.clone(),
                 source_id: crate::source_id::normalize_source(&SourceId::Fetchable(
-                    FetchableOrigin::Git { url: git, subpath: dep.subpath.clone() },
+                    FetchableOrigin::Git {
+                        url: git,
+                        git_ref: Some(dep.git_ref.clone()),
+                        subpath: dep.subpath.clone(),
+                    },
                 ))?,
                 is_root: false,
                 claimant: "transitive".to_string(),
@@ -2782,6 +2787,7 @@ impl<'a> ResolveProvider<'a> {
                     FetchableOrigin::Oci {
                         registry: dep.registry.clone(),
                         repository: dep.repository.clone(),
+                        digest: Some(dep.digest.clone()),
                         subpath: dep.subpath.clone(),
                     },
                 ))?,
@@ -3033,16 +3039,17 @@ impl<'a> ResolveProvider<'a> {
                                             // of `gate_only` dequeues it).
                                             let sub_svar = {
                                                 let br = self.binding_resolver.borrow();
-                                                let (sub_namespace, sub_url): (Option<&str>, Option<&str>) =
+                                                let (sub_namespace, sub_url, sub_git_ref): (Option<&str>, Option<&str>, Option<&str>) =
                                                     match sub_dep {
-                                                        Dep::Named(n) => (n.namespace.as_deref(), None),
-                                                        Dep::Url(u) => (None, Some(u.git.as_str())),
-                                                        _ => (None, None),
+                                                        Dep::Named(n) => (n.namespace.as_deref(), None, None),
+                                                        Dep::Url(u) => (None, Some(u.git.as_str()), Some(u.git_ref.as_str())),
+                                                        _ => (None, None, None),
                                                     };
                                                 canonical_key_for_requirement(
                                                     &sub_name,
                                                     sub_namespace,
                                                     sub_url,
+                                                    sub_git_ref,
                                                     &self.overrides,
                                                     self.index,
                                                     self.root_self_name.as_deref(),
@@ -3986,6 +3993,7 @@ impl<'a> ResolveProvider<'a> {
                             &dep_name,
                             None,
                             Some(&u.url),
+                            Some(&u.ref_),
                             &self.overrides,
                             self.index,
                             self.root_self_name.as_deref(),
@@ -4055,6 +4063,7 @@ impl<'a> ResolveProvider<'a> {
                         canonical_key_for_requirement(
                             &n.name,
                             n.namespace.as_deref(),
+                            None,
                             None,
                             &self.overrides,
                             self.index,
@@ -4840,6 +4849,7 @@ impl<'a> ResolveProvider<'a> {
                                     &cpe.dep,
                                     None,
                                     None,
+                                    None,
                                     &self.overrides,
                                     self.index,
                                     self.root_self_name.as_deref(),
@@ -4968,15 +4978,16 @@ impl<'a> ResolveProvider<'a> {
                         // "url"/"named" arm of `gate_only` dequeues it).
                         let sub_svar = {
                             let br = self.binding_resolver.borrow();
-                            let (sub_namespace, sub_url): (Option<&str>, Option<&str>) = match dep {
-                                Dep::Named(n) => (n.namespace.as_deref(), None),
-                                Dep::Url(u) => (None, Some(u.git.as_str())),
-                                _ => (None, None),
+                            let (sub_namespace, sub_url, sub_git_ref): (Option<&str>, Option<&str>, Option<&str>) = match dep {
+                                Dep::Named(n) => (n.namespace.as_deref(), None, None),
+                                Dep::Url(u) => (None, Some(u.git.as_str()), Some(u.git_ref.as_str())),
+                                _ => (None, None, None),
                             };
                             canonical_key_for_requirement(
                                 &sub_name,
                                 sub_namespace,
                                 sub_url,
+                                sub_git_ref,
                                 &self.overrides,
                                 self.index,
                                 self.root_self_name.as_deref(),

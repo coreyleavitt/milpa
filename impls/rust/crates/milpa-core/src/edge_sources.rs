@@ -840,6 +840,7 @@ mod tests {
     fn sid(label: &str) -> SourceId {
         normalize_source(&SourceId::Fetchable(FetchableOrigin::Git {
             url: format!("https://example.com/{label}.git"),
+            git_ref: None,
             subpath: None,
         }))
         .unwrap()

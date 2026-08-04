@@ -772,10 +772,15 @@ yet exist ([[feedback_minimal_over_completeness]], [[positioning_no_generic]]).
 > gate" (`RES-PROVENANCE-CONFLICT`) keyed on that string to stop two
 > transports from claiming one dep — is **superseded**. The defect that rule
 > encoded (`#193`) was keying the solver by the consumer's **label**. The
-> solver variable is now a **source-id**: the dep's version-independent
-> **origin** (`SourceId` — a git URL, an OCI coordinate, a tarball URL, a
-> local path, a registry coordinate, or a workspace-member name; ref/tag/
-> digest excluded — they are versions, not origin). Coordinate-is-origin: a
+> solver variable is now a **source-id**: the dep's **origin** (`SourceId` — a
+> git URL, an OCI coordinate, a tarball URL, a local path, a registry
+> coordinate, or a workspace-member name) plus, for a DIRECT dep, its declared
+> `ref`/`digest` **pin** (DE2-ref, RFC §3 amendment — a git commit/branch/tag
+> is not a version but a source pin; a registry/member origin stays version-
+> independent). Two claims for one origin at different pins are distinct
+> source-ids arbitrated by the same root-authority rule as a URL disagreement
+> (root/override wins → `LOST_TO_ROOT`; two transitive pins, no root arbiter →
+> `RES-BINDING-CONFLICT`). Coordinate-is-origin: a
 > `named` (registry) dep's origin **is** its registry coordinate; a
 > `git=`/`local=`/`tarball=` dep's origin is its own declared URL/path. The
 > same name resolving through two different origins is **not** one package —

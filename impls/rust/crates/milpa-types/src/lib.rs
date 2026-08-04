@@ -410,24 +410,33 @@ impl Provenance {
 /// §3/§4.1, S1). Origins that are fetched, hashed, and materialized under
 /// `_deps/`. Mirrors Python's `FetchableOrigin` union (`source_id.py`).
 ///
-/// A **closed enum** (five kinds; `ref`/commit/digest are VERSIONS, not the
-/// origin, and are deliberately excluded from every variant here).
+/// A **closed enum** (five kinds). DE2-ref (rfc-origin-as-identity.md §3
+/// amendment): a DIRECT dep's origin includes its PIN — `Git.git_ref` /
+/// `Oci.digest` — because a commit/branch/non-semver-tag is not a version (no
+/// version lattice), it is the source pin. Two claims for one URL at different
+/// pins are DIFFERENT origins, arbitrated by `BindingResolver` (root/override
+/// wins; two transitive pins with no root → `RES-BINDING-CONFLICT`).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum FetchableOrigin {
-    /// A `git=` dependency's origin: the normalized repository URL. `url` is
-    /// ALWAYS normalized (`source_id::normalize_source`) by every trusted
-    /// caller; no `source_id::parse` exists (round-2.5, rfc-origin-as-
-    /// identity.md §4.1) — the frozen struct is the authoritative
-    /// representation, never reconstructed from a flat string.
+    /// A `git=` dependency's SOURCE PIN: normalized URL + the pinned ref.
+    /// `url` is ALWAYS normalized (`source_id::normalize_source`); the frozen
+    /// struct is authoritative, never reconstructed from a flat string.
     Git {
         url: String,
+        /// DE2-ref: the pinned ref (branch/tag/sha) as declared; `None` = the
+        /// remote's default branch. Part of the pin — compared pre-fetch; the
+        /// lockfile records the resolved commit separately as provenance.
+        /// (`ref` is a Rust keyword, hence `git_ref`; serialized as `ref`.)
+        git_ref: Option<String>,
         /// Normalized posix; `None` = repo root.
         subpath: Option<String>,
     },
-    /// An `oci=` dependency's origin: registry + repository, no digest/tag.
+    /// An `oci=` dependency's SOURCE PIN: registry + repository + digest.
     Oci {
         registry: String,
         repository: String,
+        /// DE2-ref: the pinned digest (an OCI artifact is addressed by digest).
+        digest: Option<String>,
         subpath: Option<String>,
     },
     /// A `tarball=` dependency's origin. Each distinct URL is a distinct source.

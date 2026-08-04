@@ -1,0 +1,5 @@
+name "t1"
+kind "library"
+deps {
+    foo git=(url)"https://example.com/foo.git" ref="v2.0.0"
+}

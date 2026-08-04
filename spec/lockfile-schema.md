@@ -760,17 +760,21 @@ dep "widget" {
 
 ### 3.10  `source` block (S5, `rfc-origin-as-identity.md` §4.1/§7)
 
-Every dep block carries a `source { … }` node recording its version-
-independent **origin** (the `SourceId` — RFC origin-as-identity.md §4.1) —
-**structured**, with typed children, never a flat parsed string. Positioned
-right after the optional dep-arg `namespace` child (§2.3) and before
-`identity` (§3.1): "where this came from" before "what its content hash is".
+Every dep block carries a `source { … }` node recording its **origin** (the
+`SourceId` — RFC origin-as-identity.md §4.1) — **structured**, with typed
+children, never a flat parsed string. Positioned right after the optional
+dep-arg `namespace` child (§2.3) and before `identity` (§3.1): "where this came
+from" before "what its content hash is". Per **DE2-ref** (RFC §3 amendment) a
+DIRECT dep's origin includes its **pin** (`git` → `ref`; `oci` → `digest`) —
+the pin is not a version but part of the source; a `registry`/`member` origin
+stays version-independent.
 
 ```kdl
 dep "nimz3" {
     source {
         kind "git"
         url (url)"https://github.com/coreyleavitt/nim-z3"
+        ref "main"                 // DE2-ref: the pin; omitted only when absent
         subpath "pkg/foo"          // omitted when the repo root is used
     }
     identity "dag-sha256:<64hex>"
@@ -798,12 +802,19 @@ dep "utils" {
 >
 > | `kind` | children (order) |
 > |---|---|
-> | `git` | `url` (req, `(url)`-tagged) / `subpath` (opt) |
-> | `oci` | `registry` (req) / `repository` (req) / `subpath` (opt) |
+> | `git` | `url` (req, `(url)`-tagged) / `ref` (opt, DE2-ref pin) / `subpath` (opt) |
+> | `oci` | `registry` (req) / `repository` (req) / `digest` (opt, DE2-ref pin) / `subpath` (opt) |
 > | `tarball` | `url` (req, `(url)`-tagged) / `subpath` (opt) |
 > | `local` | `path` (req) |
 > | `registry` | `registry` (req) / `namespace` (opt) / `name` (req) |
 > | `member` | `name` (req) |
+>
+> DE2-ref (RFC §3 amendment): a `git` `ref` / `oci` `digest` is the direct
+> dep's SOURCE PIN — compared **as declared** (the binding is pure/pre-fetch);
+> the `provenance` block (§2.4) still records the RESOLVED commit/digest. Two
+> claims for one origin at different pins are DISTINCT `SourceId`s: a root/
+> override pin wins over a transitive one (`LOST_TO_ROOT`); two transitive
+> pins disagreeing with no root arbiter → `RES-BINDING-CONFLICT`.
 >
 > A `/`-bearing `registry` namespace (e.g. `codeberg.org/eris`, a real
 > host-qualified tianguis namespace) stores losslessly as an ordinary KDL

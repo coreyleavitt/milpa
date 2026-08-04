@@ -14,7 +14,7 @@ use super::*;
 use milpa_types::{FetchableOrigin, SourceId};
 
 fn git(url: &str) -> SourceId {
-    SourceId::Fetchable(FetchableOrigin::Git { url: url.to_string(), subpath: None })
+    SourceId::Fetchable(FetchableOrigin::Git { git_ref: None, url: url.to_string(), subpath: None })
 }
 
 fn assert_malformed(result: Result<SourceId, MilpaError>) {
@@ -35,6 +35,7 @@ fn canonical_git_no_subpath() {
 #[test]
 fn canonical_git_with_subpath() {
     let sid = SourceId::Fetchable(FetchableOrigin::Git {
+        git_ref: None,
         url: "https://github.com/facebook/react".into(),
         subpath: Some("packages/react-dom".into()),
     });
@@ -47,6 +48,7 @@ fn canonical_git_with_subpath() {
 #[test]
 fn canonical_oci_no_subpath() {
     let sid = SourceId::Fetchable(FetchableOrigin::Oci {
+        digest: None,
         registry: "ghcr.io".into(),
         repository: "coreyleavitt/softlink".into(),
         subpath: None,
@@ -136,10 +138,12 @@ fn worked_examples() -> Vec<SourceId> {
     vec![
         git("https://github.com/coreyleavitt/nim-z3"),
         SourceId::Fetchable(FetchableOrigin::Git {
+            git_ref: None,
             url: "https://github.com/facebook/react".into(),
             subpath: Some("packages/react-dom".into()),
         }),
         SourceId::Fetchable(FetchableOrigin::Oci {
+            digest: None,
             registry: "ghcr.io".into(),
             repository: "coreyleavitt/softlink".into(),
             subpath: None,
@@ -181,6 +185,7 @@ fn format_distinct_labels_per_kind() {
     let sids = vec![
         git("https://x/y"),
         SourceId::Fetchable(FetchableOrigin::Oci {
+            digest: None,
             registry: "ghcr.io".into(),
             repository: "x/y".into(),
             subpath: None,
@@ -284,6 +289,7 @@ fn normalize_not_attempted_ssh_https_not_unified() {
 #[test]
 fn normalize_subpath_untouched() {
     let sid = normalize_source(&SourceId::Fetchable(FetchableOrigin::Git {
+        git_ref: None,
         url: "HTTPS://Host/Org/Repo.git".into(),
         subpath: Some("pkg/foo".into()),
     }))
@@ -291,6 +297,7 @@ fn normalize_subpath_untouched() {
     assert_eq!(
         sid,
         SourceId::Fetchable(FetchableOrigin::Git {
+            git_ref: None,
             url: "https://host/Org/Repo".into(),
             subpath: Some("pkg/foo".into()),
         })
@@ -326,6 +333,7 @@ fn normalize_ipv6_host_bracketed() {
 #[test]
 fn normalize_oci_identity() {
     let raw = SourceId::Fetchable(FetchableOrigin::Oci {
+        digest: None,
         registry: "ghcr.io".into(),
         repository: "Org/Repo".into(),
         subpath: None,
@@ -378,6 +386,7 @@ fn normalize_member_identity() {
 #[test]
 fn subpath_absolute_rejected() {
     assert_malformed(normalize_source(&SourceId::Fetchable(FetchableOrigin::Git {
+        git_ref: None,
         url: "https://example.com/x".into(),
         subpath: Some("/abs/path".into()),
     })));
@@ -386,6 +395,7 @@ fn subpath_absolute_rejected() {
 #[test]
 fn subpath_dotdot_traversal_rejected() {
     assert_malformed(normalize_source(&SourceId::Fetchable(FetchableOrigin::Git {
+        git_ref: None,
         url: "https://example.com/x".into(),
         subpath: Some("../escape".into()),
     })));
@@ -394,6 +404,7 @@ fn subpath_dotdot_traversal_rejected() {
 #[test]
 fn subpath_dotdot_mid_segment_rejected() {
     assert_malformed(normalize_source(&SourceId::Fetchable(FetchableOrigin::Git {
+        git_ref: None,
         url: "https://example.com/x".into(),
         subpath: Some("pkg/../../escape".into()),
     })));
@@ -402,6 +413,7 @@ fn subpath_dotdot_mid_segment_rejected() {
 #[test]
 fn subpath_empty_rejected() {
     assert_malformed(normalize_source(&SourceId::Fetchable(FetchableOrigin::Git {
+        git_ref: None,
         url: "https://example.com/x".into(),
         subpath: Some("".into()),
     })));
@@ -410,6 +422,7 @@ fn subpath_empty_rejected() {
 #[test]
 fn subpath_ordinary_relative_accepted() {
     let sid = normalize_source(&SourceId::Fetchable(FetchableOrigin::Git {
+        git_ref: None,
         url: "https://example.com/x".into(),
         subpath: Some("pkg/foo".into()),
     }))
@@ -417,6 +430,7 @@ fn subpath_ordinary_relative_accepted() {
     assert_eq!(
         sid,
         SourceId::Fetchable(FetchableOrigin::Git {
+            git_ref: None,
             url: "https://example.com/x".into(),
             subpath: Some("pkg/foo".into()),
         })
@@ -434,6 +448,7 @@ fn subpath_tarball_guarded_too() {
 #[test]
 fn subpath_oci_guarded_too() {
     assert_malformed(normalize_source(&SourceId::Fetchable(FetchableOrigin::Oci {
+        digest: None,
         registry: "ghcr.io".into(),
         repository: "x/y".into(),
         subpath: Some("../escape".into()),
@@ -465,6 +480,7 @@ fn tarball_url_with_literal_delim_rejected() {
 #[test]
 fn oci_coordinate_with_literal_delim_rejected() {
     assert_malformed(normalize_source(&SourceId::Fetchable(FetchableOrigin::Oci {
+        digest: None,
         registry: "ghcr.io".into(),
         repository: "x#subdirectory=evil".into(),
         subpath: None,
@@ -478,10 +494,12 @@ fn unvalidated_canonical_would_collide_without_the_guard() {
     // GitSourceIds collide under canonical(). This is exactly the
     // pathological input normalize_source rejects.
     let folded = SourceId::Fetchable(FetchableOrigin::Git {
+        git_ref: None,
         url: "https://example.com/x#subdirectory=pkg".into(),
         subpath: None,
     });
     let split = SourceId::Fetchable(FetchableOrigin::Git {
+        git_ref: None,
         url: "https://example.com/x".into(),
         subpath: Some("pkg".into()),
     });
@@ -497,6 +515,7 @@ fn unvalidated_canonical_would_collide_without_the_guard() {
 #[test]
 fn oci_registry_with_slash_rejected() {
     assert_malformed(normalize_source(&SourceId::Fetchable(FetchableOrigin::Oci {
+        digest: None,
         registry: "a/b".into(),
         repository: "c".into(),
         subpath: None,
@@ -506,11 +525,13 @@ fn oci_registry_with_slash_rejected() {
 #[test]
 fn oci_registry_slash_collision_without_the_guard() {
     let a = SourceId::Fetchable(FetchableOrigin::Oci {
+        digest: None,
         registry: "a/b".into(),
         repository: "c".into(),
         subpath: None,
     });
     let b = SourceId::Fetchable(FetchableOrigin::Oci {
+        digest: None,
         registry: "a".into(),
         repository: "b/c".into(),
         subpath: None,
@@ -633,6 +654,7 @@ fn tarball_url_with_control_char_rejected() {
 #[test]
 fn oci_registry_with_control_char_rejected() {
     assert_malformed(normalize_source(&SourceId::Fetchable(FetchableOrigin::Oci {
+        digest: None,
         registry: "ghcr.io\x1b".into(),
         repository: "x".into(),
         subpath: None,
@@ -642,6 +664,7 @@ fn oci_registry_with_control_char_rejected() {
 #[test]
 fn oci_repository_with_control_char_rejected() {
     assert_malformed(normalize_source(&SourceId::Fetchable(FetchableOrigin::Oci {
+        digest: None,
         registry: "ghcr.io".into(),
         repository: "x\x1by".into(),
         subpath: None,

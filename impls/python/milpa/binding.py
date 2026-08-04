@@ -311,14 +311,15 @@ def _override_target_to_raw_origin(ov: "Override", index: "Index | None" = None)
     from milpa.manifest import GitTarget, LocalTarget, MemberTarget, OciTarget, RegistryTarget, TarballTarget
 
     if isinstance(ov.target, GitTarget):
-        return GitSourceId(url=ov.target.git, subpath=ov.target.subpath)
+        return GitSourceId(url=ov.target.git, ref=ov.target.ref, subpath=ov.target.subpath)
     if isinstance(ov.target, LocalTarget):
         return LocalSourceId(path=ov.target.path)
     if isinstance(ov.target, MemberTarget):
         return MemberSourceId(member_name=ov.target.member_name)
     if isinstance(ov.target, OciTarget):
         return OciSourceId(
-            registry=ov.target.registry, repository=ov.target.repository, subpath=ov.target.subpath,
+            registry=ov.target.registry, repository=ov.target.repository,
+            digest=ov.target.digest, subpath=ov.target.subpath,
         )
     if isinstance(ov.target, TarballTarget):
         return TarballSourceId(url=ov.target.url, subpath=ov.target.subpath)
@@ -337,7 +338,7 @@ def _dep_declared_raw_origin(dep: object, index: "Index") -> SourceId | None:
     from milpa.manifest import LocalDep, MemberDep, NamedDep, TarballDep, UrlDep
 
     if isinstance(dep, UrlDep):
-        return GitSourceId(url=dep.git, subpath=dep.subpath)
+        return GitSourceId(url=dep.git, ref=dep.ref, subpath=dep.subpath)
     if isinstance(dep, NamedDep):
         ns = resolved_registry_namespace(dep.name, dep.namespace, index)
         return RegistrySourceId(registry=DEFAULT_REGISTRY_ALIAS, namespace=ns, name=dep.name)
@@ -355,6 +356,7 @@ def canonical_key_for_requirement(
     name: str,
     namespace: str | None = None,
     url: str | None = None,
+    ref: str | None = None,
     overrides_by_name: dict[str, "Override"],
     index: "Index | None",
     root_self_name: str | None = None,
@@ -441,7 +443,7 @@ def canonical_key_for_requirement(
     if ov is not None:
         raw = _override_target_to_raw_origin(ov, index)
     elif url is not None:
-        raw = GitSourceId(url=url)
+        raw = GitSourceId(url=url, ref=ref)
     else:
         ns = resolved_registry_namespace(name, namespace, index)
         raw = RegistrySourceId(registry=DEFAULT_REGISTRY_ALIAS, namespace=ns, name=name)

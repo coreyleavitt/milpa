@@ -13,11 +13,12 @@ const HASH_A: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 const HASH_B: &str = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
 fn git_source(url: &str) -> SourceId {
-    SourceId::Fetchable(FetchableOrigin::Git { url: url.to_string(), subpath: None })
+    SourceId::Fetchable(FetchableOrigin::Git { git_ref: None, url: url.to_string(), subpath: None })
 }
 
 fn oci_source(registry: &str, repository: &str) -> SourceId {
     SourceId::Fetchable(FetchableOrigin::Oci {
+        digest: None,
         registry: registry.to_string(),
         repository: repository.to_string(),
         subpath: None,

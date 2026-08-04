@@ -5974,17 +5974,13 @@ fn resolve_lattice_lone_url_pin_of_registry_name_disagrees_hard_fails_under_stri
 }
 
 #[test]
-fn resolve_lattice_two_agreeing_url_pins_of_same_registry_name_coexist() {
-    // Two DIFFERENT transitives each pin `foo` — a registry-known name — at
-    // the registry's OWN repository, but at two DIFFERENT refs. Both AGREE
-    // with the registry (same repo), so BOTH are accepted: they coexist as
-    // independent candidates, never conflicting with EACH OTHER (agreement
-    // is validated per-claim against the static registry record, never
-    // between claims). Ordinary solver version-negotiation (maxver) then
-    // picks the higher version. Rust's BFS is synchronous (no thread pool),
-    // so the two sequential fetches to `_deps/foocoexist` (re-linked from
-    // the CAS on each fetch) never race — unlike Python's concurrent wave
-    // dispatch, which needs an explicit dest-disambiguation escape hatch.
+fn resolve_lattice_two_transitive_pins_different_refs_conflict() {
+    // DE2-ref (RFC §3 amendment): two DIFFERENT transitives each pin `foo` at
+    // the SAME repository but at two DIFFERENT refs (`v2.0.0` vs `v3.0.0`). A
+    // ref is a SOURCE PIN, not a version, so the two are DISAGREEING claims for
+    // one origin — and with no ROOT arbiter this is a hard RES-BINDING-CONFLICT
+    // (the author must `overrides {}`-pin `foo`). The pre-DE2-ref model wrongly
+    // let maxver silently pick the higher ref; a direct pin is exact, not a range.
     let t1_url = "https://example.com/t1coexist.git";
     let t2_url = "https://example.com/t2coexist.git";
     let foo_registry_url = "https://registry.example.com/foocoexist.git";
@@ -6005,25 +6001,15 @@ fn resolve_lattice_two_agreeing_url_pins_of_same_registry_name_coexist() {
         url_dep("t1coexist", t1_url, "main"),
         url_dep("t2coexist", t2_url, "main"),
     ]);
-    let graph = resolve(
+    // DE2-ref: foo@v2.0.0 and foo@v3.0.0 are different source pins → the two
+    // transitive claims disagree, and no root pins foo → hard conflict.
+    let err = resolve(
         &m, Some(&index), &reg, None, None, Strategy::Maxver, true,
         &deps_dir(&tmp), None, false, &cas_store(&tmp),
     )
-    .unwrap();
-
-    let foo = graph.deps.iter().find(|d| d.name == "foocoexist").expect("foocoexist in graph");
-    assert_eq!(foo.version, v(3, 0, 0), "maxver picks the higher of the two coexisting pins");
-    match foo.provenances.first().expect("provenance") {
-        ProvenanceRecord::Git { url, ref_spec, .. } => {
-            assert_eq!(url, foo_registry_url);
-            assert_eq!(ref_spec.as_deref(), Some("v3.0.0"));
-        }
-        other => panic!("expected git provenance, got {other:?}"),
-    }
-    // Both agreeing pins were genuinely fetched (peacefully coexisting
-    // candidates) — neither was blocked by the other.
-    assert!(reg.calls().iter().any(|c| c.1 == foo_registry_url && c.2 == "v2.0.0"));
-    assert!(reg.calls().iter().any(|c| c.1 == foo_registry_url && c.2 == "v3.0.0"));
+    .unwrap_err();
+    assert_eq!(err.code(), "RES-BINDING-CONFLICT");
+    assert!(format!("{err:?}").contains("foocoexist"));
 }
 
 #[test]

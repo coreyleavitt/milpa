@@ -138,23 +138,37 @@ from milpa.manifest import contains_unsafe_char, valid_dep_name
 
 @dataclass(frozen=True)
 class GitSourceId:
-    """A ``git=`` dependency's origin: the normalized repository URL.
+    """A ``git=`` dependency's SOURCE PIN: normalized URL + the pinned ref.
 
-    ``url`` is ALWAYS normalized (``normalize_source``, below) by every
-    trusted caller; no ref/commit — those are VERSIONS, not the origin
-    (RFC §3).
+    DE2-ref (RFC §3 amendment): a git commit/branch/non-semver-tag is not a
+    version (no version lattice), so ``ref`` is not a version — it is part of
+    the *pin*. Two claims for the same ``url`` at different ``ref``s are
+    DIFFERENT source-ids, so ``BindingResolver`` arbitrates them by the same
+    root-authority rule as a URL disagreement (root/override pin wins; two
+    transitive pins with no root arbiter → ``RES-BINDING-CONFLICT``). ``ref``
+    is the ref AS DECLARED (compared pre-fetch — the binding stays pure); the
+    lockfile records the RESOLVED commit separately as provenance. ``None`` =
+    the remote's default branch. Unification stays name-based, so a bare
+    ``requires "x"`` still binds to a root pin (and inherits its ``ref``).
     """
 
     url: str
+    ref: str | None = None      # the pinned ref (branch/tag/sha) as declared
     subpath: str | None = None  # normalized posix; None = repo root
 
 
 @dataclass(frozen=True)
 class OciSourceId:
-    """An ``oci=`` dependency's origin: registry + repository, no digest/tag."""
+    """An ``oci=`` dependency's SOURCE PIN: registry + repository + digest.
+
+    DE2-ref: ``digest`` is the pin (an OCI artifact is addressed by digest),
+    arbitrated exactly like ``GitSourceId.ref``. ``None`` only for a bare
+    registry/repository reference with no digest declared.
+    """
 
     registry: str
     repository: str
+    digest: str | None = None
     subpath: str | None = None
 
 
@@ -239,6 +253,11 @@ _MEMBER_PREFIX = "member+"
 #: The uniform subpath delimiter (RFC §4.1) shared by Git/Tarball/Oci.
 _SUBDIR_DELIM = "#subdirectory="
 
+#: DE2-ref pin delimiters — one-way, injective (url/repo/ref/digest carry no
+#: '#', enforced by normalize_source), placed BEFORE the subpath suffix.
+_REF_DELIM = "#ref="
+_DIGEST_DELIM = "#digest="
+
 #: Kind labels for ``format_source_id`` (B6).
 _KIND_LABELS: dict[type, str] = {
     GitSourceId: "git dependency",
@@ -255,6 +274,18 @@ def _subdir_suffix(subpath: str | None) -> str:
     return _SUBDIR_DELIM + subpath
 
 
+def _ref_suffix(ref: str | None) -> str:
+    if ref is None:
+        return ""
+    return _REF_DELIM + ref
+
+
+def _digest_suffix(digest: str | None) -> str:
+    if digest is None:
+        return ""
+    return _DIGEST_DELIM + digest
+
+
 def canonical(sid: SourceId) -> str:
     """Serialize *sid* to its canonical wire-format string (RFC §4.1).
 
@@ -267,12 +298,12 @@ def canonical(sid: SourceId) -> str:
     itself performs no validation.
     """
     if isinstance(sid, GitSourceId):
-        return _GIT_PREFIX + sid.url + _subdir_suffix(sid.subpath)
+        return _GIT_PREFIX + sid.url + _ref_suffix(sid.ref) + _subdir_suffix(sid.subpath)
     if isinstance(sid, TarballSourceId):
         return _TAR_PREFIX + sid.url + _subdir_suffix(sid.subpath)
     if isinstance(sid, OciSourceId):
         base = f"{sid.registry}/{sid.repository}"
-        return _OCI_PREFIX + base + _subdir_suffix(sid.subpath)
+        return _OCI_PREFIX + base + _digest_suffix(sid.digest) + _subdir_suffix(sid.subpath)
     if isinstance(sid, LocalSourceId):
         return _FILE_PREFIX + sid.path
     if isinstance(sid, RegistrySourceId):
@@ -488,7 +519,19 @@ def normalize_source(raw: RawOrigin) -> SourceId:
         _validate_no_delim_collision(url, context=f"git+ source url {url!r}")
         if raw.subpath is not None:
             _validate_subpath(raw.subpath, context="git dependency")
-        return GitSourceId(url=url, subpath=raw.subpath)
+        # DE2-ref: the pinned ref joins the source-id. Reject '#' (guarantees
+        # canonical() injectivity against the #ref=/#subdirectory= delimiters)
+        # and any terminal-unsafe char (same sink as the url).
+        if raw.ref is not None:
+            if "#" in raw.ref:
+                raise MilpaError(
+                    SRC_ID_MALFORMED,
+                    f"git ref {raw.ref!r} contains a '#', which collides with "
+                    f"milpa's reserved source-id delimiters",
+                    value=raw.ref,
+                )
+            _validate_no_unsafe_char(raw.ref, context=f"git ref {raw.ref!r}")
+        return GitSourceId(url=url, ref=raw.ref, subpath=raw.subpath)
     if isinstance(raw, OciSourceId):
         if "/" in raw.registry:
             raise MilpaError(
@@ -503,7 +546,20 @@ def normalize_source(raw: RawOrigin) -> SourceId:
         _validate_no_delim_collision(base, context=f"oci+ source {base!r}")
         if raw.subpath is not None:
             _validate_subpath(raw.subpath, context="OCI dependency")
-        return OciSourceId(registry=raw.registry, repository=raw.repository, subpath=raw.subpath)
+        # DE2-ref: the pinned digest joins the source-id (reject '#' for
+        # canonical() injectivity; digest format itself is validated at the
+        # fetch boundary — TNG-BAD-OCI-DIGEST).
+        if raw.digest is not None and "#" in raw.digest:
+            raise MilpaError(
+                SRC_ID_MALFORMED,
+                f"OCI digest {raw.digest!r} contains a '#', which collides with "
+                f"milpa's reserved source-id delimiters",
+                value=raw.digest,
+            )
+        return OciSourceId(
+            registry=raw.registry, repository=raw.repository,
+            digest=raw.digest, subpath=raw.subpath,
+        )
     if isinstance(raw, TarballSourceId):
         _validate_no_unsafe_char(raw.url, context=f"tar+ source url {raw.url!r}")
         _validate_no_delim_collision(raw.url, context=f"tar+ source url {raw.url!r}")

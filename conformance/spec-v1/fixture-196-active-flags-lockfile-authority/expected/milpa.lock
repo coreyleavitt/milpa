@@ -6,6 +6,7 @@ dep "lib-flags" {
     source {
         kind "git"
         url (url)"https://example.com/lib-flags"
+        ref "main"
     }
     identity "dag-sha256:4562522c6d39f56093b3e1068b197a104c17057c2a144fb41ebafd4419f61281"
     version "0.0.0"

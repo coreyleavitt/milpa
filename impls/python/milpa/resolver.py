@@ -2429,7 +2429,7 @@ def _run_bfs_wave_loop(
                 # ``ns2/foo`` unchecked).
                 _url_claim = Claim(
                     name=dep_u.name,
-                    source_id=normalize_source(GitSourceId(url=dep_u.git, subpath=dep_u.subpath)),
+                    source_id=normalize_source(GitSourceId(url=dep_u.git, ref=dep_u.ref, subpath=dep_u.subpath)),
                     is_root=False,
                     claimant="transitive",
                 )
@@ -2738,6 +2738,7 @@ def _run_bfs_wave_loop(
                                         name=_nsub_name,
                                         namespace=getattr(_nsub, "namespace", None),
                                         url=_nsub.git if isinstance(_nsub, UrlDep) else None,
+                                        ref=_nsub.ref if isinstance(_nsub, UrlDep) else None,
                                         overrides_by_name=overrides_by_name,
                                         index=index,
                                         root_self_name=root_self_name,
@@ -3036,6 +3037,7 @@ def _s4a_run_fixpoint(
                         name=sub_dep.name,
                         namespace=None,
                         url=sub_dep.git,
+                        ref=sub_dep.ref,
                         overrides_by_name=overrides_by_name,
                         index=index,
                         root_self_name=root_self_name,

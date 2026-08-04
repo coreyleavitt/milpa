@@ -6,6 +6,7 @@ dep "foo" {
     source {
         kind "git"
         url (url)"https://example.com/foo-fork"
+        ref "main"
     }
     identity "dag-sha256:85c214935e90d005adc4fb0df5914e72a90fba6d9127c8fee81f1130c2e66b64"
     version "1.0.0"

@@ -25,6 +25,7 @@ dep "portal" {
     source {
         kind "git"
         url (url)"https://example.com/portal"
+        ref "v1.0.0"
     }
     identity "dag-sha256:f452fd2cd924fd5831bf98faec5e478dbdd90b78bd0f038536d1eced1bce507d"
     version "1.0.0"

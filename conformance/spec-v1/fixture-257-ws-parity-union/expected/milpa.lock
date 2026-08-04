@@ -6,6 +6,7 @@ dep "extlib" {
     source {
         kind "git"
         url (url)"https://example.com/extlib"
+        ref "main"
     }
     identity "dag-sha256:3af28f998d8f9614a60c6fc37e0c08299cd4a06c843a01c88d7a82f9c6d8a704"
     version "0.0.0"

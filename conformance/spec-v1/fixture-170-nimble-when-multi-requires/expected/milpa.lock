@@ -6,6 +6,7 @@ dep "depx" {
     source {
         kind "git"
         url (url)"https://github.com/example/depx"
+        ref "v1.0.0"
     }
     identity "dag-sha256:e9ee4c28591a142fc44ff25b625d8874abfb135782886bbb1740785fd22e66ce"
     version "1.0.0"
@@ -25,6 +26,7 @@ dep "depy" {
     source {
         kind "git"
         url (url)"https://github.com/example/depy"
+        ref "v1.0.0"
     }
     identity "dag-sha256:37f2d13653a477680c521b82beb85fdb4c02603940d55a82227c8503b2731dce"
     version "1.0.0"
@@ -44,6 +46,7 @@ dep "foo" {
     source {
         kind "git"
         url (url)"https://github.com/example/foo"
+        ref "main"
     }
     identity "dag-sha256:88c70edb5937f199251ce03b004f7246a7aec0c44c2e4581ca34eb23667be2b8"
     version "1.0.0"

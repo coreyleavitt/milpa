@@ -54,7 +54,7 @@ def _locked_git_dep(name: str, url: str, identity: str) -> LockedDep:
         src_dir="",
         requires=(),
         provenances=(GitProvenanceRecord(url=url, ref="main", commit_sha="a" * 40),),
-        source_id=normalize_source(GitSourceId(url=url)),
+        source_id=normalize_source(GitSourceId(url=url, ref="main")),  # DE2-ref: pin
     )
 
 

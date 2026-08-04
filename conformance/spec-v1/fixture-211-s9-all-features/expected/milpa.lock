@@ -6,6 +6,7 @@ dep "debuglib" {
     source {
         kind "git"
         url (url)"https://example.com/debuglib"
+        ref "main"
     }
     identity "dag-sha256:b0b044d257e9cc0e2e5cf3d86ea3ad616502dbbd960df44cb1142d643307ffe7"
     version "0.0.0"
@@ -24,6 +25,7 @@ dep "tlslib" {
     source {
         kind "git"
         url (url)"https://example.com/tlslib"
+        ref "main"
     }
     identity "dag-sha256:06c42623e12c1c865699ca9de8753487c38098aae8354498c6637e765bba8500"
     version "0.0.0"

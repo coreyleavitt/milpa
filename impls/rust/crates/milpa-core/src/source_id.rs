@@ -103,6 +103,10 @@ const MEMBER_PREFIX: &str = "member+";
 
 /// The uniform subpath delimiter (RFC §4.1) shared by Git/Tarball/Oci.
 const SUBDIR_DELIM: &str = "#subdirectory=";
+// DE2-ref pin delimiters — one-way, injective (url/repo/ref/digest carry no
+// '#', enforced by normalize_source), placed BEFORE the subpath suffix.
+const REF_DELIM: &str = "#ref=";
+const DIGEST_DELIM: &str = "#digest=";
 
 fn malformed(msg: impl Into<String>) -> MilpaError {
     MilpaError::Core(CoreError::SourceId("SRC-ID-MALFORMED", msg.into()))
@@ -115,6 +119,20 @@ fn subdir_suffix(subpath: Option<&str>) -> String {
     }
 }
 
+fn ref_suffix(git_ref: Option<&str>) -> String {
+    match git_ref {
+        None => String::new(),
+        Some(r) => format!("{REF_DELIM}{r}"),
+    }
+}
+
+fn digest_suffix(digest: Option<&str>) -> String {
+    match digest {
+        None => String::new(),
+        Some(d) => format!("{DIGEST_DELIM}{d}"),
+    }
+}
+
 /// Serialize `sid` to its canonical wire-format string (RFC §4.1).
 ///
 /// ONE-WAY: this is the solver-variable value and the in-memory/display
@@ -124,15 +142,20 @@ fn subdir_suffix(subpath: Option<&str>) -> String {
 /// docstring. `canonical()` itself performs no validation.
 pub fn canonical(sid: &SourceId) -> String {
     match sid {
-        SourceId::Fetchable(FetchableOrigin::Git { url, subpath }) => {
-            format!("{GIT_PREFIX}{url}{}", subdir_suffix(subpath.as_deref()))
+        SourceId::Fetchable(FetchableOrigin::Git { url, git_ref, subpath }) => {
+            format!(
+                "{GIT_PREFIX}{url}{}{}",
+                ref_suffix(git_ref.as_deref()),
+                subdir_suffix(subpath.as_deref())
+            )
         }
         SourceId::Fetchable(FetchableOrigin::Tarball { url, subpath }) => {
             format!("{TAR_PREFIX}{url}{}", subdir_suffix(subpath.as_deref()))
         }
-        SourceId::Fetchable(FetchableOrigin::Oci { registry, repository, subpath }) => {
+        SourceId::Fetchable(FetchableOrigin::Oci { registry, repository, digest, subpath }) => {
             format!(
-                "{OCI_PREFIX}{registry}/{repository}{}",
+                "{OCI_PREFIX}{registry}/{repository}{}{}",
+                digest_suffix(digest.as_deref()),
                 subdir_suffix(subpath.as_deref())
             )
         }
@@ -372,7 +395,7 @@ pub(crate) fn normalize_git_url(url: &str) -> String {
 /// post-fetch — RFC §3.3).
 pub fn normalize_source(raw: &SourceId) -> Result<SourceId, MilpaError> {
     match raw {
-        SourceId::Fetchable(FetchableOrigin::Git { url, subpath }) => {
+        SourceId::Fetchable(FetchableOrigin::Git { url, git_ref, subpath }) => {
             // D1 (code-review): a raw '#' fragment in the DECLARED url is
             // rejected outright, never silently stripped — checked here (on
             // the untrusted input) rather than inside `normalize_git_url`,
@@ -396,9 +419,25 @@ pub fn normalize_source(raw: &SourceId) -> Result<SourceId, MilpaError> {
             if let Some(sp) = subpath {
                 validate_subpath(sp, "git dependency")?;
             }
-            Ok(SourceId::Fetchable(FetchableOrigin::Git { url: normalized, subpath: subpath.clone() }))
+            // DE2-ref: the pinned ref joins the source-id. Reject '#'
+            // (guarantees canonical() injectivity against #ref=/#subdirectory=)
+            // and any terminal-unsafe char (same sink as the url).
+            if let Some(r) = git_ref {
+                if r.contains('#') {
+                    return Err(malformed(format!(
+                        "git ref {r:?} contains a '#', which collides with milpa's \
+                         reserved source-id delimiters"
+                    )));
+                }
+                validate_no_unsafe_char(r, &format!("git ref {r:?}"))?;
+            }
+            Ok(SourceId::Fetchable(FetchableOrigin::Git {
+                url: normalized,
+                git_ref: git_ref.clone(),
+                subpath: subpath.clone(),
+            }))
         }
-        SourceId::Fetchable(FetchableOrigin::Oci { registry, repository, subpath }) => {
+        SourceId::Fetchable(FetchableOrigin::Oci { registry, repository, digest, subpath }) => {
             if registry.contains('/') {
                 return Err(malformed(format!(
                     "OCI registry {registry:?} must not contain '/' (per the OCI \
@@ -412,9 +451,21 @@ pub fn normalize_source(raw: &SourceId) -> Result<SourceId, MilpaError> {
             if let Some(sp) = subpath {
                 validate_subpath(sp, "OCI dependency")?;
             }
+            // DE2-ref: the pinned digest joins the source-id (reject '#' for
+            // canonical() injectivity; digest format is validated at the fetch
+            // boundary — TNG-BAD-OCI-DIGEST).
+            if let Some(d) = digest {
+                if d.contains('#') {
+                    return Err(malformed(format!(
+                        "OCI digest {d:?} contains a '#', which collides with milpa's \
+                         reserved source-id delimiters"
+                    )));
+                }
+            }
             Ok(SourceId::Fetchable(FetchableOrigin::Oci {
                 registry: registry.clone(),
                 repository: repository.clone(),
+                digest: digest.clone(),
                 subpath: subpath.clone(),
             }))
         }

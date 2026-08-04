@@ -6,6 +6,7 @@ dep "foo" {
     source {
         kind "git"
         url (url)"https://github.com/example/foo"
+        ref "main"
     }
     identity "dag-sha256:e8d610490a16f414d317058a374d40c06f81dfbe46d09d9001b6f9c69dea9dbf"
     version "0.0.0"
@@ -24,6 +25,7 @@ dep "t1" {
     source {
         kind "git"
         url (url)"https://example.com/t1"
+        ref "main"
     }
     identity "dag-sha256:81109a7770fe539e0cd49489802fa64a522a447b9e996999f51c49df6ddd490e"
     version "0.0.0"

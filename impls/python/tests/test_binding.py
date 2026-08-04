@@ -312,7 +312,9 @@ class TestCanonicalKeyForRequirement:
             overrides_by_name={"chronos": ov},
             index=Index(packages=[]),
         )
-        assert key == canonical(_ZEVV_Z3)
+        # DE2-ref: the override pins ref="main", so it is part of the source pin.
+        from milpa.source_id import GitSourceId
+        assert key == canonical(GitSourceId(url=_ZEVV_Z3.url, ref="main"))
 
     def test_two_labels_same_url_produce_the_same_canonical_key(self) -> None:
         """The pre-fetch collapse precondition: independent of WHICH label a

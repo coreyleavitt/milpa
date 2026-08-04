@@ -6,6 +6,7 @@ dep "extdep" {
     source {
         kind "git"
         url (url)"https://example.com/extdep"
+        ref "main"
     }
     identity "dag-sha256:12a867a17b33723bfa300bcf3b6ab2ca1a9a51bf6a743887ad005e91f7922061"
     version "0.0.0"

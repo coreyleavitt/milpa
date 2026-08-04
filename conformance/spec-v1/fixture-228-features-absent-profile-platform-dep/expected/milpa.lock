@@ -6,6 +6,7 @@ dep "flaglib" {
     source {
         kind "git"
         url (url)"https://example.com/flaglib"
+        ref "main"
     }
     identity "dag-sha256:dbf84a9af0796be0d89294d487f845dcc023226bc169b0c41b36d976e8a32666"
     version "0.0.0"
@@ -24,6 +25,7 @@ dep "platformlib" {
     source {
         kind "git"
         url (url)"https://example.com/platformlib"
+        ref "main"
     }
     identity "dag-sha256:0008e20e4441ad22d9e3be285e3b51ddaa8513ca0b066b11b61ba126339b320b"
     version "0.0.0"

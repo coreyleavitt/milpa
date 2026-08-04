@@ -325,10 +325,12 @@ impl BindingResolver {
 /// actual candidate key, not a fresh guess. `None` only in a standalone/unit
 /// test context with no live resolve() in progress — falls back to the
 /// guess-only behavior.
+#[allow(clippy::too_many_arguments)]
 pub fn canonical_key_for_requirement(
     name: &str,
     namespace: Option<&str>,
     url: Option<&str>,
+    git_ref: Option<&str>,
     overrides_by_name: &std::collections::BTreeMap<String, Override>,
     index: &Index,
     root_self_name: Option<&str>,
@@ -358,7 +360,11 @@ pub fn canonical_key_for_requirement(
     let raw = match overrides_by_name.get(name) {
         Some(ov) => override_target_to_raw_origin(ov, index),
         None => match url {
-            Some(u) => SourceId::Fetchable(FetchableOrigin::Git { url: u.to_string(), subpath: None }),
+            Some(u) => SourceId::Fetchable(FetchableOrigin::Git {
+                url: u.to_string(),
+                git_ref: git_ref.map(str::to_string),
+                subpath: None,
+            }),
             None => SourceId::Fetchable(FetchableOrigin::Registry {
                 registry: DEFAULT_REGISTRY_ALIAS.to_string(),
                 namespace: resolved_registry_namespace(name, namespace, index),
@@ -413,15 +419,24 @@ pub fn resolved_registry_namespace(name: &str, namespace: Option<&str>, index: &
 /// "named" BFS arm will independently compute for the SAME coordinate later.
 fn override_target_to_raw_origin(ov: &Override, index: &Index) -> SourceId {
     match &ov.target {
-        OverrideTarget::Git { url, subpath, .. } => {
-            SourceId::Fetchable(FetchableOrigin::Git { url: url.clone(), subpath: subpath.clone() })
+        OverrideTarget::Git { url, git_ref, subpath } => {
+            SourceId::Fetchable(FetchableOrigin::Git {
+                url: url.clone(),
+                git_ref: Some(git_ref.clone()),
+                subpath: subpath.clone(),
+            })
         }
         OverrideTarget::Local { path } => {
             SourceId::Fetchable(FetchableOrigin::Local { path: path.clone() })
         }
         OverrideTarget::Member { member_name } => SourceId::Member { member_name: member_name.clone() },
-        OverrideTarget::Oci { registry, repository, subpath, .. } => SourceId::Fetchable(
-            FetchableOrigin::Oci { registry: registry.clone(), repository: repository.clone(), subpath: subpath.clone() },
+        OverrideTarget::Oci { registry, repository, digest, subpath } => SourceId::Fetchable(
+            FetchableOrigin::Oci {
+                registry: registry.clone(),
+                repository: repository.clone(),
+                digest: Some(digest.clone()),
+                subpath: subpath.clone(),
+            },
         ),
         OverrideTarget::Tarball { url, subpath, .. } => {
             SourceId::Fetchable(FetchableOrigin::Tarball { url: url.clone(), subpath: subpath.clone() })
@@ -444,7 +459,11 @@ fn override_target_to_raw_origin(ov: &Override, index: &Index) -> SourceId {
 /// dep declaration). Mirrors Python's `binding._dep_declared_raw_origin`.
 fn dep_declared_raw_origin(dep: &Dep, index: &Index) -> Option<SourceId> {
     match dep {
-        Dep::Url(d) => Some(SourceId::Fetchable(FetchableOrigin::Git { url: d.git.clone(), subpath: d.subpath.clone() })),
+        Dep::Url(d) => Some(SourceId::Fetchable(FetchableOrigin::Git {
+            url: d.git.clone(),
+            git_ref: Some(d.git_ref.clone()),
+            subpath: d.subpath.clone(),
+        })),
         Dep::Named(d) => Some(SourceId::Fetchable(FetchableOrigin::Registry {
             registry: DEFAULT_REGISTRY_ALIAS.to_string(),
             namespace: resolved_registry_namespace(&d.name, d.namespace.as_deref(), index),

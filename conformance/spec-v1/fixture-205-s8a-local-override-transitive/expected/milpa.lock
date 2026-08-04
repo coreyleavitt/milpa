@@ -22,6 +22,7 @@ dep "translib" {
     source {
         kind "git"
         url (url)"https://example.com/translib"
+        ref "main"
     }
     identity "dag-sha256:51224ffa03f35b2f5987c8654c5fcd8942f9400d9bdb9c8f501fa32b7471ad9b"
     version "0.0.0"

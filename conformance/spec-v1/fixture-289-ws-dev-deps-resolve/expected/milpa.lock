@@ -6,6 +6,7 @@ dep "devtool" {
     source {
         kind "git"
         url (url)"https://example.com/devtool"
+        ref "main"
     }
     identity "dag-sha256:89087811956a01bbdbbb1cca1761b294a5f2369715cd8c0864ee9f6a4f02f16e"
     version "0.0.0"
@@ -24,6 +25,7 @@ dep "extlib" {
     source {
         kind "git"
         url (url)"https://example.com/extlib"
+        ref "main"
     }
     identity "dag-sha256:3af28f998d8f9614a60c6fc37e0c08299cd4a06c843a01c88d7a82f9c6d8a704"
     version "0.0.0"
@@ -74,6 +76,7 @@ dep "testhelper" {
     source {
         kind "git"
         url (url)"https://example.com/testhelper"
+        ref "main"
     }
     identity "dag-sha256:213ada61d29c6c2d450b66c012aa3b9addc8e18c69a300343e512cf561925174"
     version "0.0.0"
