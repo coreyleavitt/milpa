@@ -591,7 +591,7 @@ fn resolve_named_dep_strategy_selects_version() {
             name: "foo".to_string(),
             namespace: String::new(),
             versions: vec![idx_ver("0.4.0"), idx_ver("0.5.0"), idx_ver("1.0.0")],
-        }],
+        }], ..Default::default()
     };
     let m = manifest(vec![named_dep("foo", Some(">= 0.4.0"))]);
 
@@ -681,7 +681,7 @@ fn b2_index() -> Index {
         packages: vec![
             two_version_package("libfoo", "# libfoo v1\n", "# libfoo v2\n"),
             two_version_package("libbar", "# libbar v1\n", "# libbar v2\n"),
-        ],
+        ], ..Default::default()
     }
 }
 
@@ -941,7 +941,7 @@ fn resolve_c2_lowest_direct_root_direct_minver_transitive_maxver() {
                     idx_ver("transitive", "2.0.0", transitive_body),
                 ],
             },
-        ],
+        ], ..Default::default()
     };
     let reg = FakeReg::git(&[
         (
@@ -1040,7 +1040,7 @@ fn c3_direct_transitive_index_and_registry() -> (Index, FakeReg) {
                     idx_ver("transitive", "2.0.0", transitive_body),
                 ],
             },
-        ],
+        ], ..Default::default()
     };
     let reg = FakeReg::git(&[
         (
@@ -1204,7 +1204,7 @@ fn is_root_direct_namespace_aware_direct_unit_coverage() {
     use milpa_solver::PackageProvider;
     use milpa_types::DepKey;
 
-    let empty_index = Index { packages: vec![] };
+    let empty_index = Index { packages: vec![], ..Default::default() };
     let empty_reg = FakeReg::git(&[]);
     let tmp = tempfile::tempdir().unwrap();
 
@@ -1320,7 +1320,7 @@ fn r6_namespace_index_and_registry() -> (Index, FakeReg) {
                 namespace: "ns2".to_string(),
                 versions: vec![idx_ver("ns2", "1.0.0"), idx_ver("ns2", "2.0.0")],
             },
-        ],
+        ], ..Default::default()
     };
 
     let carrier_kdl = "name \"carrier\"\nkind \"library\"\ndeps {\n    foo namespace=\"ns2\"\n}\n";
@@ -1783,7 +1783,7 @@ fn oci_index(content_hash: &str) -> Index {
                 yanked_reason: None,
                 published_at_raw: None,
             }],
-        }],
+        }], ..Default::default()
     }
 }
 
@@ -1923,7 +1923,7 @@ fn s5b_phase_a_error_slug_divergence_spike() {
                 yanked_reason: None,
                 published_at_raw: None,
             }],
-        }],
+        }], ..Default::default()
     };
     // Manifest: requires foo >= 2.0.0 — unsatisfiable given the index.
     let m = manifest(vec![named_dep("foo", Some(">= 2.0.0"))]);
@@ -3097,7 +3097,7 @@ fn resolve_cross_origin_dedup_registry_and_git_identical_content() {
             "https://example.com/chronos.git",
             "v1.0.0",
             content_hash,
-        )],
+        )], ..Default::default()
     };
     let reg = FakeReg::git(&[
         ("https://example.com/chronos.git", "v1.0.0", milpa_kdl("sha-registry", shared)),
@@ -3177,7 +3177,7 @@ fn resolve_cross_origin_no_dedup_for_different_content() {
             "https://example.com/chronos.git",
             "v1.0.0",
             content_hash,
-        )],
+        )], ..Default::default()
     };
     let reg = FakeReg::git(&[
         ("https://example.com/chronos.git", "v1.0.0", milpa_kdl("sha-registry", registry_body)),
@@ -4602,7 +4602,7 @@ fn b5_index(specs: &[(&str, &[&str])]) -> Index {
         packages: specs
             .iter()
             .map(|(name, versions)| multi_version_package(name, versions))
-            .collect(),
+            .collect(), ..Default::default()
     }
 }
 
@@ -4851,7 +4851,7 @@ fn d3_index(name: &str, versions: &[(&str, &str, Option<&str>)]) -> Index {
                 .iter()
                 .map(|(ver, body, published_at)| d3_ver(name, ver, body, *published_at))
                 .collect(),
-        }],
+        }], ..Default::default()
     }
 }
 
@@ -5458,7 +5458,7 @@ fn resolve_a4_version_unknown_constrained_names_both_real_constrainers() {
         packages: vec![
             single_ver("chronos", chronos_url, chronos_body),
             single_ver("asyncdispatch", async_url, async_body),
-        ],
+        ], ..Default::default()
     };
 
     let m = manifest(vec![
@@ -5565,7 +5565,7 @@ fn lattice_index_ver(name: &str, url: &str, refp: &str, version: &str, body: &st
                 yanked_reason: None,
                 published_at_raw: None,
             }],
-        }],
+        }], ..Default::default()
     }
 }
 
@@ -6073,7 +6073,7 @@ fn lattice_index_oci(name: &str, content_hash: &str) -> Index {
                 yanked_reason: None,
                 published_at_raw: None,
             }],
-        }],
+        }], ..Default::default()
     }
 }
 
@@ -6277,7 +6277,7 @@ fn lattice_index_oci_with_source(name: &str, content_hash: &str, source_url: &st
                 yanked_reason: None,
                 published_at_raw: None,
             }],
-        }],
+        }], ..Default::default()
     }
 }
 
@@ -6763,7 +6763,7 @@ fn resolve_s5_rekey_bare_root_and_qualified_transitive_collapse_to_one_node() {
             name: "foo".to_string(),
             namespace: "acme".to_string(),
             versions: versions.iter().map(|(ver, url)| idx_ver(ver, url)).collect(),
-        }],
+        }], ..Default::default()
     };
     let wrapper_kdl = "name \"wrapper\"\nkind \"library\"\ndeps {\n    foo namespace=\"acme\" \">= 1.0.0\"\n}\n";
     let mut mocks: Vec<(&str, &str, Mock)> = versions
@@ -7405,7 +7405,7 @@ fn widget_index_two_versions(hash_v1: &str, hash_v2: &str) -> Index {
                     published_at_raw: None,
                 },
             ],
-        }],
+        }], ..Default::default()
     }
 }
 

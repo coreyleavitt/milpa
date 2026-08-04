@@ -27,6 +27,7 @@ use milpa_types::{AttestationKind, EntryAttestation, Provenance, RekorRef};
 // compile unchanged.
 pub use milpa_types::{parse_iso8601_timestamp, Timestamp};
 
+use crate::epoch_commitment::EpochCommitmentStatus;
 use crate::error::CoreError;
 
 /// The only index schema version this milpa understands. A document declaring a
@@ -255,9 +256,18 @@ pub enum BareLookup {
 }
 
 /// The parsed registry index, in document order for deterministic iteration.
+///
+/// `epoch_commitment_status` — the S-EpochCommitment index-gate phase's
+/// output (`rfc-attestation-v1-normative.md` §6, D14; registry-protocol
+/// §3.4.8). Defaults to `Unarmed` — `Index::parse` itself never computes
+/// this (parsing is pure, offline, and crypto-free); the caller that owns
+/// sidecar acquisition + composed verification (the CLI / `index_cache.rs`,
+/// once per resolve) overwrites this field with the real computed status
+/// AFTER `Index::parse` returns. Mirrors `registry.py::Index.epoch_commitment_status`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Index {
     pub packages: Vec<Package>,
+    pub epoch_commitment_status: EpochCommitmentStatus,
 }
 
 impl Index {
@@ -367,7 +377,7 @@ impl Index {
         for diag in &diagnostics {
             eprintln!("[milpa] warning: {diag}");
         }
-        Ok(Index { packages })
+        Ok(Index { packages, epoch_commitment_status: EpochCommitmentStatus::Unarmed })
     }
 
     /// Look up by bare `name` (registry-protocol §3.2). Raise-free.

@@ -666,7 +666,7 @@ fn resolve_bare_collision_is_ambiguous() {
         packages: vec![
             pkg("bar", "ns1", vec![ver("1.0.0", ID1, vec![git()])]),
             pkg("bar", "ns2", vec![ver("1.0.0", ID1, vec![git()])]),
-        ],
+        ], ..Default::default()
     };
     assert_eq!(
         idx.resolve_named_all("bar", &full(), None)
@@ -679,7 +679,7 @@ fn resolve_bare_collision_is_ambiguous() {
 #[test]
 fn resolve_no_satisfying_version() {
     let idx = Index {
-        packages: vec![pkg("bar", "", vec![ver("1.0.0", ID1, vec![git()])])],
+        packages: vec![pkg("bar", "", vec![ver("1.0.0", ID1, vec![git()])])], ..Default::default()
     };
     let err = idx
         .resolve_named_all("bar", &gte(">= 2.0.0"), Some(">= 2.0.0"))
@@ -690,7 +690,7 @@ fn resolve_no_satisfying_version() {
 #[test]
 fn resolve_all_provenance_less_is_no_provenance() {
     let idx = Index {
-        packages: vec![pkg("bar", "", vec![ver("1.0.0", ID1, vec![])])],
+        packages: vec![pkg("bar", "", vec![ver("1.0.0", ID1, vec![])])], ..Default::default()
     };
     let err = idx.resolve_named_all("bar", &full(), None).unwrap_err();
     assert_eq!(err.code(), "TNG-NO-PROVENANCE");
@@ -706,7 +706,7 @@ fn resolve_returns_satisfying_newest_first() {
                 ver("2.0.0", ID1, vec![git()]),
                 ver("1.0.0", ID1, vec![git()]),
             ],
-        )],
+        )], ..Default::default()
     };
     let got = idx.resolve_named_all("bar", &full(), None).unwrap();
     assert_eq!(got.len(), 2);
@@ -737,7 +737,7 @@ fn bare_yanked_version_excluded_from_enumeration() {
                 yanked_ver("2.0.0", ID1, vec![git()], Some("ships a vulnerable bearssl pin")),
                 ver("1.0.0", ID1, vec![git()]),
             ],
-        )],
+        )], ..Default::default()
     };
     let got = idx.resolve_named_all("bar", &full(), None).unwrap();
     assert_eq!(got.len(), 1);
@@ -754,7 +754,7 @@ fn bare_all_yanked_raises_no_satisfying_version() {
                 yanked_ver("2.0.0", ID1, vec![git()], Some("ships a vulnerable bearssl pin")),
                 yanked_ver("1.0.0", ID1, vec![git()], None),
             ],
-        )],
+        )], ..Default::default()
     };
     let err = idx.resolve_named_all("bar", &full(), None).unwrap_err();
     assert_eq!(err.code(), "TNG-NO-SATISFYING-VERSION");
@@ -772,7 +772,7 @@ fn bare_no_satisfying_version_names_yanked_candidates() {
                 vec![git()],
                 Some("ships a vulnerable bearssl pin"),
             )],
-        )],
+        )], ..Default::default()
     };
     let err = idx.resolve_named_all("bar", &full(), None).unwrap_err();
     assert_eq!(err.code(), "TNG-NO-SATISFYING-VERSION");
@@ -784,7 +784,7 @@ fn bare_no_satisfying_version_names_yanked_candidates() {
 #[test]
 fn bare_no_yank_no_yanked_excluded_segment() {
     let idx = Index {
-        packages: vec![pkg("bar", "", vec![ver("1.0.0", ID1, vec![git()])])],
+        packages: vec![pkg("bar", "", vec![ver("1.0.0", ID1, vec![git()])])], ..Default::default()
     };
     let err = idx
         .resolve_named_all("bar", &gte(">= 2.0.0"), Some(">= 2.0.0"))
@@ -805,7 +805,7 @@ fn yanked_version_excluded_even_when_only_match_for_constraint() {
                 yanked_ver("2.0.0", ID1, vec![git()], None),
                 ver("1.0.0", ID1, vec![git()]),
             ],
-        )],
+        )], ..Default::default()
     };
     let err = idx
         .resolve_named_all("bar", &gte("== 2.0.0"), Some("== 2.0.0"))
@@ -829,7 +829,7 @@ fn bare_yanked_excluded_diagnostic_scoped_to_satisfying_versions() {
                 yanked_ver("2.5.0", ID1, vec![git()], Some("ships a vulnerable bearssl pin")),
                 yanked_ver("1.0.0", ID1, vec![git()], None),
             ],
-        )],
+        )], ..Default::default()
     };
     let err = idx
         .resolve_named_all("bar", &gte("^2.0.0"), Some("^2.0.0"))
@@ -855,7 +855,7 @@ fn qualified_yanked_version_excluded_from_enumeration() {
                 yanked_ver("2.0.0", ID1, vec![git()], Some("ships a vulnerable bearssl pin")),
                 ver("1.0.0", ID1, vec![git()]),
             ],
-        )],
+        )], ..Default::default()
     };
     let got = idx
         .resolve_named_all_qualified("core", "bar", &full(), None)
@@ -874,7 +874,7 @@ fn qualified_all_yanked_raises_no_satisfying_version() {
                 yanked_ver("2.0.0", ID1, vec![git()], Some("ships a vulnerable bearssl pin")),
                 yanked_ver("1.0.0", ID1, vec![git()], None),
             ],
-        )],
+        )], ..Default::default()
     };
     let err = idx
         .resolve_named_all_qualified("core", "bar", &full(), None)
@@ -894,7 +894,7 @@ fn qualified_no_satisfying_version_names_yanked_candidates() {
                 vec![git()],
                 Some("ships a vulnerable bearssl pin"),
             )],
-        )],
+        )], ..Default::default()
     };
     let err = idx
         .resolve_named_all_qualified("core", "bar", &full(), None)

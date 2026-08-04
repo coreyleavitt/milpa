@@ -984,7 +984,7 @@ fn cmd_verify(
         // maybe_index() returns None when offline/unreachable (treats as absent).
         // Pass verify_index_policy (captured above from manifest) and the threaded flags.
         let verify_history_policy = effective_index_history_policy(&verify_index_history_policy);
-        let index_opt = maybe_index(no_index, &verify_index_policy, verify_index_signer, verify_index_bundle, require_attested_index, refresh_index, &verify_history_policy)?;
+        let index_opt = maybe_index(no_index, &verify_index_policy, verify_index_signer, verify_index_bundle, require_attested_index, refresh_index, &verify_history_policy, &verify_entry_trust_policy, require_attested_entries)?;
         if index_opt.is_none() {
             // Offline / unreachable.
             if strict {
@@ -1375,7 +1375,7 @@ fn cmd_fetch(
             resolve_workspace_frozen(&ws, &lock, &build_store(), &deps_dir)?
         } else {
             // SSOT (RD-M4): maybe_index_for_workspace collapses extract+call.
-            let index = maybe_index_for_workspace(no_index, &ws, require_attested_index, refresh_index)?;
+            let index = maybe_index_for_workspace(no_index, &ws, require_attested_index, refresh_index, &ws.entry_trust_policy, require_attested_entries)?;
             let profile = profile_from_env();
             // §8: reuse existing pins (idempotent repeated fetch — see single-pkg path).
             let prior = maybe_prior_lockfile(&dir.join("milpa.lock"));
@@ -1504,7 +1504,7 @@ fn cmd_fetch(
         )?;
         Milpa.resolve_frozen(&manifest, &lock, &build_store(), &deps_dir)?
     } else {
-        let index = maybe_index_for_manifest(no_index, &manifest, require_attested_index, refresh_index)?;
+        let index = maybe_index_for_manifest(no_index, &manifest, require_attested_index, refresh_index, &manifest.entry_trust_policy, require_attested_entries)?;
         let profile = profile_from_env();
         // §8: reuse the existing lockfile's pins so repeated `fetch`/`lock` runs
         // are idempotent and a silently-moved ref / substituted archive is caught.
@@ -1797,7 +1797,7 @@ fn cmd_update(dir: &Path, strategy_cli: Option<Strategy>, rest: &[String], no_in
     if let ManifestDoc::Workspace(_) = doc {
         let ws = load_workspace(dir)?;
         // SSOT (RD-M4): maybe_index_for_workspace collapses extract+call.
-        let index = maybe_index_for_workspace(no_index, &ws, require_attested_index, refresh_index)?;
+        let index = maybe_index_for_workspace(no_index, &ws, require_attested_index, refresh_index, &ws.entry_trust_policy, require_attested_entries)?;
         let profile = profile_from_env();
         let ws_deps_dir = dir.join("_deps");
         // P3a (RFC per-entry-attestation.md §8): entry-trust gate, online/index-loading verbs.
@@ -1856,7 +1856,7 @@ fn cmd_update(dir: &Path, strategy_cli: Option<Strategy>, rest: &[String], no_in
         let ws_lock_path = ws_root.join("milpa.lock");
         let ws_deps_dir = ws_root.join("_deps");
         // SSOT (RD-M4): maybe_index_for_workspace collapses extract+call.
-        let index = maybe_index_for_workspace(no_index, &ws, require_attested_index, refresh_index)?;
+        let index = maybe_index_for_workspace(no_index, &ws, require_attested_index, refresh_index, &ws.entry_trust_policy, require_attested_entries)?;
         let profile = profile_from_env();
         // P3a (RFC per-entry-attestation.md §8): entry-trust gate, online/index-loading verbs.
         let entry_trust = build_entry_trust_gate(
@@ -1927,7 +1927,7 @@ fn cmd_update(dir: &Path, strategy_cli: Option<Strategy>, rest: &[String], no_in
     let ManifestDoc::Package(manifest) = doc else {
         unreachable!("workspace handled above");
     };
-    let index = maybe_index_for_manifest(no_index, &manifest, require_attested_index, refresh_index)?;
+    let index = maybe_index_for_manifest(no_index, &manifest, require_attested_index, refresh_index, &manifest.entry_trust_policy, require_attested_entries)?;
     let profile = profile_from_env();
     let dep_decl_store_owned = maybe_dep_decl_store(no_index);
     let dep_decl_store: Option<&dyn DepDeclStore> = dep_decl_store_owned.as_deref();
@@ -2101,7 +2101,7 @@ fn cmd_add(dir: &Path, strategy_cli: Option<Strategy>, rest: &[String], no_index
         let ws_deps_dir = ws_root.join("_deps");
         let ws_lock_path = ws_root.join("milpa.lock");
         // SSOT (RD-M4): maybe_index_for_workspace collapses extract+call.
-        let index = maybe_index_for_workspace(no_index, &ws, require_attested_index, refresh_index)?;
+        let index = maybe_index_for_workspace(no_index, &ws, require_attested_index, refresh_index, &ws.entry_trust_policy, require_attested_entries)?;
         let profile = profile_from_env();
         // B7 (RFC resolution-semantics.md §3 Axis B): thread the SHARED
         // workspace lock as `prior` so adding a dep to one member re-resolves
@@ -2239,7 +2239,7 @@ fn cmd_add(dir: &Path, strategy_cli: Option<Strategy>, rest: &[String], no_index
 
     let deps_dir = dir.join("_deps");
     let registry = build_registry();
-    let index = maybe_index_for_manifest(no_index, &existing, require_attested_index, refresh_index)?;
+    let index = maybe_index_for_manifest(no_index, &existing, require_attested_index, refresh_index, &existing.entry_trust_policy, require_attested_entries)?;
     let profile = profile_from_env();
     // B7 (RFC resolution-semantics.md §3 Axis B): thread the committed lock as
     // `prior` so minimal-change re-resolution applies — the new dep resolves
@@ -2432,7 +2432,7 @@ fn cmd_workspace_add_member(
     // Delegate to apply_workspace_manifest_change.
     let registry = build_registry();
     // SSOT (RD-M4): maybe_index_for_workspace collapses extract+call.
-    let index = maybe_index_for_workspace(no_index, &current_ws, require_attested_index, refresh_index)?;
+    let index = maybe_index_for_workspace(no_index, &current_ws, require_attested_index, refresh_index, &current_ws.entry_trust_policy, false)?;
     let profile = profile_from_env();
     // B7 (RFC resolution-semantics.md §3 Axis B): thread the SHARED workspace
     // lock as `prior` — adding a member re-resolves minimally, so the OTHER
@@ -2595,7 +2595,7 @@ fn cmd_workspace_remove_member(
     // Delegate to apply_workspace_manifest_change.
     let registry = build_registry();
     // SSOT (RD-M4): maybe_index_for_workspace collapses extract+call.
-    let index = maybe_index_for_workspace(no_index, &current_ws, require_attested_index, refresh_index)?;
+    let index = maybe_index_for_workspace(no_index, &current_ws, require_attested_index, refresh_index, &current_ws.entry_trust_policy, false)?;
     let profile = profile_from_env();
     // B7 (RFC resolution-semantics.md §3 Axis B): thread the SHARED workspace
     // lock as `prior` — removing a member re-resolves minimally, so remaining
@@ -2898,7 +2898,7 @@ fn cmd_remove(dir: &Path, strategy_cli: Option<Strategy>, rest: &[String], no_in
         let ws_with_override = milpa_core::load_workspace_with_member_override(&ws, dir, proposed_member.clone())?;
         let ws_deps_dir = ws_root.join("_deps");
         // SSOT (RD-M4): maybe_index_for_workspace collapses extract+call.
-        let index = maybe_index_for_workspace(no_index, &ws, require_attested_index, refresh_index)?;
+        let index = maybe_index_for_workspace(no_index, &ws, require_attested_index, refresh_index, &ws.entry_trust_policy, false)?;
         let profile = profile_from_env();
         // C3/R9 (resolution-semantics RFC §3 Axis C / D-C2): resolve the
         // EFFECTIVE strategy (+ whether it was explicitly sourced) against
@@ -2996,7 +2996,7 @@ fn cmd_remove(dir: &Path, strategy_cli: Option<Strategy>, rest: &[String], no_in
 
     let deps_dir = dir.join("_deps");
     let registry = build_registry();
-    let index = maybe_index_for_manifest(no_index, &existing, require_attested_index, refresh_index)?;
+    let index = maybe_index_for_manifest(no_index, &existing, require_attested_index, refresh_index, &existing.entry_trust_policy, false)?;
     let profile = profile_from_env();
     // C3/R9: resolve the EFFECTIVE strategy (+ whether it was explicitly
     // sourced) against the current manifest (`prior_lock`, above, is used
@@ -3216,6 +3216,8 @@ fn maybe_index(
     require_attested_index: bool,
     refresh_index: bool,
     index_history_policy: &milpa_manifest::TrustPolicy,
+    entry_trust_policy: &milpa_manifest::TrustPolicy,
+    require_attested_entries: bool,
 ) -> Result<Option<Index>, MilpaError> {
     // --no-index flag OR present-but-empty MILPA_INDEX_URL → explicitly no
     // index (the flag overrides any configured index). Absent → default URL.
@@ -3251,8 +3253,8 @@ fn maybe_index(
     // seam-vs-S4b dispatch, config+verifier construction.
     use milpa_core::BundleHttpGet;
     let gate = build_index_trust_gate(manifest_policy, manifest_signer, manifest_bundle, require_attested_index, &url)?;
-    match gate {
-        None => load_index_raw(&url, &http, now, None, None, None, refresh_index, index_history_policy),
+    let mut index_opt = match &gate {
+        None => load_index_raw(&url, &http, now, None, None, None, refresh_index, index_history_policy)?,
         Some(active) => load_index_raw(
             &url,
             &http,
@@ -3262,8 +3264,149 @@ fn maybe_index(
             Some(active.bundle_fn.as_ref() as BundleHttpGet<'_>),
             refresh_index,
             index_history_policy,
-        ),
+        )?,
+    };
+
+    // S-EpochCommitment (rfc-attestation-v1-normative.md §6, D14-D18;
+    // registry-protocol §3.4.8/§3.4.9): the index-gate epoch-commitment
+    // phase, once per resolve, after index-trust's own verification
+    // succeeds and BEFORE any candidate is selected. Mirrors
+    // `cli.py::_apply_epoch_commitment_phase`'s wiring inside
+    // `_load_index_for_verb`.
+    //
+    // JUDGMENT CALL (flagged, not spec-mandated, mirrors the Python
+    // docstring): this phase runs ONLY when index-trust is active for this
+    // invocation (`gate` is `Some`) — the phase's crypto has no trust root
+    // to verify against when index-trust itself is off, so gating it on
+    // index-trust's own on/off state is the defensible reading adopted
+    // here. An index that HAS armed a commitment while a consumer runs
+    // with index-trust off is therefore silently treated as `Unarmed` by
+    // this consumer — a documented residual, not a silent security
+    // downgrade of a check the consumer opted into.
+    if let (Some(active), Some(index)) = (gate.as_ref(), index_opt.as_mut()) {
+        apply_epoch_commitment_phase(index, &active.cfg.trust_bundle, &url, entry_trust_policy, index_history_policy)?;
     }
+
+    Ok(index_opt)
+}
+
+/// Compute + enforce the S-EpochCommitment index-gate phase for one
+/// already-loaded `Index` (mutated in place — `Index` is not frozen).
+/// Mirrors `cli.py::_apply_epoch_commitment_phase`.
+///
+/// Reuses index-trust's already-resolved trust ROOT (`trust_bundle`) — the
+/// epoch commitment is authenticated against a DEDICATED re-arm signer
+/// identity (D15), never the whole-index signer, but the Fulcio/Rekor trust
+/// root is the same one index-trust resolved for this invocation (spec
+/// §3.4.8: "resolved the same way").
+///
+/// # Errors
+/// - `TNG-INDEX-EPOCH-COMMITMENT-INVALID` — unconditional abort on
+///   `ArmingInvalid` (D14).
+/// - `TNG-INDEX-EPOCH-RATCHET-REQUIRED` — the D18 co-requirement (`Armed` +
+///   `entry-trust "strict"` requires `index-history "strict"`).
+fn apply_epoch_commitment_phase(
+    index: &mut Index,
+    trust_bundle: &milpa_core::index_trust::TrustBundle,
+    index_url: &str,
+    entry_trust_policy: &milpa_manifest::TrustPolicy,
+    index_history_policy: &milpa_manifest::TrustPolicy,
+) -> Result<(), MilpaError> {
+    use milpa_core::epoch_commitment::{
+        check_epoch_ratchet_requirement, enforce_epoch_commitment, DEFAULT_REARM_SIGNER,
+    };
+    use milpa_core::index_cache::{load_epoch_commitment_status, read_cached_epoch_commitment_pointer};
+    use milpa_core::index_trust::{IndexBundleVerifier, MockVerifier, SigstoreVerifier, VerificationResult};
+
+    let pointer = read_cached_epoch_commitment_pointer(index_url, &index_cache_dir());
+
+    // Verifier: MockVerifier from the conformance seam (mirrors
+    // MILPA_INDEX_TRUST_MOCK_VERIFIER's file://-only guard exactly), else
+    // SigstoreVerifier — the SAME production class index-trust uses (only
+    // `expected_signer` differs).
+    let mock_result_str = std::env::var("MILPA_INDEX_EPOCH_MOCK_VERIFIER")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    let verifier: Box<dyn IndexBundleVerifier> = match mock_result_str {
+        Some(mock_str) => {
+            if !index_url.starts_with("file://") {
+                return Err(MilpaError::Core(CoreError::Tianguis(
+                    "MILPA-INTERNAL",
+                    "MILPA_INDEX_EPOCH_MOCK_VERIFIER is conformance-internal and only \
+                     honored for file:// index URLs (all conformance fixtures use \
+                     file://; production indexes are https). This variable must not \
+                     be set in production or with non-file:// index URLs."
+                        .to_string(),
+                )));
+            }
+            let mock_result = VerificationResult::from_value(mock_str.trim()).ok_or_else(|| {
+                MilpaError::Core(CoreError::Tianguis(
+                    "MILPA-INTERNAL",
+                    format!(
+                        "MILPA_INDEX_EPOCH_MOCK_VERIFIER={mock_str:?} is not a valid \
+                         VerificationResult wire string (expected one of: trusted, \
+                         sig-invalid, digest-mismatch, signer-mismatch, bundle-stale, \
+                         bundle-missing, bundle-malformed). Test seam must never \
+                         fail-open silently."
+                    ),
+                ))
+            })?;
+            Box::new(MockVerifier::new(mock_result))
+        }
+        None => Box::new(SigstoreVerifier),
+    };
+
+    // Signer: a DEDICATED re-arm identity (D15), overridable independently
+    // of the whole-index signer (MILPA_INDEX_TRUST_SIGNER is NOT reused
+    // here on purpose). No manifest-node override exists yet (env-only for
+    // this slice).
+    let expected_signer = std::env::var("MILPA_INDEX_EPOCH_SIGNER")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_REARM_SIGNER.to_string());
+
+    let http_get = build_commitment_http_fn();
+    let status = load_epoch_commitment_status(
+        index_url,
+        pointer.as_deref(),
+        &epoch_commitment_cache_dir(),
+        http_get.as_ref(),
+        verifier.as_ref(),
+        trust_bundle,
+        &expected_signer,
+    );
+    index.epoch_commitment_status = status.clone();
+
+    enforce_epoch_commitment(&status)?;
+    check_epoch_ratchet_requirement(&status, entry_trust_policy, index_history_policy)?;
+    Ok(())
+}
+
+/// `$XDG_CACHE_HOME/milpa/epoch-commitment/` (default
+/// `~/.cache/milpa/epoch-commitment/`) — mirrors [`index_cache_dir`] with a
+/// dedicated sub-directory (the store's native content-address key, `C`).
+fn epoch_commitment_cache_dir() -> PathBuf {
+    cache_home().join("milpa").join("epoch-commitment")
+}
+
+/// Build the curl-based epoch-commitment sidecar HTTP fetcher closure.
+/// Mirrors [`build_bundle_http_fn`], but this artifact class has no
+/// degraded "missing sidecar" mode (registry-protocol §3.4.9 — the on-index
+/// pointer being present is itself the unconditional trigger) so failures
+/// collapse to a single generic error string rather than distinguishing 404
+/// from other network failures.
+fn build_commitment_http_fn() -> Box<dyn Fn(&str) -> Result<Vec<u8>, String>> {
+    Box::new(|url: &str| -> Result<Vec<u8>, String> {
+        let out = std::process::Command::new("curl")
+            .args(["-fsSL", url])
+            .output()
+            .map_err(|e| format!("curl: {e}"))?;
+        if out.status.success() {
+            Ok(out.stdout)
+        } else {
+            Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+        }
+    })
 }
 
 /// An active trust gate: config + verifier + bundle transport, assembled for one index load.
@@ -3884,24 +4027,45 @@ fn workspace_index_trust_fields(
 /// RD-M4 SSOT: extract a loaded workspace's index-trust fields and call
 /// `maybe_index` in one place, so a future `maybe_index` signature change
 /// touches this one wrapper instead of every workspace call site.
+/// `entry_trust_policy` / `require_attested_entries` feed ONLY the
+/// S-EpochCommitment D18 co-requirement check inside `maybe_index` — they do
+/// not otherwise affect index loading (mirrors `cli.py`'s
+/// `_apply_epoch_commitment_phase` reading the entry-trust axis
+/// independently of whether an `EntryTrustConfig` gate is actually built).
+#[allow(clippy::too_many_arguments)]
 fn maybe_index_for_workspace(
     no_index: bool,
     ws: &LoadedWorkspace,
     require_attested_index: bool,
     refresh_index: bool,
+    entry_trust_policy: &milpa_manifest::TrustPolicy,
+    require_attested_entries: bool,
 ) -> Result<Option<Index>, MilpaError> {
     let (policy, signer, bundle) = workspace_index_trust_fields(ws);
     let history_policy = effective_index_history_policy(&ws.index_history_policy);
-    maybe_index(no_index, &policy, signer, bundle, require_attested_index, refresh_index, &history_policy)
+    maybe_index(
+        no_index,
+        &policy,
+        signer,
+        bundle,
+        require_attested_index,
+        refresh_index,
+        &history_policy,
+        entry_trust_policy,
+        require_attested_entries,
+    )
 }
 
 /// RD-M4 SSOT: extract a single-package manifest's index-trust fields and
 /// call `maybe_index` in one place, mirroring `maybe_index_for_workspace`.
+#[allow(clippy::too_many_arguments)]
 fn maybe_index_for_manifest(
     no_index: bool,
     m: &Manifest,
     require_attested_index: bool,
     refresh_index: bool,
+    entry_trust_policy: &milpa_manifest::TrustPolicy,
+    require_attested_entries: bool,
 ) -> Result<Option<Index>, MilpaError> {
     let history_policy = effective_index_history_policy(&m.index_history_policy);
     maybe_index(
@@ -3912,6 +4076,8 @@ fn maybe_index_for_manifest(
         require_attested_index,
         refresh_index,
         &history_policy,
+        entry_trust_policy,
+        require_attested_entries,
     )
 }
 
@@ -6750,7 +6916,7 @@ mod tests {
         unsafe { std::env::set_var("MILPA_INDEX_URL", &url) };
         unsafe { std::env::set_var("XDG_CACHE_HOME", tmp.path()) };
 
-        let result = maybe_index(false, &milpa_manifest::TrustPolicy::Off, None, None, false, false, &milpa_manifest::TrustPolicy::Off);
+        let result = maybe_index(false, &milpa_manifest::TrustPolicy::Off, None, None, false, false, &milpa_manifest::TrustPolicy::Off, &milpa_manifest::TrustPolicy::Off, false);
 
         unsafe { std::env::remove_var("MILPA_INDEX_URL") };
         unsafe { std::env::remove_var("XDG_CACHE_HOME") };
@@ -6783,7 +6949,7 @@ mod tests {
         };
         unsafe { std::env::set_var("XDG_CACHE_HOME", tmp.path()) };
 
-        let result = maybe_index(false, &milpa_manifest::TrustPolicy::Off, None, None, false, false, &milpa_manifest::TrustPolicy::Off);
+        let result = maybe_index(false, &milpa_manifest::TrustPolicy::Off, None, None, false, false, &milpa_manifest::TrustPolicy::Off, &milpa_manifest::TrustPolicy::Off, false);
 
         unsafe { std::env::remove_var("MILPA_INDEX_URL") };
         unsafe { std::env::remove_var("XDG_CACHE_HOME") };
@@ -6878,7 +7044,7 @@ mod tests {
         unsafe { std::env::set_var("MILPA_INDEX_URL", "https://example.com/index.kdl") };
         unsafe { std::env::set_var("MILPA_INDEX_TRUST_MOCK_VERIFIER", "trusted") };
 
-        let result = maybe_index(false, &milpa_manifest::TrustPolicy::Warn, None, None, false, false, &milpa_manifest::TrustPolicy::Off);
+        let result = maybe_index(false, &milpa_manifest::TrustPolicy::Warn, None, None, false, false, &milpa_manifest::TrustPolicy::Off, &milpa_manifest::TrustPolicy::Off, false);
 
         unsafe { std::env::remove_var("MILPA_INDEX_URL") };
         unsafe { std::env::remove_var("MILPA_INDEX_TRUST_MOCK_VERIFIER") };
@@ -6906,7 +7072,7 @@ mod tests {
         unsafe { std::env::set_var("MILPA_INDEX_URL", "file:///nonexistent-mock-seam-test.kdl") };
         unsafe { std::env::set_var("MILPA_INDEX_TRUST_MOCK_VERIFIER", "trusted") };
 
-        let result = maybe_index(false, &milpa_manifest::TrustPolicy::Warn, None, None, false, false, &milpa_manifest::TrustPolicy::Off);
+        let result = maybe_index(false, &milpa_manifest::TrustPolicy::Warn, None, None, false, false, &milpa_manifest::TrustPolicy::Off, &milpa_manifest::TrustPolicy::Off, false);
 
         unsafe { std::env::remove_var("MILPA_INDEX_URL") };
         unsafe { std::env::remove_var("MILPA_INDEX_TRUST_MOCK_VERIFIER") };
@@ -6938,7 +7104,7 @@ mod tests {
         unsafe { std::env::set_var("MILPA_INDEX_URL", "file:///nonexistent-milpa-strict-test.kdl") };
         unsafe { std::env::remove_var("MILPA_INDEX_TRUST_MOCK_VERIFIER") };
 
-        let result = maybe_index(false, &milpa_manifest::TrustPolicy::Strict, None, None, false, false, &milpa_manifest::TrustPolicy::Off);
+        let result = maybe_index(false, &milpa_manifest::TrustPolicy::Strict, None, None, false, false, &milpa_manifest::TrustPolicy::Off, &milpa_manifest::TrustPolicy::Off, false);
 
         unsafe { std::env::remove_var("MILPA_INDEX_URL") };
         unsafe { std::env::remove_var("XDG_CACHE_HOME") };
@@ -6962,7 +7128,7 @@ mod tests {
         unsafe { std::env::set_var("MILPA_INDEX_URL", "file:///nonexistent-off-test.kdl") };
         unsafe { std::env::remove_var("MILPA_INDEX_TRUST_MOCK_VERIFIER") };
 
-        let result = maybe_index(false, &milpa_manifest::TrustPolicy::Off, None, None, false, false, &milpa_manifest::TrustPolicy::Off);
+        let result = maybe_index(false, &milpa_manifest::TrustPolicy::Off, None, None, false, false, &milpa_manifest::TrustPolicy::Off, &milpa_manifest::TrustPolicy::Off, false);
 
         unsafe { std::env::remove_var("MILPA_INDEX_URL") };
         unsafe { std::env::remove_var("XDG_CACHE_HOME") };

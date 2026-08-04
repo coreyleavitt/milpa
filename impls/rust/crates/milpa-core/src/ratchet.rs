@@ -20,7 +20,9 @@ use milpa_types::{Provenance, RekorRef};
 use sha2::{Digest, Sha256};
 
 // ---------------------------------------------------------------------------
-// Order-kind tags (registry-protocol §3.5.1) — five DISJOINT tags.
+// Order-kind tags (registry-protocol §3.5.1) — six DISJOINT tags (R12 added
+// `AppendOnce` alongside the original five for the `attestation-epoch-commitment`
+// root field).
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,6 +32,18 @@ pub enum OrderKind {
     AppendOnlyMultiset,
     AdvisoryMutable,
     OrdinalNonDecreasing,
+    /// registry-protocol §3.5.1's `attestation-epoch-commitment` root-field
+    /// row (R12): permits exactly one `absent -> value` transition, reading
+    /// identically to `SetOnce` in English but DELIBERATELY tagged
+    /// separately (the table-header note: distinct tags even for orders
+    /// that read alike) — this field's "value" is a content-address
+    /// POINTER into an externally composed-verified sidecar (§3.4.9), not a
+    /// self-contained claim the ratchet fold alone authenticates; sharing
+    /// `SetOnce`'s tag would wrongly suggest re-typing the EXISTING
+    /// `attestation-epoch` field's shape (timestamp -> commitment) is a
+    /// sanctioned migration path (it is not — D16). Mirrors
+    /// `ratchet.py::OrderKind.APPEND_ONCE`.
+    AppendOnce,
 }
 
 // ---------------------------------------------------------------------------
@@ -309,6 +323,7 @@ fn lattice() -> Vec<(&'static str, FieldSpec)> {
         // --- Root fields (document-level, reserved empty key) ---
         ("schema_version", spec(OrderKind::OrdinalNonDecreasing)),
         ("attestation-epoch", spec(OrderKind::SetOnce)),
+        ("attestation-epoch-commitment", spec(OrderKind::AppendOnce)),
     ]
 }
 
@@ -334,6 +349,17 @@ fn dominates_set_once(baseline: Option<&FieldValue>, candidate: Option<&FieldVal
             }
         }
     }
+}
+
+/// Same dominance LOGIC as [`dominates_set_once`] (absent -> anything is
+/// legal exactly once; any change thereafter, including a value-preserving
+/// re-encoding, violates) but kept as its own function per the `OrderKind`
+/// doc comment's "distinct tags even for orders that read alike" rule — a
+/// future divergence between the two orders (e.g. a re-arm exception) has a
+/// dedicated call site to change without touching `SetOnce`'s fields.
+/// Mirrors `ratchet.py::_dominates_append_once`.
+fn dominates_append_once(baseline: Option<&FieldValue>, candidate: Option<&FieldValue>) -> Option<&'static str> {
+    dominates_set_once(baseline, candidate)
 }
 
 fn as_i64(v: Option<&FieldValue>) -> i64 {
@@ -434,6 +460,7 @@ fn dispatch(kind: OrderKind, baseline: Option<&FieldValue>, candidate: Option<&F
         OrderKind::AttestationMonotone => dominates_attestation(baseline, candidate),
         OrderKind::AppendOnlyMultiset => dominates_multiset(baseline, candidate),
         OrderKind::AdvisoryMutable => dominates_advisory(baseline, candidate),
+        OrderKind::AppendOnce => dominates_append_once(baseline, candidate),
     }
 }
 

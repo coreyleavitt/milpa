@@ -440,6 +440,17 @@ impl CoreError {
             // atomic baseline-pair swap (never a silent no-op).
             "TNG-INDEX-NOT-CONFIGURED",
             "TNG-INDEX-BASELINE-WRITE-FAILED",
+            // S-EpochCommitment (rfc-attestation-v1-normative.md §6, D14-D18;
+            // registry-protocol §3.4.8/§3.4.9): the index-gate pre-epoch set
+            // arming phase. COMMITMENT-INVALID is the unconditional
+            // fail-closed abort on a present-but-unverifiable
+            // `attestation-epoch-commitment` pointer. RATCHET-REQUIRED is
+            // the D18 co-requirement config error (Armed + entry-trust
+            // "strict" without index-history "strict"). Emitted by
+            // `epoch_commitment::enforce_epoch_commitment` /
+            // `epoch_commitment::check_epoch_ratchet_requirement`.
+            "TNG-INDEX-EPOCH-COMMITMENT-INVALID",
+            "TNG-INDEX-EPOCH-RATCHET-REQUIRED",
         ]
     }
 }

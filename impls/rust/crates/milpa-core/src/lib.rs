@@ -27,6 +27,7 @@ pub mod discovery;
 pub mod edge_sources;
 pub mod entry_bundle_store;
 pub mod entry_trust;
+pub mod epoch_commitment;
 pub mod error;
 pub mod fetch;
 pub mod fetchers;

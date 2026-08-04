@@ -63,7 +63,11 @@ pub fn build_index_state(text: &str) -> Result<(Index, IndexState), MilpaError> 
     let index = Index::parse(text).map_err(MilpaError::from)?;
     let schema_version = raw_schema_version(text)?;
     let attestation_epoch = raw_attestation_epoch(text)?;
-    Ok((index.clone(), index_state_from(schema_version, attestation_epoch, &index)))
+    let attestation_epoch_commitment = raw_attestation_epoch_commitment(text)?;
+    Ok((
+        index.clone(),
+        index_state_from(schema_version, attestation_epoch, attestation_epoch_commitment, &index),
+    ))
 }
 
 /// The document-root `schema_version` integer, or `None` if absent (the
@@ -125,7 +129,47 @@ fn raw_attestation_epoch(text: &str) -> Result<Option<String>, MilpaError> {
     Ok(None)
 }
 
-fn index_state_from(schema_version: Option<i64>, attestation_epoch: Option<String>, index: &Index) -> IndexState {
+/// The document-root `attestation-epoch-commitment` string, or `None` if
+/// absent (registry-protocol §3.4.8's typed pointer / §3.5.1's `AppendOnce`
+/// root-field row, R12 — S-EpochCommitment, `rfc-attestation-v1-normative.md`
+/// §6, D16). A *new*, separate root field from the legacy `attestation-epoch`
+/// timestamp — see `raw_attestation_epoch`'s doc comment and D16: re-typing
+/// that existing field's shape would trip `TNG-INDEX-ROOT-MUTATED` for every
+/// consumer with an established baseline the moment a registry re-arms, so
+/// this is a sibling field with its own `OrderKind::AppendOnce` row instead.
+///
+/// Like `attestation-epoch`, this field is not part of any `package` node,
+/// so `Index::parse`'s own charset pass never sees it — this re-walk is the
+/// only site that extracts it, so it is also the only site that can
+/// charset-check it (registry-protocol §3.3 NORMATIVE). Mirrors
+/// `index_ratchet_seam.py::_raw_attestation_epoch_commitment`.
+pub(crate) fn raw_attestation_epoch_commitment(text: &str) -> Result<Option<String>, MilpaError> {
+    let doc = KdlDocument::parse(text)
+        .map_err(|e| tng("TNG-KDL-SYNTAX", format!("index KDL syntax error: {e}")))?;
+    for node in doc.nodes() {
+        if node.name().value() != "attestation-epoch-commitment" {
+            continue;
+        }
+        let pointer = node
+            .entries()
+            .iter()
+            .find(|e| e.name().is_none())
+            .and_then(|e| e.value().as_string())
+            .map(str::to_string);
+        if let Some(ref p) = pointer {
+            validate_no_control_chars(p, "attestation-epoch-commitment").map_err(MilpaError::from)?;
+        }
+        return Ok(pointer);
+    }
+    Ok(None)
+}
+
+fn index_state_from(
+    schema_version: Option<i64>,
+    attestation_epoch: Option<String>,
+    attestation_epoch_commitment: Option<String>,
+    index: &Index,
+) -> IndexState {
     let mut state = IndexState::new();
 
     let mut root = RatchetEntry::new();
@@ -134,6 +178,9 @@ fn index_state_from(schema_version: Option<i64>, attestation_epoch: Option<Strin
     }
     if let Some(e) = attestation_epoch {
         root = root.set("attestation-epoch", RawField::new(FieldValue::Str(e)));
+    }
+    if let Some(c) = attestation_epoch_commitment {
+        root = root.set("attestation-epoch-commitment", RawField::new(FieldValue::Str(c)));
     }
     state.insert(EntryKey::root(), root);
 

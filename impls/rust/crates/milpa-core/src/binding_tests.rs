@@ -340,7 +340,7 @@ fn solver_key_transitive_claim_extends_the_index() {
 
 #[test]
 fn canonical_key_for_requirement_url_matches_git_source_id_canonical() {
-    let index = Index { packages: vec![] };
+    let index = Index { packages: vec![], ..Default::default() };
     let key = canonical_key_for_requirement(
         "foo",
         None,
@@ -357,7 +357,7 @@ fn canonical_key_for_requirement_url_matches_git_source_id_canonical() {
 
 #[test]
 fn canonical_key_for_requirement_named_matches_registry_source_id_canonical() {
-    let index = Index { packages: vec![] };
+    let index = Index { packages: vec![], ..Default::default() };
     let key = canonical_key_for_requirement(
         "chronos",
         None,
@@ -376,7 +376,7 @@ fn canonical_key_for_requirement_named_matches_registry_source_id_canonical() {
 fn canonical_key_for_requirement_override_wins_over_own_declared_source() {
     use milpa_manifest::{Override, OverrideTarget};
 
-    let index = Index { packages: vec![] };
+    let index = Index { packages: vec![], ..Default::default() };
     let mut overrides = std::collections::BTreeMap::new();
     overrides.insert(
         "chronos".to_string(),
@@ -408,7 +408,7 @@ fn canonical_key_for_requirement_two_labels_same_url_produce_the_same_canonical_
     // requirement is declared under, the SAME (url, no-override) always
     // yields the SAME canonical key — this is what lets `candidates`/
     // `SolverDep::new` naturally collapse two labels for one origin.
-    let index = Index { packages: vec![] };
+    let index = Index { packages: vec![], ..Default::default() };
     let empty = std::collections::BTreeMap::new();
     let url = "https://github.com/coreyleavitt/nim-z3";
     let key_foo = canonical_key_for_requirement("foo", None, Some(url), None, &empty, &index, None, None).unwrap();

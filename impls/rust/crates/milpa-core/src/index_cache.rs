@@ -38,9 +38,11 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
+use crate::epoch_commitment::{evaluate_epoch_commitment, EpochCommitmentStatus};
 use crate::error::{CoreError, MilpaError};
-use crate::index_ratchet_seam::{evaluate_gate, parse_baseline_meta, BaselineMeta, GateDecision};
-use crate::index_trust::{enforce_index_trust, IndexBundleVerifier, IndexTrustConfig,
+use crate::index_ratchet_seam::{evaluate_gate, parse_baseline_meta, raw_attestation_epoch_commitment,
+                                 BaselineMeta, GateDecision};
+use crate::index_trust::{enforce_index_trust, IndexBundleVerifier, IndexTrustConfig, TrustBundle,
                           VerificationResult};
 use crate::registry::Index;
 use milpa_manifest::TrustPolicy;
@@ -126,6 +128,39 @@ pub fn get_bundle_url(index_url: &str) -> String {
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| derive_bundle_url(index_url))
+}
+
+/// Derive the epoch-commitment sidecar URL from the index URL
+/// (registry-protocol §3.4.9 NORMATIVE): identical derivation to
+/// [`derive_bundle_url`], substituting the `.epoch-commitment` suffix for
+/// `.bundle`.
+///
+/// Example (default index URL):
+///   `https://raw.githubusercontent.com/coreyleavitt/tianguis/main/index.kdl`
+///   → `https://raw.githubusercontent.com/coreyleavitt/tianguis/main/index.kdl.epoch-commitment`
+///
+/// Mirrors `index_cache.py::derive_commitment_url`.
+pub fn derive_commitment_url(index_url: &str) -> String {
+    // Shares derive_bundle_url's query/fragment-preserving suffix logic —
+    // there is no query-string component in practice for this artifact
+    // class, but the derivation stays uniform with the bundle sidecar's for
+    // the same robustness reason (naive string suffixing breaks `?ref=main`
+    // and trailing-slash URLs).
+    let query_pos = index_url.find('?');
+    let frag_pos = index_url.find('#');
+    let suffix_start = match (query_pos, frag_pos) {
+        (Some(q), Some(f)) => Some(q.min(f)),
+        (Some(q), None) => Some(q),
+        (None, Some(f)) => Some(f),
+        (None, None) => None,
+    };
+    match suffix_start {
+        Some(pos) => {
+            let (base, suffix) = index_url.split_at(pos);
+            format!("{base}.epoch-commitment{suffix}")
+        }
+        None => format!("{index_url}.epoch-commitment"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -472,6 +507,128 @@ pub fn write_baseline_pair(
             ),
         ))
     })
+}
+
+// ---------------------------------------------------------------------------
+// Epoch-commitment sidecar cache (S-EpochCommitment; rfc-attestation-v1-
+// normative.md §6, D14-D18; registry-protocol §3.4.8/§3.4.9). Content-
+// addressed by the commitment digest `C` itself (§3.4.9 NORMATIVE: "cached
+// as an immutable content-addressed artifact keyed by C ... no TTL, no
+// staleness concept"). A new `C` (a re-arm, or a different registry) is
+// simply a cache miss — there is no "stale key" comparison to perform,
+// unlike the single-slot bundle cache. Mirrors `index_cache.py`'s
+// epoch-commitment section.
+// ---------------------------------------------------------------------------
+
+/// `<cache_dir>/<C>.epoch-commitment` — the content-addressed cache file for
+/// the commitment sidecar whose digest is `pointer`.
+pub fn epoch_commitment_cache_path(pointer: &str, cache_dir: &Path) -> PathBuf {
+    cache_dir.join(format!("{pointer}.epoch-commitment"))
+}
+
+/// Read the `attestation-epoch-commitment` pointer off the CACHED index text
+/// for `index_url` (registry-protocol §3.4.8's typed pointer), reading from
+/// the ordinary (non-content-addressed) index cache at `cache_dir`.
+///
+/// `load_index`/`load_index_with_history` return only the parsed, validated
+/// `Index` — they do not surface document-root free-text fields (the same
+/// reason `index_ratchet_seam.rs` exists as a re-walk seam for
+/// `attestation-epoch`). This is a SECOND read of the same cached file the
+/// caller's index load just wrote or verified moments earlier — a
+/// pragmatic simplification over threading the pointer through every
+/// branch of the cache's four-state machine; safe because by the time a
+/// caller reaches this function, Layer-1 verification has already
+/// completed for this invocation, so the cached bytes are the same trusted
+/// bytes already served.
+///
+/// Returns `None` when there is no cache file yet, the bytes are not valid
+/// UTF-8, or the field extraction itself errors (mirrors
+/// `raw_attestation_epoch`'s posture: absence is not itself an error at
+/// this call site — a malformed index would already have raised earlier,
+/// inside the index load's own parse). Mirrors
+/// `index_cache.py::read_cached_epoch_commitment_pointer`.
+pub fn read_cached_epoch_commitment_pointer(index_url: &str, cache_dir: &Path) -> Option<String> {
+    let cache_file = cache_path_for(index_url, cache_dir);
+    let text = std::fs::read_to_string(&cache_file).ok()?;
+    raw_attestation_epoch_commitment(&text).ok().flatten()
+}
+
+/// A fetch transport for the epoch-commitment sidecar: maps a URL string to
+/// body bytes, or an error string on any failure (network error, 404 — this
+/// artifact class has no degraded "missing sidecar, proceed anyway" mode:
+/// the on-index pointer being present is itself the unconditional trigger,
+/// registry-protocol §3.4.9).
+pub type EpochCommitmentHttpGet<'a> = &'a dyn Fn(&str) -> Result<Vec<u8>, String>;
+
+/// The full acquisition + composed-verification orchestration for the
+/// S-EpochCommitment index-gate phase (registry-protocol §3.4.8/§3.4.9).
+///
+/// Thin I/O wrapper over [`crate::epoch_commitment::evaluate_epoch_commitment`]
+/// (pure): this function's ONLY job is "get the sidecar bytes from the
+/// content-addressed cache or the network, exactly like every other
+/// sidecar in this module" — the parse/digest/crypto logic lives in
+/// `epoch_commitment.rs`, not here (mirrors the `index_ratchet_seam.rs` /
+/// `index_cache.rs` split).
+///
+/// Acquisition:
+///   1. `pointer.is_none()` → no fetch attempted at all (`Unarmed`, computed
+///      by the pure function with `sidecar_bytes=None, fetch_failed=false`).
+///   2. Cache hit (`<cache_dir>/<pointer>.epoch-commitment` exists) → serve
+///      cached bytes, no network (content-addressed, no TTL, no
+///      re-verification against a wall-clock bound).
+///   3. Cache miss → ONE fetch attempt via `http_get` at
+///      `derive_commitment_url(index_url)`. A returned `Err` maps to
+///      `fetch_failed=true` (→ `ArmingInvalid`) — this function MUST NOT
+///      loop or retry (registry-protocol §3.4.9 NORMATIVE).
+///
+/// Persistence: the fetched bytes are cached ONLY when verification
+/// produces `Armed` (never persist bytes that failed to verify — an
+/// `ArmingInvalid` sidecar must be re-fetched, not remembered, so a
+/// transient/attacker-served bad sidecar self-corrects on the next
+/// invocation once the registry is fixed). Mirrors
+/// `index_cache.py::load_epoch_commitment_status`.
+#[allow(clippy::too_many_arguments)]
+pub fn load_epoch_commitment_status(
+    index_url: &str,
+    pointer: Option<&str>,
+    cache_dir: &Path,
+    http_get: EpochCommitmentHttpGet<'_>,
+    verifier: &dyn IndexBundleVerifier,
+    trust_bundle: &TrustBundle,
+    expected_signer: &str,
+) -> EpochCommitmentStatus {
+    let Some(pointer) = pointer else {
+        return evaluate_epoch_commitment(None, None, false, verifier, trust_bundle, expected_signer);
+    };
+
+    let cache_path = epoch_commitment_cache_path(pointer, cache_dir);
+    let mut sidecar_bytes: Option<Vec<u8>> = std::fs::read(&cache_path).ok();
+    let mut fetch_failed = false;
+    if sidecar_bytes.is_none() {
+        let sidecar_url = derive_commitment_url(index_url);
+        match http_get(&sidecar_url) {
+            Ok(bytes) => sidecar_bytes = Some(bytes),
+            Err(_) => fetch_failed = true,
+        }
+    }
+
+    let status = evaluate_epoch_commitment(
+        Some(pointer),
+        sidecar_bytes.as_deref(),
+        fetch_failed,
+        verifier,
+        trust_bundle,
+        expected_signer,
+    );
+
+    if matches!(status, EpochCommitmentStatus::Armed { .. }) {
+        if let Some(bytes) = &sidecar_bytes {
+            let _ = std::fs::create_dir_all(cache_dir);
+            let _ = atomic_write_bytes(&cache_path, bytes);
+        }
+    }
+
+    status
 }
 
 /// Force a network fetch of `url` and verify it under the effective
