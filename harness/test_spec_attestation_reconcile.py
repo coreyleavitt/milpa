@@ -156,6 +156,38 @@ class TestAttestationGateHedgesRetired(unittest.TestCase):
             msg="expected at least one cross-reference to the new §3.6 entry-trust gate section",
         )
 
+    def test_backdate_check_retired_not_deferred(self) -> None:
+        """S-Backdate (RFC D8, round 3): the epoch-boundary backdate purpose is
+        subsumed by the epoch-commitment's ArmingInvalid, and published_at is
+        informational-only, so v1 retires the TNG-ENTRY-BACKDATED-class check
+        rather than building a weaker, already-subsumed audit. §3.5.4 must
+        state this definitively — no longer deferring the disposition."""
+        self.assert_phrase_absent(
+            "disposition settled in `docs/rfc-attestation-v1-normative.md`",
+            "§3.5.4 no longer defers the backdate-check disposition to the RFC",
+        )
+        # The definitive retirement statement is present.
+        self.assertIn(
+            "`TNG-ENTRY-BACKDATED`-class check and no such slug",
+            self.text,
+            msg="§3.5.4 must definitively state v1 defines no TNG-ENTRY-BACKDATED check",
+        )
+        self.assertIn(
+            "retired rather than built",
+            self.text,
+            msg="§3.5.4 must state the check is retired (subsumed), not built",
+        )
+
+    def test_backdate_slug_stays_undefined_in_errors_catalog(self) -> None:
+        """The retired check has no slug: TNG-ENTRY-BACKDATED must NOT appear in
+        the spec-owned error catalog (bijection stays green without it)."""
+        errors_md = (_REPO_ROOT / "spec" / "errors.md").read_text(encoding="utf-8")
+        self.assertNotIn(
+            "TNG-ENTRY-BACKDATED",
+            errors_md,
+            msg="TNG-ENTRY-BACKDATED is retired, not defined — it must not enter errors.md",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

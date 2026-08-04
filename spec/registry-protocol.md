@@ -1985,12 +1985,23 @@ section's check entirely. `published_at` is informational metadata only:
 the per-entry attestation mandate's own epoch boundary (§3.6) is decided by
 the epoch-commitment mechanism's set membership, never by this field's
 value or its presence, so the mandate's correctness does not depend on
-closing that omission dodge here. Whether a dedicated
-`TNG-ENTRY-BACKDATED`-class check is built on top of this watermark, as a
-distinct, non-epoch-boundary chronological-consistency audit, is a
-disposition settled in `docs/rfc-attestation-v1-normative.md`; this section
-guarantees only the baseline semantics (the watermark definition above)
-such a check would consume.
+closing that omission dodge here.
+
+> NORMATIVE (no backdate check in v1 — retired): v1 defines **no**
+> `TNG-ENTRY-BACKDATED`-class check and no such slug. The epoch-boundary
+> backdate dodge this check was once proposed to close is already closed,
+> for free, by the epoch-commitment mechanism: an attacker who adds a
+> post-arming identity to the committed pre-epoch set `S` makes the
+> commitment fail composed verification (`hash(S) != C`), yielding
+> `ArmingInvalid` and aborting the resolve (§3.4.8) — the same fail-closed
+> path that closes the omission dodge. A separate watermark check keyed on
+> `published_at` would only re-audit a field the mandate treats as
+> informational, and would inherit both scope holes above (no TOFU
+> protection, trivially dodged by omission); building it would add a weaker,
+> already-subsumed check, so it is retired rather than built. The watermark
+> **definition** above is retained as a documented baseline property (a
+> future, out-of-scope chronological-consistency audit MAY consume it), but
+> nothing in v1 evaluates it and no error is raised from it.
 
 ### 3.6  Per-entry attestation gate (Layer 2)
 
