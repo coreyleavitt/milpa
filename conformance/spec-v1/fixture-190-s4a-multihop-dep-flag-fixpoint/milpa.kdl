@@ -21,3 +21,4 @@ deps {
         flag "feat"
     }
 }
+index-trust "warn"

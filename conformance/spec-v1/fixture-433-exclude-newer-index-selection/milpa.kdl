@@ -11,3 +11,4 @@ resolution {
 deps {
     widget ">= 1.0.0"
 }
+index-trust "warn"

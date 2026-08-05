@@ -4,3 +4,5 @@ workspace {
     member "member-a"
     member "member-c"
 }
+
+index-trust "warn"

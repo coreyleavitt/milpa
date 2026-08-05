@@ -3,3 +3,4 @@ kind "application"
 deps {
     pkga git=(url)"https://github.com/example/pkga.git" ref="main"
 }
+index-trust "warn"

@@ -71,6 +71,10 @@ KNOWN_LIMITATIONS: dict[str, str] = {
         "cmd=lock-roundtrip has no CLI surface — covered by impl-internal "
         "tests only (pytest / cargo test); black-box harness cannot drive it"
     ),
+    "fixture-316-s5b-namespace-lock-roundtrip": (
+        "cmd=lock-roundtrip has no CLI surface — covered by impl-internal "
+        "tests only (pytest / cargo test); black-box harness cannot drive it"
+    ),
     "fixture-264-s9a-workspace-manifest-roundtrip": (
         "cmd=workspace-manifest-roundtrip has no CLI surface — covered by "
         "impl-internal tests only (pytest / cargo test); black-box harness "
@@ -99,61 +103,29 @@ KNOWN_LIMITATIONS: dict[str, str] = {
     # unit tests instead).
     #
     # S8 (rfc-attestation-v1-normative.md, differential: attestation surface in
-    # the harness): the index-trust / show-index-trust fixture tier (338-366).
-    # These carry cmd="index-trust" or "show-index-trust", which runner.py has
-    # never mapped to a CLI invocation (confirmed via ValueError: "Unknown
-    # fixture cmd"). This is structural, not an oversight: the tier's `env` file
-    # carries schema-only recipe fields (e.g. MILPA_INDEX_TRUST_MANIFEST,
-    # mock_verifier_result) that each impl's OWN in-process conformance adapter
-    # (test_conformance.py::_execute_index_trust_fixture /
-    # milpa-conformance's Cmd::IndexTrust + Cmd::ShowIndexTrust) reads to
-    # synthesize a manifest and inject a MockVerifier result — there is no real
-    # CLI flag to drive a scripted verifier outcome, and most of these fixtures
-    # have no milpa.kdl on disk at all. Same category as lock-roundtrip /
-    # workspace-manifest-roundtrip above: no CLI surface, covered by
-    # impl-internal tests only (both impls' full test suites, part of the
-    # shared conformance corpus every impl runner consumes).
-    **{
-        name: (
-            "cmd=index-trust/show-index-trust has no CLI surface — the fixture's "
-            "env carries adapter-only recipe fields (MILPA_INDEX_TRUST_MANIFEST, "
-            "mock_verifier_result) with no real CLI flag equivalent; covered by "
-            "impl-internal tests only (test_conformance.py::_execute_index_trust_fixture "
-            "/ milpa-conformance Cmd::IndexTrust|ShowIndexTrust) — see RFC "
-            "rfc-attestation-v1-normative.md S8"
-        )
-        for name in (
-            "fixture-338-index-trust-valid-trusted",
-            "fixture-339-index-trust-warn-on-tamper",
-            "fixture-340-index-trust-strict-sig-invalid",
-            "fixture-341-index-trust-strict-digest-mismatch",
-            "fixture-342-index-trust-strict-signer-mismatch",
-            "fixture-343-index-trust-strict-bundle-missing",
-            "fixture-344-index-trust-strict-bundle-malformed",
-            "fixture-345-index-trust-strict-bundle-stale",
-            "fixture-346-index-trust-cert-expired-wall-clock-ok",
-            "fixture-347-index-trust-flag-escalates-warn",
-            "fixture-348-index-trust-upgrade-no-bundle-warn",
-            "fixture-349-index-trust-workspace-root-strict",
-            "fixture-350-index-trust-off-sig-invalid",
-            "fixture-351-index-trust-off-digest-mismatch",
-            "fixture-352-index-trust-off-bundle-missing",
-            "fixture-353-index-trust-manifest-off-env-strict",
-            "fixture-354-index-trust-manifest-warn-env-off",
-            "fixture-355-index-trust-workspace-member-illegal",
-            "fixture-356-show-index-trust-fresh",
-            "fixture-357-show-index-trust-stale",
-            "fixture-358-show-index-trust-no-bundle",
-            "fixture-359-index-trust-warn-sig-invalid",
-            "fixture-360-index-trust-warn-signer-mismatch",
-            "fixture-361-index-trust-warn-bundle-malformed",
-            "fixture-362-index-trust-warn-bundle-stale",
-            "fixture-363-index-trust-flag-escalation-failure",
-            "fixture-364-index-trust-env-strict-failure",
-            "fixture-365-index-trust-bundle-url-override",
-            "fixture-366-index-trust-workspace-root-off",
-        )
-    },
+    # the harness): the index-trust / show-index-trust fixture tier (338-366)
+    # is NOW WIRED (see runner.py's _write_index_trust_manifest /
+    # _translate_index_trust_env / _dispatch_cmd). The fixture's env carries
+    # schema-only recipe fields (MILPA_INDEX_TRUST_MANIFEST, mock_verifier_result,
+    # MILPA_INDEX_TRUST_WS_ROOT, MILPA_INDEX_TRUST_WS_MEMBER_ILLEGAL,
+    # MILPA_REQUIRE_ATTESTED_INDEX); the black-box runner translates these into a
+    # real synthesized milpa.kdl (+ workspace member dirs) and real CLI-recognized
+    # env vars / flags, then dispatches to `fetch` (index-trust) or
+    # `show --index-trust` (show-index-trust) — driving the REAL CLI's
+    # `_build_index_trust` → `load_default_index` → `enforce_index_trust` gate,
+    # confirmed empirically to match `expected/outcome` exactly on both impls
+    # for all 29 fixtures (0 divergence). No entries remain here for this tier.
+    #
+    # 9 of the 29 (the `error:<SLUG>` outcomes — 340-345, 355, 363, 364) show up
+    # as ASSERTION FAILURES (not skips, not divergences) in TestB2/TestB4: the
+    # generic black-box assertion dispatch (harness/assertions.py, off-limits to
+    # this task) treats a fixture with no `expected/error` file as success-class
+    # (exit 0 required) — it has no schema awareness of `expected/outcome`'s
+    # `error:<SLUG>` string. The real CLI's exit code (1) + slug are verified by
+    # hand to be byte-correct in every case; this is a known, symmetric (both
+    # impls agree) assertion-schema gap, not a behavior bug — see
+    # TestS8AttestationDifferential's updated docstring in test_harness.py.
+    #
     # S8: the entry-trust fixture tier (367-377). Unlike the index-trust tier
     # above, these DO carry a real milpa.kdl + mocked-fetches/ and dispatch via
     # the ordinary default cmd ("resolve" — no cmd file), so runner.py maps them
@@ -196,6 +168,145 @@ KNOWN_LIMITATIONS: dict[str, str] = {
             "fixture-375-entry-trust-strict-signer-mismatch",
             "fixture-376-entry-trust-workspace-member-illegal",
             "fixture-377-entry-trust-strict-trusted-succeeds",
+        )
+    },
+    # H-infra git-protocol tier (cmd=git-protocol, 13 fixtures): NOW WIRED (see
+    # runner.py's _prepare_git_protocol) for 9 of 13 — the black-box runner
+    # materializes the declared repos, synthesizes a single-dep manifest against
+    # a reserved `.invalid` host, and rewrites the real transport target
+    # per-subprocess via git's GIT_CONFIG_COUNT/KEY_n/VALUE_n `insteadOf`
+    # mechanism (no file:// URL ever reaches the manifest — spec/manifest-
+    # grammar.md §git NORMATIVE rejects it, MAN-GIT-URL-BAD-SCHEME, confirmed
+    # against both real binaries). Confirmed passing on both impls with 0
+    # divergence: 294, 296, 297, 299, 301, 334, 337 (content_hash-class) — the
+    # black-box gate is exit-0-only (no byte-level content_hash re-derivation;
+    # assertions.py has no comparison surface for `expected/content_hash`, and
+    # extending it is out of this task's touch-list — the real cross-impl
+    # content_hash guarantee remains each impl's own in-process H-infra adapter
+    # matching the SAME committed expected/content_hash, exactly the
+    # both-match-shared-expected pattern the entry-trust tier above relies on).
+    #
+    # The remaining 4 stay here:
+    "fixture-295-git-protocol-non-tip-commit": (
+        "the fixture pins an exact, non-ref commit_sha (fetch.commit_sha, "
+        "H4/#177) distinct from ref — the manifest grammar has NO commit_sha "
+        "field (spec/manifest-grammar.md §git NORMATIVE: 'In the manifest, git "
+        "provenance is expressed as a UrlDep's git=+ref= properties'; commit_sha "
+        "is lockfile/Provenance-only), so this cannot be driven through the "
+        "CLI's fetch verb without silently substituting the mutable-ref-tip "
+        "resolver for the exact-commit-pin `_ensure_commit_present` path the "
+        "fixture exists to exercise. Covered by the in-process H-infra adapter, "
+        "which constructs GitProvenance(ref=, commit_sha=) directly."
+    ),
+    **{
+        name: (
+            "the real CLI's per-candidate fetch loop "
+            "(impls/python/milpa/resolver.py _fetch_url_dep_worker, and the Rust "
+            "equivalent) catches EVERY exception from `fetcher.fetch()` — including "
+            "definitive, non-retryable containment-guard errors raised during "
+            "materialization (EXTRACT-SYMLINK-ESCAPE / EXTRACT-ZIP-SLIP / "
+            "FETCH-GIT-LFS-POINTER) — as a 'this mirror candidate failed, try the "
+            "next one'. With a single candidate (no mirrors declared, as in this "
+            "fixture) the loop exhausts and wraps the swallowed error into a "
+            "generic FETCH-ALL-FAILED, discarding the real slug entirely. "
+            "Confirmed empirically on BOTH impls (same wrapped slug, same lost "
+            "detail) driving this fixture through the real CLI's fetch verb via "
+            "the black-box runner. This is a genuine, pre-existing, cross-impl "
+            "resolver bug independent of the harness — a real user hitting this "
+            "path (mirror-exhausted symlink-escape/zip-slip/LFS dep) gets the same "
+            "useless FETCH-ALL-FAILED instead of an actionable slug. Filed as "
+            "#198 (not fixed here — impls/ is off-limits, control-loop "
+            "break-glass boundary); covered by the in-process H-infra adapter, "
+            "which calls GitFetcher.fetch() directly and observes the real slug."
+        )
+        for name in (
+            "fixture-298-git-protocol-symlink-escape",
+            "fixture-300-git-protocol-lfs-pointer",
+            "fixture-335-git-protocol-hostile-tree-parent-escape",
+            "fixture-336-git-protocol-hostile-tree-absolute-path",
+        )
+    },
+    # cmd=hash (1 fixture) and cmd=dag-oracle (5 fixtures): discovered while
+    # wiring git-protocol/index-trust above — runner.py has never mapped either
+    # cmd to a CLI invocation either (same "Unknown fixture cmd" crash), but
+    # NEITHER was in this task's scope (git-protocol / index-trust /
+    # show-index-trust only). Left here rather than silently crashing the
+    # corpus loop; wiring them is a natural follow-up (both reuse the same
+    # git-protocol.json repo-generation infra via harness/git_protocol_repo.py)
+    # but is out of scope for this change. Covered by each impl's in-process
+    # adapter (test_conformance.py::_execute_hash_fixture /
+    # _execute_dag_oracle_fixture and their Rust equivalents).
+    "fixture-326-hash-git-probe": (
+        "cmd=hash has no black-box CLI dispatch yet — out of scope for this "
+        "change (git-protocol/index-trust/show-index-trust only); covered by "
+        "the in-process adapter (test_conformance.py::_execute_hash_fixture)"
+    ),
+    **{
+        name: (
+            "cmd=dag-oracle has no black-box CLI dispatch yet — out of scope for "
+            "this change (git-protocol/index-trust/show-index-trust only); "
+            "covered by the in-process adapter "
+            "(test_conformance.py::_execute_dag_oracle_fixture)"
+        )
+        for name in (
+            "fixture-329-dag-oracle-empty-root",
+            "fixture-330-dag-oracle-nested-leafsort",
+            "fixture-331-dag-oracle-git-nested",
+            "fixture-332-dag-oracle-tarball-nested",
+            "fixture-333-dag-oracle-local-nested",
+        )
+    },
+    # index-history fixture tier (378-410, 453; cmd=index-trust): a NEWER
+    # extension of the index-trust tier (A4a, RFC registry-append-only.md §2 —
+    # the append-only ratchet baseline) discovered while wiring 338-366 above.
+    # These share cmd="index-trust" but carry a DIFFERENT, richer recipe
+    # (MILPA_INDEX_HISTORY_MANIFEST, `baseline-seed/`, `expected/baseline-state`,
+    # `expected/baseline`, `expected/digest`, `expected/recurring`) that the
+    # 338-366 translation in runner.py does not attempt to honor — out of scope
+    # for this change. Left here (rather than silently crashing the corpus loop
+    # once 338-366 stopped being a blanket skip) pending a dedicated wiring pass.
+    # Covered by each impl's in-process adapter (already green — both
+    # test_conformance.py::_execute_index_trust_fixture's A4a extension and the
+    # Rust equivalent pass all 30 today).
+    **{
+        name: (
+            "index-history tier (A4a ratchet-baseline extension) — recipe fields "
+            "(MILPA_INDEX_HISTORY_MANIFEST, baseline-seed/, expected/baseline-state) "
+            "not honored by this task's index-trust translation; out of scope. "
+            "Covered by the in-process adapter "
+            "(test_conformance.py::_execute_index_trust_fixture A4a extension)"
+        )
+        for name in (
+            "fixture-378-index-history-baseline-seed-clean-advance",
+            "fixture-379-index-history-baseline-seed-violation-warn",
+            "fixture-380-index-history-rollback-version-removed-warn",
+            "fixture-381-index-history-rollback-package-removed-warn",
+            "fixture-382-index-history-frozen-content-hash-swap-strict",
+            "fixture-383-index-history-set-once-backfill-legal-clean",
+            "fixture-384-index-history-schema-version-regression-warn",
+            "fixture-385-index-history-schema-version-absent-equiv-one-clean",
+            "fixture-386-index-history-provenance-in-place-mutation-strict",
+            "fixture-387-index-history-provenance-append-clean",
+            "fixture-388-index-history-yank-flip-clean",
+            "fixture-389-index-history-attestation-epoch-violation-warn",
+            "fixture-390-index-history-dep-decl-lockstep-violation-warn",
+            "fixture-391-index-history-off-preserves-baseline-clean",
+            "fixture-392-index-history-corrupt-baseline-warn",
+            "fixture-393-index-history-corrupt-baseline-strict",
+            "fixture-394-index-history-corrupt-baseline-off-never-reads-clean",
+            "fixture-395-index-history-parse-at-gate-no-clobber",
+            "fixture-396-index-history-tofu-no-seed-establishes-baseline",
+            "fixture-397-index-history-recurring-suppressed-warn",
+            "fixture-398-index-history-recurring-new-remutation-warn",
+            "fixture-399-index-history-composite-ordering-worked-example-warn",
+            "fixture-404-index-history-attestation-strip-warn",
+            "fixture-405-index-history-attestation-reattribution-strict",
+            "fixture-406-index-history-attestation-repin-warn",
+            "fixture-407-index-history-attestation-upgrade-clean",
+            "fixture-408-index-history-rekor-frozen-changed-strict",
+            "fixture-409-index-history-attestation-epoch-violation-strict",
+            "fixture-410-index-history-root-vs-root-composite-tie-worked-example-warn",
+            "fixture-453-index-history-provenance-oci-source-mutation-strict",
         )
     },
 }

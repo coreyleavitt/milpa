@@ -10,3 +10,4 @@ kind "application"
 deps {
     bar
 }
+index-trust "warn"

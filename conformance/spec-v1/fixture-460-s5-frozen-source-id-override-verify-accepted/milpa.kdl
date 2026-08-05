@@ -6,3 +6,4 @@ deps {
 overrides {
     pkg "foo" git=(url)"https://example.com/foo-fork.git" ref="main"
 }
+index-trust "warn"

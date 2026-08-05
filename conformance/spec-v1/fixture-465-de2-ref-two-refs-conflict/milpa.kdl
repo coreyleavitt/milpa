@@ -4,3 +4,4 @@ deps {
     t1 git=(url)"https://example.com/t1.git" ref="main"
     t2 git=(url)"https://example.com/t2.git" ref="main"
 }
+index-trust "warn"

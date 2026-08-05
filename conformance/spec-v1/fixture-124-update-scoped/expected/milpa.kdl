@@ -4,3 +4,4 @@ deps {
     foo git=(url)"https://github.com/example/foo.git" ref="main"
     bar git=(url)"https://github.com/example/bar.git" ref="main"
 }
+index-trust "warn"

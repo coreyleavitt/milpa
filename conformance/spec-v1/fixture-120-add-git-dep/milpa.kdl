@@ -1,2 +1,3 @@
 name "myapp"
 kind "application"
+index-trust "warn"

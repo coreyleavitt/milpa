@@ -6,3 +6,4 @@ flags {
     tls default=#false
 }
 kind "library"
+index-trust "warn"

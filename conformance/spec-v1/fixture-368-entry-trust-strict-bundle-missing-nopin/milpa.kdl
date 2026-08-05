@@ -4,3 +4,4 @@ entry-trust "strict"
 deps {
     bar ">= 2.0.0"
 }
+index-trust "warn"

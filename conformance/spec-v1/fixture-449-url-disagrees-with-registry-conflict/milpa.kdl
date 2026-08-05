@@ -4,3 +4,4 @@ attestation-policy "strict"
 deps {
     wrap git=(url)"https://example.com/wrap.git" ref="main"
 }
+index-trust "warn"

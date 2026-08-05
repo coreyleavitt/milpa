@@ -3,3 +3,4 @@ kind "application"
 deps {
     foo git=(url)"https://github.com/example/foo.git" ref="main"
 }
+index-trust "warn"

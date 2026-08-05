@@ -18,3 +18,4 @@ kind "application"
 deps {
     foo git=(url)"https://github.com/example/foo.git" ref="main" platform="linux" arch="amd64"
 }
+index-trust "warn"

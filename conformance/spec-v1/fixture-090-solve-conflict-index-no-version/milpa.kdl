@@ -3,3 +3,4 @@ kind "application"
 deps {
     bar ">= 5.0.0"
 }
+index-trust "warn"

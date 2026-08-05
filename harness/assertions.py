@@ -281,6 +281,7 @@ def assert_conformance(
     expected_dir = fixture_dir / "expected"
     error_file = expected_dir / "error"
     is_error_fixture = error_file.exists()
+    outcome_file = expected_dir / "outcome"
 
     cmd_file = fixture_dir / "cmd"
     cmd = cmd_file.read_text().strip() if cmd_file.exists() else "resolve"
@@ -290,6 +291,13 @@ def assert_conformance(
             run, fixture_dir, expected_dir, cmd, is_error_fixture,
             failures, normalized_outputs,
         )
+    elif outcome_file.exists() and not is_error_fixture:
+        # Index-trust tier (fixture-338..366, cmd=index-trust): the expected
+        # outcome is an `expected/outcome` line — `trusted` (exit 0, no slug),
+        # `warn:<SLUG>` (exit 0 + <SLUG> emitted as a warning), or `error:<SLUG>`
+        # (exit 1 + that slug). The in-process adapter's index-trust executor
+        # implements the same contract; this makes the black-box runner assert it.
+        _assert_outcome_fixture(run, outcome_file, failures, normalized_outputs)
     elif is_error_fixture:
         _assert_error_fixture(run, fixture_dir, expected_dir, cmd, failures, normalized_outputs)
     elif _is_liveness_cmd(cmd):
@@ -306,6 +314,55 @@ def assert_conformance(
         failures=failures,
         normalized_outputs=normalized_outputs,
     )
+
+
+def _assert_outcome_fixture(
+    run: RunResult,
+    outcome_file: Path,
+    failures: list,
+    normalized_outputs: dict,
+) -> None:
+    """Assert an index-trust ``expected/outcome`` fixture (spec/registry-protocol
+    §3.4 whole-index gate). The outcome line is one of:
+
+      - ``trusted``      → exit 0, no ``milpa-error`` slug (index verified).
+      - ``warn:<SLUG>``  → exit 0, ``<SLUG>`` present in stderr (a warning line).
+      - ``error:<SLUG>`` → exit 1, ``run.slug == <SLUG>`` (a hard failure).
+
+    The in-process index-trust executor implements the SAME contract; this makes
+    the black-box differential runner assert it identically (SSOT: one contract).
+    """
+    def _fail(detail: str) -> None:
+        failures.append(AssertionFailure(
+            fixture_name=run.fixture_name, impl_name=run.impl_name,
+            kind="outcome-fixture", detail=detail,
+        ))
+
+    outcome = outcome_file.read_text().strip()
+    normalized_outputs["expected/outcome"] = outcome
+    if outcome == "trusted":
+        if run.returncode != 0:
+            _fail(f"outcome=trusted expects exit 0, got {run.returncode}; stderr: {run.stderr[:300]!r}")
+        elif run.slug is not None:
+            _fail(f"outcome=trusted expects no milpa-error slug, got {run.slug!r}")
+    elif outcome.startswith("warn:"):
+        want = outcome[len("warn:"):]
+        if run.returncode != 0:
+            _fail(f"outcome=warn:{want} expects exit 0 (warning), got {run.returncode}; stderr: {run.stderr[:300]!r}")
+        elif want not in run.stderr:
+            _fail(f"outcome=warn:{want} expects {want!r} in stderr; stderr: {run.stderr[:300]!r}")
+    elif outcome.startswith("error:"):
+        want = outcome[len("error:"):]
+        if run.returncode != 1:
+            _fail(f"outcome=error:{want} expects exit 1, got {run.returncode}; stderr: {run.stderr[:300]!r}")
+        elif run.slug != want:
+            _fail(f"outcome=error:{want} expects slug {want!r}, got {run.slug!r}")
+    else:
+        failures.append(AssertionFailure(
+            fixture_name=run.fixture_name, impl_name=run.impl_name,
+            kind="harness-error",
+            detail=f"unrecognized expected/outcome {outcome!r} (expected trusted|warn:<SLUG>|error:<SLUG>)",
+        ))
 
 
 # ---------------------------------------------------------------------------
@@ -831,6 +888,13 @@ def _assert_success_fixture(
 
     # Workspace per-member outputs: for each <member>/ subdir in expected_dir,
     # check nim.cfg and/or milpa.kdl (mutation fixtures).
+    #
+    # A bare success fixture (e.g. cmd=verify, "accepted") produces no output
+    # artifacts and legitimately ships no expected/ dir at all — its only
+    # contract is exit 0 + no slug + empty stdout, already asserted above. Guard
+    # the member iteration so a missing expected/ dir is not a FileNotFoundError.
+    if not expected_dir.is_dir():
+        return
     for member_dir in sorted(expected_dir.iterdir()):
         if not member_dir.is_dir():
             continue

@@ -661,24 +661,71 @@ class TestB4PythonRustCorpus(unittest.TestCase):
 class TestS8AttestationDifferential(unittest.TestCase):
     """S8: the mock-seam index-trust (338-366) + entry-trust (367-377) fixtures.
 
-    These carry cmds/recipes the BLACK-BOX differential runner cannot drive:
-    ``index-trust``/``show-index-trust`` have no CLI surface (their ``env``
-    carries adapter-only recipe fields — ``MILPA_INDEX_TRUST_MANIFEST``,
-    ``mock_verifier_result`` — with no real CLI-flag equivalent, and most ship
-    no ``milpa.kdl``); the entry-trust tier resolves via the real CLI but, under
-    S4's flipped ``index-trust=strict`` default, hits the index-trust gate
-    before reaching the entry-trust gate it was authored for (the S4
-    index-trust-gate-ordering follow-up). They are therefore DOCUMENTED
-    ``KNOWN_LIMITATIONS`` for ``TestB4PythonRustCorpus`` (see ``corpus.py``), and
-    are differentially validated instead by EACH impl's in-process conformance
-    adapter matching the SAME committed ``expected/`` — both-match-expected means
-    the two impls agree. This class pins that disposition. The real-crypto
-    differential (both real verifiers agree on the committed bundle; D13's
-    shared trust root makes "identical verdicts" unconditional) is pinned
-    per-impl in ``test_entry_trust.py::test_s8_real_entry_bundle_same_outcome_as_rust``
-    and its Rust counterpart
-    ``entry_trust.rs::tests::s8_real_entry_bundle_same_outcome_as_python``.
+    index-trust / show-index-trust (338-366, 29 fixtures) are NOW WIRED into
+    the black-box differential runner (see ``runner.py``'s
+    ``_write_index_trust_manifest`` / ``_translate_index_trust_env`` /
+    ``_dispatch_cmd``): the fixture's recipe env (``MILPA_INDEX_TRUST_MANIFEST``,
+    ``mock_verifier_result``, workspace-shape flags, ...) is translated into a
+    real synthesized manifest + real CLI-recognized env vars/flags, then
+    dispatched to ``fetch`` (index-trust) or ``show --index-trust``
+    (show-index-trust) — driving the REAL ``_build_index_trust`` →
+    ``load_default_index`` → ``enforce_index_trust`` gate. This class runs that
+    tier through BOTH impls directly (not via the full ``run_corpus()`` sweep,
+    to stay fast and independent of the rest of the corpus) and asserts the
+    REAL thing: zero cross-impl divergence — not a "both cover it separately"
+    proxy.
+
+    entry-trust (367-377, 11 fixtures) is UNCHANGED by this task: it resolves
+    via the real CLI but, under S4's flipped ``index-trust=strict`` default,
+    hits the index-trust gate before reaching the entry-trust gate it was
+    authored for (the S4 index-trust-gate-ordering follow-up — orthogonal to
+    S8). It remains a DOCUMENTED ``KNOWN_LIMITATIONS`` entry, differentially
+    validated instead by EACH impl's in-process conformance adapter matching
+    the SAME committed ``expected/`` — both-match-expected means the two impls
+    agree.
+
+    The real-crypto differential (both real verifiers agree on the committed
+    bundle; D13's shared trust root makes "identical verdicts" unconditional)
+    is pinned per-impl in
+    ``test_entry_trust.py::test_s8_real_entry_bundle_same_outcome_as_rust`` and
+    its Rust counterpart
+    ``entry_trust.rs::tests::s8_real_entry_bundle_same_outcome_as_python`` —
+    untouched by this class.
     """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        rust_bin = _REPO_ROOT / "impls" / "rust" / "target" / "release" / "milpa"
+        if not rust_bin.exists():
+            cls._skip_reason = (
+                f"Rust binary not found at {rust_bin}; "
+                "build with: ./dev-rust build --release"
+            )
+            cls.fixture_dirs = []
+            cls.results_by_fixture = {}
+            return
+        cls._skip_reason = None
+        descs = build_descriptors(_REPO_ROOT)
+        # The 338-366 tier: index-trust + show-index-trust. "index-trust" is a
+        # substring of every name in this tier (including "show-index-trust")
+        # and of no fixture outside it (verified: exactly 29 matches, 338-366).
+        cls.fixture_dirs = sorted(
+            (fx for fx in discover_fixtures(_CONFORMANCE_ROOT) if "index-trust" in fx.name),
+            key=lambda p: p.name,
+        )
+        cls.results_by_fixture: dict[str, dict[str, "ConformanceResult"]] = {}
+        for fx_dir in cls.fixture_dirs:
+            per_impl = {}
+            for desc in descs:
+                run = run_fixture(fx_dir, desc, timeout=60)
+                result = assert_conformance(run, fx_dir)
+                run.cleanup()
+                per_impl[desc.name] = result
+            cls.results_by_fixture[fx_dir.name] = per_impl
+
+    def _skip_if_no_rust(self) -> None:
+        if self.__class__._skip_reason is not None:
+            self.skipTest(self.__class__._skip_reason)
 
     @staticmethod
     def _attestation_names() -> set:
@@ -699,19 +746,84 @@ class TestS8AttestationDifferential(unittest.TestCase):
             f"expected >=40 index-trust/entry-trust fixtures, found {len(names)}",
         )
 
+    def test_index_trust_tier_runs_through_black_box_cli(self) -> None:
+        """S8 core claim, part 1: every 338-366 fixture actually dispatches
+        through the real CLI on BOTH impls (no crash, no ValueError) — the
+        black-box wiring itself, not just the divergence outcome."""
+        self._skip_if_no_rust()
+        self.assertEqual(
+            len(self.fixture_dirs), 29,
+            f"expected exactly 29 index-trust/show-index-trust fixtures (338-366), "
+            f"found {len(self.fixture_dirs)}",
+        )
+        for name, per_impl in self.results_by_fixture.items():
+            self.assertEqual(
+                set(per_impl), {"python", "rust"},
+                f"{name}: expected a result from both impls",
+            )
+
+    def test_index_trust_tier_zero_cross_impl_divergence(self) -> None:
+        """S8 core claim, part 2: both impls AGREE on every 338-366 fixture —
+        zero cross-impl divergence (verdict asymmetry AND, among co-passers,
+        normative-surface disagreement). This is the real guarantee the class's
+        docstring promises, not a "both separately cover it" proxy."""
+        self._skip_if_no_rust()
+        all_divergences = []
+        for name, per_impl in self.results_by_fixture.items():
+            all_divergences.extend(_detect_divergences(name, "index-trust", per_impl))
+        self.assertEqual(
+            all_divergences, [],
+            f"{len(all_divergences)} cross-impl divergence(s) on the index-trust tier: "
+            + "; ".join(f"{d.fixture_name}[{d.output_file}]" for d in all_divergences),
+        )
+
+    def test_index_trust_tier_all_pass_black_box(self) -> None:
+        """Every index-trust fixture (338-366) now PASSES the black-box
+        differential on both impls. The `expected/outcome` assertion-schema gap
+        (`trusted`/`warn:<SLUG>`/`error:<SLUG>`) that previously left the 9
+        `error:<SLUG>` fixtures asserting as spurious "expected exit 0" failures
+        is closed — `harness/assertions.py::_assert_outcome_fixture` now
+        implements the same outcome contract the in-process adapter does (SSOT).
+        So the index-trust tier is fully black-box differential-validated: zero
+        failures, zero divergence (the divergence assertion is the test above)."""
+        self._skip_if_no_rust()
+        failing = {
+            name for name, per_impl in self.results_by_fixture.items()
+            if ("index-trust" in name)
+            and (not per_impl["python"].passed or not per_impl["rust"].passed)
+        }
+        self.assertEqual(
+            failing, set(),
+            "every index-trust fixture must now pass black-box on both impls; "
+            f"still failing: {sorted(failing)}",
+        )
+
     def test_attestation_fixtures_are_documented_black_box_limitations(self) -> None:
-        """Every attestation fixture is a DOCUMENTED KNOWN_LIMITATIONS entry for the
-        black-box differential runner (no CLI surface for index-trust/show-index-trust;
-        the S4 index-trust-gate-ordering collision for entry-trust). This guarantees
-        none silently drops out of cross-impl coverage unaccounted-for: the real
-        cross-impl guarantee is each impl's in-process conformance adapter validating
-        against the shared expected/ (test_attestation_fixtures_have_shared_expected)."""
-        undocumented = self._attestation_names() - set(KNOWN_LIMITATIONS)
+        """Every ENTRY-TRUST fixture (367-377) remains a DOCUMENTED
+        KNOWN_LIMITATIONS entry — unchanged by this task (the S4
+        index-trust-gate-ordering collision, orthogonal to S8). The index-trust
+        tier (338-366) must NO LONGER appear there: it is now wired (see the
+        tests above), so any 338-366 name still listed would itself be a
+        regression back to a silent skip."""
+        entry_trust_names = {
+            fx.name for fx in discover_fixtures(_CONFORMANCE_ROOT) if "entry-trust" in fx.name
+        }
+        undocumented = entry_trust_names - set(KNOWN_LIMITATIONS)
         self.assertEqual(
             undocumented, set(),
-            "every attestation fixture must be a documented black-box KNOWN_LIMITATIONS "
-            "entry (covered instead by each impl's in-process conformance adapter); "
-            f"undocumented: {sorted(undocumented)}",
+            f"every entry-trust fixture must be a documented KNOWN_LIMITATIONS "
+            f"entry; undocumented: {sorted(undocumented)}",
+        )
+
+        index_trust_names = {
+            fx.name for fx in discover_fixtures(_CONFORMANCE_ROOT) if "index-trust" in fx.name
+        }
+        still_limited = index_trust_names & set(KNOWN_LIMITATIONS)
+        self.assertEqual(
+            still_limited, set(),
+            f"index-trust/show-index-trust fixtures must no longer be "
+            f"KNOWN_LIMITATIONS entries (now wired into the black-box runner): "
+            f"{sorted(still_limited)}",
         )
 
     def test_attestation_fixtures_have_shared_expected(self) -> None:

@@ -12,3 +12,4 @@ deps {
     foo ">= 1.5.0"
     bar
 }
+index-trust "warn"

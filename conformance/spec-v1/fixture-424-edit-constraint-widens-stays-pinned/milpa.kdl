@@ -12,3 +12,4 @@ deps {
     foo
     bar
 }
+index-trust "warn"

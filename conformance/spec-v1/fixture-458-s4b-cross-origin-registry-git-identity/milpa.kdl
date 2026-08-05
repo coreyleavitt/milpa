@@ -14,3 +14,4 @@ deps {
     chronos
     chronos-fork git=(url)"https://example.com/chronos-fork.git" ref="main"
 }
+index-trust "warn"

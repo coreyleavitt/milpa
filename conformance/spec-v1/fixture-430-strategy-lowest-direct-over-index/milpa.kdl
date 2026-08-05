@@ -13,3 +13,4 @@ kind "application"
 deps {
     direct ">= 1.0.0"
 }
+index-trust "warn"

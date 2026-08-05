@@ -4,3 +4,4 @@ deps {
     translib git=(url)"https://example.com/translib.git" ref="main"
     shared git=(url)"https://our-fork.example.com/shared.git" ref="main"
 }
+index-trust "warn"

@@ -4,3 +4,4 @@ deps {
     "ns1/bar" ">= 1.0.0"
     "ns2/bar" ">= 2.0.0"
 }
+index-trust "warn"

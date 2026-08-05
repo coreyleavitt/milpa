@@ -4,3 +4,4 @@ deps {
     bearssl
     httputils
 }
+index-trust "warn"

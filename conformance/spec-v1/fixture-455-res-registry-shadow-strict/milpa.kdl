@@ -4,3 +4,4 @@ attestation-policy "strict"
 deps {
     t1 git=(url)"https://example.com/t1.git" ref="main"
 }
+index-trust "warn"

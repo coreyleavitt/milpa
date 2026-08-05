@@ -16,3 +16,4 @@ kind "application"
 deps {
     lib-a git=(url)"https://example.com/lib-a.git" ref="main"
 }
+index-trust "warn"

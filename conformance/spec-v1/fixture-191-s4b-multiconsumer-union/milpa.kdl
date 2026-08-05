@@ -24,3 +24,4 @@ deps {
     lib-a git=(url)"https://example.com/lib-a.git" ref="main"
     lib-b git=(url)"https://example.com/lib-b.git" ref="main"
 }
+index-trust "warn"

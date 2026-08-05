@@ -3,3 +3,4 @@ kind "application"
 deps {
     results
 }
+index-trust "warn"

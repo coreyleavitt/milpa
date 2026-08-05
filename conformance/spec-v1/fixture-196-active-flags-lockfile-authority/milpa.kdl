@@ -9,3 +9,4 @@ kind "application"
 deps {
     lib-flags git=(url)"https://example.com/lib-flags.git" ref="main"
 }
+index-trust "warn"

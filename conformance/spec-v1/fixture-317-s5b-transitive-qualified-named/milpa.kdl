@@ -15,3 +15,4 @@ kind "application"
 deps {
     foo git=(url)"https://example.com/foo.git" ref="main"
 }
+index-trust "warn"

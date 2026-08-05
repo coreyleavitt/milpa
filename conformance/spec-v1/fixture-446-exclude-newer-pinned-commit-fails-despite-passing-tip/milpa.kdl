@@ -15,3 +15,4 @@ resolution {
 deps {
     widget git=(url)"https://example.com/widget.git" ref="main"
 }
+index-trust "warn"

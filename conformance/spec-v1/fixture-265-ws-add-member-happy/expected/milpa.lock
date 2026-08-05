@@ -3,8 +3,12 @@ version 1
 strategy "maxver"
 
 dep "liba" {
-    identity "dag-sha256:f136dfd3f071bc8b941a99235436138faeebba441dca8337c452b52c40258a55"
-    version "0.0.1"
+    source {
+        kind "member"
+        name "liba"
+    }
+    identity "dag-sha256:4368dff7cd74dc6d84258d30a62a8825aff4b9e7a7b98126be2334588a1a1517"
+    version "0.0.0"
     src_dir ""
     requires
     provenance {
@@ -15,8 +19,12 @@ dep "liba" {
 }
 
 dep "libb" {
-    identity "dag-sha256:0925e52fac4feb724cd47a669748850ee3884cb08129e084e9ce8a2998b4bd07"
-    version "0.0.1"
+    source {
+        kind "member"
+        name "libb"
+    }
+    identity "dag-sha256:1542c5f9157ee96da0cd71a3dad62aafd996e9bbdd99eb75906d56f53ec07edb"
+    version "0.0.0"
     src_dir ""
     requires
     provenance {

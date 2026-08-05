@@ -10,3 +10,4 @@ kind "application"
 deps {
     bar namespace="ns1"
 }
+index-trust "warn"

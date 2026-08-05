@@ -6,3 +6,4 @@ deps {
 dev-deps {
     d git=(url)"https://example.com/d.git" ref="main"
 }
+index-trust "warn"

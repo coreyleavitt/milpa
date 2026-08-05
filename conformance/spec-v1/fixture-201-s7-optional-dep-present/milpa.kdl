@@ -16,3 +16,4 @@ flags {
 deps {
     optlib git=(url)"https://example.com/optlib.git" ref="main" optional=#true
 }
+index-trust "warn"

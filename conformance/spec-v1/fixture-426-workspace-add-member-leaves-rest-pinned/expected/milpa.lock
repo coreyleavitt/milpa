@@ -3,6 +3,11 @@ version 1
 strategy "maxver"
 
 dep "bearssl" {
+    source {
+        kind "registry"
+        registry "tianguis"
+        name "bearssl"
+    }
     identity "dag-sha256:07eb3b0f3f1004831e73b25a888e40a6841d1f722935b5462b61f728d5280426"
     version "1.0.0"
     src_dir "src"
@@ -17,6 +22,11 @@ dep "bearssl" {
 }
 
 dep "httputils" {
+    source {
+        kind "registry"
+        registry "tianguis"
+        name "httputils"
+    }
     identity "dag-sha256:088de10e04624b980875c56b488e1b36b1796467f750f56172196e0b44410b7e"
     version "2.0.0"
     src_dir "src"
@@ -31,6 +41,10 @@ dep "httputils" {
 }
 
 dep "liba" {
+    source {
+        kind "member"
+        name "liba"
+    }
     identity "dag-sha256:b842e06c96de013cc8ebb2fff827e83681b3176adf686c3f8e0eaec8c2151f23"
     version "0.0.0"
     src_dir ""
@@ -43,6 +57,10 @@ dep "liba" {
 }
 
 dep "libc" {
+    source {
+        kind "member"
+        name "libc"
+    }
     identity "dag-sha256:e3cf1140e9f9d9d8ef22d83ce499e50213ec26bd9d1eabb74fbec4fe49bdf665"
     version "0.0.0"
     src_dir ""

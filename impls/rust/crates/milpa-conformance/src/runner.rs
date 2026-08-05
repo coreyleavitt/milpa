@@ -2718,10 +2718,19 @@ fn fixture_all_features(dir: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Admit every `cas-seed/<name>/` tree into `store` under its content hash,
-/// standing in for a prior `milpa fetch`. `admit` moves its source, so each tree
-/// is copied to a staging dir (on the same filesystem as the CAS) first. A no-op
-/// when `cas-seed/` is absent.
+/// Admit every `cas-seed/` tree into `store`, standing in for a prior
+/// `milpa fetch`. Two layouts are accepted (both mirror the Python adapter and
+/// the black-box harness — SSOT):
+///
+/// - **Dep-name-keyed** — `cas-seed/<dep-name>/` — the tree is hashed and
+///   admitted at its computed content identity.
+/// - **Identity-keyed** — `cas-seed/<algo>/<hex>/` — mirrors the store layout;
+///   admitted verbatim at `<algo>:<hex>` with no re-hash. Required when
+///   dep-name keying is ambiguous (two deps sharing one import name but
+///   differing in identity, or one tree backing several deduped deps).
+///
+/// `admit` moves its source, so each tree is copied to a staging dir (on the
+/// same filesystem as the CAS) first. A no-op when `cas-seed/` is absent.
 fn seed_cas(
     seed_root: &Path,
     store: &milpa_core::CaStore,
@@ -2731,6 +2740,25 @@ fn seed_cas(
         return Ok(());
     }
     let staging_root = scratch_root.join(".cas-seed-staging");
+    // Stage `tree` and admit it: `identity=Some` → verbatim at that identity
+    // (identity-keyed, no re-hash); `None` → compute the content hash.
+    let admit_tree = |tree: &Path, identity: Option<String>| -> Result<(), String> {
+        let staged = staging_root.join(tree.file_name().unwrap_or_default());
+        let _ = std::fs::remove_dir_all(&staged);
+        copy_tree(tree, &staged).map_err(|e| format!("E2E-CAS-SEED: {e}"))?;
+        let ident = match identity {
+            Some(id) => id,
+            None => milpa_core::compute_content_hash(&staged)
+                .map_err(|e| format!("E2E-CAS-SEED: {}", e.message()))?,
+        };
+        if !store.contains(&ident).unwrap_or(false) {
+            store
+                .admit(&staged, &ident)
+                .map_err(|e| format!("E2E-CAS-SEED: {}", e.message()))?;
+        }
+        let _ = std::fs::remove_dir_all(&staged);
+        Ok(())
+    };
     for entry in std::fs::read_dir(seed_root).map_err(|e| format!("E2E-CAS-SEED: {e}"))? {
         let entry = entry.map_err(|e| format!("E2E-CAS-SEED: {e}"))?;
         if !entry
@@ -2741,17 +2769,26 @@ fn seed_cas(
             continue;
         }
         let name = entry.file_name();
-        let staged = staging_root.join(&name);
-        let _ = std::fs::remove_dir_all(&staged);
-        copy_tree(&entry.path(), &staged).map_err(|e| format!("E2E-CAS-SEED: {e}"))?;
-        let identity = milpa_core::compute_content_hash(&staged)
-            .map_err(|e| format!("E2E-CAS-SEED: {}", e.message()))?;
-        if !store.contains(&identity).unwrap_or(false) {
-            store
-                .admit(&staged, &identity)
-                .map_err(|e| format!("E2E-CAS-SEED: {}", e.message()))?;
+        let name_str = name.to_string_lossy();
+        // Identity-keyed store-layout subtree (`cas-seed/<algo>/<hex>/`).
+        if name_str == "sha256" || name_str == "dag-sha256" {
+            for hex_entry in
+                std::fs::read_dir(entry.path()).map_err(|e| format!("E2E-CAS-SEED: {e}"))?
+            {
+                let hex_entry = hex_entry.map_err(|e| format!("E2E-CAS-SEED: {e}"))?;
+                if hex_entry
+                    .file_type()
+                    .map_err(|e| format!("E2E-CAS-SEED: {e}"))?
+                    .is_dir()
+                {
+                    let ident = format!("{}:{}", name_str, hex_entry.file_name().to_string_lossy());
+                    admit_tree(&hex_entry.path(), Some(ident))?;
+                }
+            }
+            continue;
         }
-        let _ = std::fs::remove_dir_all(&staged);
+        // Dep-name-keyed: hash the tree and admit at the computed identity.
+        admit_tree(&entry.path(), None)?;
     }
     Ok(())
 }

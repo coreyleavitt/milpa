@@ -19,3 +19,4 @@ deps {
     lib-ssl git=(url)"https://example.com/lib-ssl.git" ref="main"
     lib-childless git=(url)"https://example.com/lib-childless.git" ref="main"
 }
+index-trust "warn"

@@ -21,3 +21,4 @@ deps {
     bearssl git=(url)"https://example.com/bearssl.git" ref="v1"
     chronos git=(url)"https://example.com/chronos.git" ref="main"
 }
+index-trust "warn"
