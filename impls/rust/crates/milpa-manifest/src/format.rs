@@ -164,38 +164,6 @@ pub fn format_manifest(m: &Manifest) -> String {
         lines.push("}".to_string());
         lines.push(String::new());
     }
-    // index-trust / index-trust-signer / index-trust-bundle (RD-M2 code-review
-    // item; spec/manifest-grammar.md §8 semantic round-trip): present-stays-present
-    // / absent-stays-absent, mirroring spec-version above — index_trust_policy_explicit
-    // (not a non-default-value check) is what triggers emission, matching the
-    // WS-INDEX-TRUST-ON-MEMBER check's own "WHERE it's declared, not what value it
-    // holds" semantics (workspace.rs / manifest.py). Without this, add-member /
-    // remove-member / add / remove round-trips through format_manifest silently
-    // reverted a declared policy back to warn — a fail-open.
-    if m.index_trust_policy_explicit {
-        lines.push(format!("index-trust \"{}\"", trust_policy_str(&m.index_trust_policy)));
-        lines.push(String::new());
-    }
-    if let Some(signer) = &m.index_trust_signer {
-        lines.push(format!("index-trust-signer \"{}\"", kdl_str(signer)));
-        lines.push(String::new());
-    }
-    if let Some(bundle) = &m.index_trust_bundle {
-        lines.push(format!("index-trust-bundle \"{}\"", kdl_str(bundle)));
-        lines.push(String::new());
-    }
-    // entry-trust (P3a, RFC per-entry-attestation.md §4). Same absent-stays-
-    // absent rule as index-trust above.
-    if m.entry_trust_policy_explicit {
-        lines.push(format!("entry-trust \"{}\"", trust_policy_str(&m.entry_trust_policy)));
-        lines.push(String::new());
-    }
-    // index-history (A3, rfc-registry-append-only.md §2). Same absent-stays-
-    // absent rule as index-trust/entry-trust above.
-    if m.index_history_policy_explicit {
-        lines.push(format!("index-history \"{}\"", trust_policy_str(&m.index_history_policy)));
-        lines.push(String::new());
-    }
     if !m.deps.is_empty() {
         lines.push("deps {".to_string());
         for dep in &m.deps {
@@ -319,6 +287,35 @@ pub fn format_manifest(m: &Manifest) -> String {
         lines.push(String::new());
     }
 
+    // index-trust / index-trust-signer / index-trust-bundle / entry-trust /
+    // index-history — emitted AFTER deps/dev-deps/overrides/mirrors/provides/flags
+    // and immediately before `kind` (the canonical order, byte-identical to
+    // manifest.py's serializer). present-stays-present / absent-stays-absent:
+    // *_explicit (not a non-default-value check) triggers emission, matching the
+    // WS-INDEX-TRUST-ON-MEMBER "WHERE it's declared, not what value" semantics.
+    // Without this, add / remove / add-member / remove-member round-trips
+    // silently reverted a declared policy back to warn — a fail-open.
+    if m.index_trust_policy_explicit {
+        lines.push(format!("index-trust \"{}\"", trust_policy_str(&m.index_trust_policy)));
+        lines.push(String::new());
+    }
+    if let Some(signer) = &m.index_trust_signer {
+        lines.push(format!("index-trust-signer \"{}\"", kdl_str(signer)));
+        lines.push(String::new());
+    }
+    if let Some(bundle) = &m.index_trust_bundle {
+        lines.push(format!("index-trust-bundle \"{}\"", kdl_str(bundle)));
+        lines.push(String::new());
+    }
+    if m.entry_trust_policy_explicit {
+        lines.push(format!("entry-trust \"{}\"", trust_policy_str(&m.entry_trust_policy)));
+        lines.push(String::new());
+    }
+    if m.index_history_policy_explicit {
+        lines.push(format!("index-history \"{}\"", trust_policy_str(&m.index_history_policy)));
+        lines.push(String::new());
+    }
+
     lines.push(format!("kind \"{}\"", kdl_str(&m.kind)));
     let mut out = lines.join("\n");
     out.push('\n');
@@ -342,12 +339,9 @@ pub fn format_workspace_manifest(ws: &Workspace) -> String {
     }
 
     // resolution { strategy "..."; exclude-newer "..." } — C3 (§3 Axis C /
-    // §5) + D1 (§3 Axis D), root-only. Emitted right after `name` (matches
-    // this formatter's own canonical position for workspace-root policy
-    // fields — index-trust/entry-trust/index-history below follow the
-    // pre-existing, out-of-scope Python/Rust ordering divergence documented
-    // in the resolution-semantics handoff; this NEW field does not inherit
-    // it).
+    // §5) + D1 (§3 Axis D), root-only. Emitted right after `name`.
+    // (index-trust/entry-trust/index-history are now emitted after the
+    // workspace/overrides/flags blocks, matching manifest.py — see below.)
     if let Some(resolution) = ws.resolution {
         if resolution.strategy.is_some() || resolution.exclude_newer.is_some() {
             lines.push("resolution {".to_string());
@@ -363,40 +357,6 @@ pub fn format_workspace_manifest(ws: &Workspace) -> String {
             lines.push("}".to_string());
             lines.push(String::new());
         }
-    }
-
-    // index-trust / index-trust-signer / index-trust-bundle (RD-M2 code-review
-    // item; spec §3.4.7 root-authority model — the workspace root is the
-    // resolution root for index-trust purposes). Mirrors `format_manifest`'s
-    // package-side gating: emission is keyed on `index_trust_policy_explicit`
-    // (present-stays-present / absent-stays-absent), NOT on the value, so a
-    // hand-authored but redundant `index-trust "warn"` survives a
-    // format→parse round trip instead of silently reverting to the implicit
-    // default the next time `milpa workspace add-member`/`remove-member`
-    // rewrites the file.
-    if ws.index_trust_policy_explicit {
-        lines.push(format!("index-trust \"{}\"", trust_policy_str(&ws.index_trust_policy)));
-        lines.push(String::new());
-    }
-    if let Some(signer) = &ws.index_trust_signer {
-        lines.push(format!("index-trust-signer \"{}\"", kdl_str(signer)));
-        lines.push(String::new());
-    }
-    if let Some(bundle) = &ws.index_trust_bundle {
-        lines.push(format!("index-trust-bundle \"{}\"", kdl_str(bundle)));
-        lines.push(String::new());
-    }
-
-    // entry-trust (P3a, RFC per-entry-attestation.md §4 — root-authority policy).
-    if ws.entry_trust_policy_explicit {
-        lines.push(format!("entry-trust \"{}\"", trust_policy_str(&ws.entry_trust_policy)));
-        lines.push(String::new());
-    }
-
-    // index-history (A3, rfc-registry-append-only.md §2 — root-authority policy).
-    if ws.index_history_policy_explicit {
-        lines.push(format!("index-history \"{}\"", trust_policy_str(&ws.index_history_policy)));
-        lines.push(String::new());
     }
 
     // workspace { member "..." }
@@ -489,6 +449,35 @@ pub fn format_workspace_manifest(ws: &Workspace) -> String {
             }
         }
         lines.push("}".to_string());
+        lines.push(String::new());
+    }
+
+    // index-trust / index-trust-signer / index-trust-bundle / entry-trust /
+    // index-history — root-authority policy fields (spec §3.4.7: the workspace
+    // root is the resolution root for these). Emitted AFTER the workspace block,
+    // overrides, and flags — byte-identical to manifest.py's workspace
+    // serializer (resolving the previously out-of-scope Python/Rust ordering
+    // divergence). Emission is keyed on *_explicit (present-stays-present /
+    // absent-stays-absent), NOT on the value, so a redundant `index-trust
+    // "warn"` survives a format→parse round trip instead of silently reverting.
+    if ws.index_trust_policy_explicit {
+        lines.push(format!("index-trust \"{}\"", trust_policy_str(&ws.index_trust_policy)));
+        lines.push(String::new());
+    }
+    if let Some(signer) = &ws.index_trust_signer {
+        lines.push(format!("index-trust-signer \"{}\"", kdl_str(signer)));
+        lines.push(String::new());
+    }
+    if let Some(bundle) = &ws.index_trust_bundle {
+        lines.push(format!("index-trust-bundle \"{}\"", kdl_str(bundle)));
+        lines.push(String::new());
+    }
+    if ws.entry_trust_policy_explicit {
+        lines.push(format!("entry-trust \"{}\"", trust_policy_str(&ws.entry_trust_policy)));
+        lines.push(String::new());
+    }
+    if ws.index_history_policy_explicit {
+        lines.push(format!("index-history \"{}\"", trust_policy_str(&ws.index_history_policy)));
         lines.push(String::new());
     }
 
