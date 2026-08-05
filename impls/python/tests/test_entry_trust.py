@@ -1038,3 +1038,64 @@ def test_s7_interregnum_membership_ignores_publication_timing() -> None:
 
     assert "published_at" not in inspect.signature(classify_epoch_membership).parameters
     assert "published_at" not in inspect.signature(evaluate_entry_attestation).parameters
+
+
+# ---------------------------------------------------------------------------
+# Break-glass (#196): the two-signal transient-outage lever
+# ---------------------------------------------------------------------------
+
+
+def _bg_outcome(cause):
+    from milpa.entry_trust import EntryGateOutcome, BundleMissing, EpochMembership
+    return EntryGateOutcome(
+        result=BundleMissing, epoch_membership=EpochMembership.POST_EPOCH, cause=cause
+    )
+
+
+def test_break_glass_forces_transient_unfetchable_through_under_strict(capsys):
+    from milpa.entry_trust import enforce_entry_trust, _reset_warned_entries
+    _reset_warned_entries()
+    # PostEpoch + strict + BundleMissing/unfetchable + break_glass -> no raise, loud warning.
+    enforce_entry_trust(
+        _bg_outcome("unfetchable"), "strict",
+        namespace="ns", name="pkg", version="1.0.0", break_glass=True,
+    )
+    err = capsys.readouterr().err
+    assert "INSECURE" in err and "break-glass" in err and "pkg" in err
+
+
+def test_break_glass_off_still_hard_fails_transient_under_strict():
+    from milpa.entry_trust import enforce_entry_trust, _reset_warned_entries
+    from milpa.errors import MilpaError, TNG_ENTRY_BUNDLE_MISSING
+    _reset_warned_entries()
+    with pytest.raises(MilpaError) as ei:
+        enforce_entry_trust(
+            _bg_outcome("unfetchable"), "strict",
+            namespace="ns", name="pkg", version="1.0.0", break_glass=False,
+        )
+    assert ei.value.slug == TNG_ENTRY_BUNDLE_MISSING
+
+
+def test_break_glass_never_bypasses_tampering_or_no_pin():
+    # break-glass is scoped to the TRANSIENT class only. A no-pin BundleMissing
+    # (registry never published one) is not transient, and a DigestMismatch is
+    # tampering — both must still hard-fail under strict even with break-glass.
+    from milpa.entry_trust import (
+        enforce_entry_trust, EntryGateOutcome, DigestMismatch, EpochMembership,
+        _reset_warned_entries,
+    )
+    from milpa.errors import MilpaError
+    _reset_warned_entries()
+    with pytest.raises(MilpaError):  # no-pin is not the transient class
+        enforce_entry_trust(
+            _bg_outcome("no-pin"), "strict",
+            namespace="ns", name="pkg", version="1.0.0", break_glass=True,
+        )
+    _reset_warned_entries()
+    tamper = EntryGateOutcome(
+        result=DigestMismatch, epoch_membership=EpochMembership.POST_EPOCH, cause=None
+    )
+    with pytest.raises(MilpaError):  # tampering is never bypassed
+        enforce_entry_trust(
+            tamper, "strict", namespace="ns", name="pkg", version="1.0.0", break_glass=True,
+        )

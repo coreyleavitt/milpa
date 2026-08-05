@@ -557,6 +557,11 @@ pub struct EntryTrustConfig {
     /// `None` disables bundle acquisition entirely (every attested entry with
     /// a `bundle` pin resolves as `BundleMissing`/unfetchable).
     pub bundle_store: Option<Box<dyn EntryBundleStore>>,
+    /// Break-glass (#196): forces a transient unfetchable-bundle outage
+    /// through under strict (loud, per-entry). True ONLY when both
+    /// MILPA_ENTRY_TRUST_BREAK_GLASS and --i-know-this-is-insecure are set.
+    /// Mirrors the Python `EntryTrustConfig.break_glass` field.
+    pub break_glass: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -920,6 +925,7 @@ pub fn enforce_entry_trust(
     version: &str,
     bundle_store: Option<&dyn EntryBundleStore>,
     verify_context: bool,
+    break_glass: bool,
 ) -> Result<(), MilpaError> {
     if *policy == TrustPolicy::Off || outcome.result == EntryVerificationResult::Trusted {
         return Ok(());
@@ -945,6 +951,26 @@ pub fn enforce_entry_trust(
         hint = format!("{hint} (cause: {c})");
     }
     hint = format!("{hint}{}", epoch_membership_hint_suffix(outcome.epoch_membership));
+
+    // Break-glass (#196): force a TRANSIENT bundle outage
+    // (BundleMissing/unfetchable) through under strict — ONLY when the caller
+    // resolved `break_glass` from BOTH MILPA_ENTRY_TRUST_BREAK_GLASS and
+    // --i-know-this-is-insecure. Narrow: never bypasses a present-but-invalid
+    // attestation (tampering) nor a no-pin/Unattested gap; loud + per-entry.
+    if break_glass
+        && effective_policy == TrustPolicy::Strict
+        && outcome.result == EntryVerificationResult::BundleMissing
+        && outcome.cause.as_deref() == Some("unfetchable")
+    {
+        eprintln!(
+            "milpa: INSECURE — entry-trust break-glass engaged for {coordinate:?}: \
+             proceeding despite an unfetchable attestation bundle ({slug}). This \
+             bypasses the strict mandate for a transient mirror outage only; unset \
+             MILPA_ENTRY_TRUST_BREAK_GLASS and drop --i-know-this-is-insecure, then \
+             re-run once the mirror recovers."
+        );
+        return Ok(());
+    }
 
     if effective_policy == TrustPolicy::Strict {
         return Err(MilpaError::Core(CoreError::Tianguis(
@@ -1420,21 +1446,21 @@ mod tests {
     #[test]
     fn enforce_off_is_silent() {
         enforce_entry_trust(
-            &outcome(EntryVerificationResult::Unattested), &TrustPolicy::Off, "ns1", "bar", "2.0.0", None, false,
+            &outcome(EntryVerificationResult::Unattested), &TrustPolicy::Off, "ns1", "bar", "2.0.0", None, false, false,
         ).expect("off must never raise");
     }
 
     #[test]
     fn enforce_trusted_is_silent_even_under_strict() {
         enforce_entry_trust(
-            &outcome(EntryVerificationResult::Trusted), &TrustPolicy::Strict, "ns1", "bar", "2.0.0", None, false,
+            &outcome(EntryVerificationResult::Trusted), &TrustPolicy::Strict, "ns1", "bar", "2.0.0", None, false, false,
         ).expect("trusted must never raise");
     }
 
     #[test]
     fn enforce_strict_raises_slug() {
         let err = enforce_entry_trust(
-            &outcome(EntryVerificationResult::SignerMismatch), &TrustPolicy::Strict, "ns1", "bar", "2.0.0", None, false,
+            &outcome(EntryVerificationResult::SignerMismatch), &TrustPolicy::Strict, "ns1", "bar", "2.0.0", None, false, false,
         ).unwrap_err();
         assert_eq!(err.code(), "TNG-ENTRY-SIGNER-MISMATCH");
     }
@@ -1443,8 +1469,61 @@ mod tests {
     fn enforce_warn_never_raises() {
         _reset_warned_entries();
         enforce_entry_trust(
-            &outcome(EntryVerificationResult::Unattested), &TrustPolicy::Warn, "ns1", "warntest", "2.0.0", None, false,
+            &outcome(EntryVerificationResult::Unattested), &TrustPolicy::Warn, "ns1", "warntest", "2.0.0", None, false, false,
         ).expect("warn must not raise");
+    }
+
+    // -----------------------------------------------------------------------
+    // Break-glass (#196) — mirrors impls/python/tests/test_entry_trust.py's
+    // three test_break_glass_* cases. PostEpoch throughout: the strict
+    // mandate must actually apply (Unarmed/None would downgrade to
+    // warn-equivalent per effective_epoch_policy, which would pass trivially
+    // and prove nothing about break_glass itself).
+    // -----------------------------------------------------------------------
+
+    fn bg_outcome(cause: &str) -> EntryGateOutcome {
+        outcome_with(EntryVerificationResult::BundleMissing, Some(EpochMembership::PostEpoch), Some(cause))
+    }
+
+    #[test]
+    fn break_glass_forces_transient_unfetchable_through_under_strict() {
+        _reset_warned_entries();
+        // PostEpoch + strict + BundleMissing/unfetchable + break_glass=true ->
+        // no raise (a loud per-entry stderr warning takes its place).
+        enforce_entry_trust(
+            &bg_outcome("unfetchable"), &TrustPolicy::Strict, "ns", "pkg", "1.0.0", None, false, true,
+        ).expect("break-glass must force a transient unfetchable outage through, not raise");
+    }
+
+    #[test]
+    fn break_glass_off_still_hard_fails_transient_under_strict() {
+        _reset_warned_entries();
+        let err = enforce_entry_trust(
+            &bg_outcome("unfetchable"), &TrustPolicy::Strict, "ns", "pkg", "1.0.0", None, false, false,
+        ).unwrap_err();
+        assert_eq!(err.code(), "TNG-ENTRY-BUNDLE-MISSING");
+    }
+
+    #[test]
+    fn break_glass_never_bypasses_tampering_or_no_pin() {
+        // Break-glass is scoped to the TRANSIENT class only. A no-pin
+        // BundleMissing (registry never published one) is not transient, and
+        // a DigestMismatch is tampering — both must still hard-fail under
+        // strict even with break_glass=true.
+        _reset_warned_entries();
+        enforce_entry_trust(
+            &bg_outcome("no-pin"), &TrustPolicy::Strict, "ns", "pkg", "1.0.0", None, false, true,
+        ).unwrap_err(); // no-pin is not the transient class
+
+        _reset_warned_entries();
+        let tamper = EntryGateOutcome {
+            result: EntryVerificationResult::DigestMismatch,
+            epoch_membership: Some(EpochMembership::PostEpoch),
+            cause: None,
+        };
+        enforce_entry_trust(
+            &tamper, &TrustPolicy::Strict, "ns", "pkg", "1.0.0", None, false, true,
+        ).unwrap_err(); // tampering is never bypassed
     }
 
     // -----------------------------------------------------------------------
@@ -1480,7 +1559,7 @@ mod tests {
     fn unattested_hint_recommends_warn_not_off() {
         _reset_warned_entries();
         enforce_entry_trust(
-            &outcome(EntryVerificationResult::Unattested), &TrustPolicy::Warn, "ns1", "foo", "1.0.0", None, false,
+            &outcome(EntryVerificationResult::Unattested), &TrustPolicy::Warn, "ns1", "foo", "1.0.0", None, false, false,
         ).unwrap();
         assert_eq!(hint_for(EntryVerificationResult::Unattested).contains("entry-trust \"warn\""), true);
         assert_eq!(hint_for(EntryVerificationResult::Unattested).contains("entry-trust \"off\""), false);
@@ -1534,6 +1613,7 @@ mod tests {
             "foo",
             "1.0.0",
             Some(store.as_ref()),
+            false,
             false,
         ).unwrap();
     }
@@ -1673,7 +1753,7 @@ mod tests {
             let outcome = evaluate_unattested(Some(EpochMembership::PostEpoch));
             assert_eq!(outcome.result, EntryVerificationResult::Unattested);
             assert_eq!(outcome.epoch_membership, Some(EpochMembership::PostEpoch));
-            let err = enforce_entry_trust(&outcome, &TrustPolicy::Strict, "ns1", "foo", "1.0.0", None, false).unwrap_err();
+            let err = enforce_entry_trust(&outcome, &TrustPolicy::Strict, "ns1", "foo", "1.0.0", None, false, false).unwrap_err();
             assert_eq!(err.code(), "TNG-ENTRY-UNATTESTED");
         }
 
@@ -1682,7 +1762,7 @@ mod tests {
             _reset_warned_entries();
             let outcome = evaluate_unattested(Some(EpochMembership::PreEpoch));
             assert_eq!(outcome.epoch_membership, Some(EpochMembership::PreEpoch));
-            enforce_entry_trust(&outcome, &TrustPolicy::Strict, "ns1", "foo", "1.0.0", None, false)
+            enforce_entry_trust(&outcome, &TrustPolicy::Strict, "ns1", "foo", "1.0.0", None, false, false)
                 .expect("PreEpoch must stay warn-territory even under strict");
         }
 
@@ -1691,14 +1771,14 @@ mod tests {
             _reset_warned_entries();
             let outcome = evaluate_unattested(None);
             assert_eq!(outcome.epoch_membership, None);
-            enforce_entry_trust(&outcome, &TrustPolicy::Strict, "ns1", "foo", "1.0.0", None, false)
+            enforce_entry_trust(&outcome, &TrustPolicy::Strict, "ns1", "foo", "1.0.0", None, false, false)
                 .expect("Unarmed must be warn-equivalent even under strict");
         }
 
         #[test]
         fn post_epoch_mandate_hint_is_pinned() {
             let outcome = evaluate_unattested(Some(EpochMembership::PostEpoch));
-            let err = enforce_entry_trust(&outcome, &TrustPolicy::Strict, "ns1", "foo", "1.0.0", None, false).unwrap_err();
+            let err = enforce_entry_trust(&outcome, &TrustPolicy::Strict, "ns1", "foo", "1.0.0", None, false, false).unwrap_err();
             let msg = err.message();
             assert!(msg.contains("not in the registry's committed pre-epoch set"), "{msg}");
             assert!(msg.contains("must carry a verifiable attestation"), "{msg}");
@@ -1724,7 +1804,7 @@ mod tests {
                     Some(&store), &TrustBundle::test(), "vendor-bot", &status_for(membership),
                 ).unwrap();
                 assert_eq!(outcome.result, EntryVerificationResult::Trusted);
-                enforce_entry_trust(&outcome, &TrustPolicy::Strict, "ns1", "foo", "1.0.0", None, false)
+                enforce_entry_trust(&outcome, &TrustPolicy::Strict, "ns1", "foo", "1.0.0", None, false, false)
                     .expect("Trusted must never raise/warn regardless of membership");
             }
         }
@@ -1734,7 +1814,7 @@ mod tests {
             for membership in [Some(EpochMembership::PreEpoch), Some(EpochMembership::PostEpoch), None] {
                 _reset_warned_entries();
                 let outcome = evaluate_unattested(membership);
-                enforce_entry_trust(&outcome, &TrustPolicy::Warn, "ns1", "foo", "1.0.0", None, false)
+                enforce_entry_trust(&outcome, &TrustPolicy::Warn, "ns1", "foo", "1.0.0", None, false, false)
                     .expect("warn must never raise");
             }
         }
@@ -1743,7 +1823,7 @@ mod tests {
         fn off_policy_never_raises_regardless_of_membership() {
             for membership in [Some(EpochMembership::PreEpoch), Some(EpochMembership::PostEpoch), None] {
                 let outcome = evaluate_unattested(membership);
-                enforce_entry_trust(&outcome, &TrustPolicy::Off, "ns1", "foo", "1.0.0", None, false)
+                enforce_entry_trust(&outcome, &TrustPolicy::Off, "ns1", "foo", "1.0.0", None, false, false)
                     .expect("off must never raise");
             }
         }
@@ -1856,6 +1936,7 @@ mod tests {
                 ENTRY_FIXTURE_VERSION,
                 None,
                 false,
+                false,
             )
             .unwrap_err();
             assert_eq!(err.code(), "TNG-ENTRY-UNATTESTED");
@@ -1912,6 +1993,7 @@ mod tests {
                 ENTRY_FIXTURE_NAME,
                 ENTRY_FIXTURE_VERSION,
                 None,
+                false,
                 false,
             )
             .unwrap_err();
@@ -2098,6 +2180,7 @@ mod tests {
                 ENTRY_FIXTURE_VERSION,
                 Some(&store),
                 false,
+                false,
             )
             .unwrap_err();
             assert_eq!(err.code(), "TNG-ENTRY-BUNDLE-MISSING");
@@ -2129,7 +2212,7 @@ mod tests {
             assert_eq!(outcome.result, EntryVerificationResult::Unattested);
             assert_eq!(outcome.epoch_membership, Some(EpochMembership::PreEpoch));
 
-            enforce_entry_trust(&outcome, &TrustPolicy::Strict, "testns", "legacy-pkg", "0.9.0", None, false)
+            enforce_entry_trust(&outcome, &TrustPolicy::Strict, "testns", "legacy-pkg", "0.9.0", None, false, false)
                 .expect("pre-epoch legacy unattested must stay warn-territory even under strict");
         }
 
@@ -2220,7 +2303,7 @@ mod tests {
                 epoch_membership: Some(EpochMembership::PostEpoch),
                 cause: Some("unfetchable".to_string()),
             };
-            let err = enforce_entry_trust(&outcome, &TrustPolicy::Strict, "ns1", "foo", "1.0.0", None, true)
+            let err = enforce_entry_trust(&outcome, &TrustPolicy::Strict, "ns1", "foo", "1.0.0", None, true, false)
                 .unwrap_err();
             let msg = err.message();
             assert!(msg.contains("'milpa verify' only"), "{msg}");
@@ -2236,7 +2319,7 @@ mod tests {
                 epoch_membership: Some(EpochMembership::PostEpoch),
                 cause: Some("unfetchable".to_string()),
             };
-            let err = enforce_entry_trust(&outcome, &TrustPolicy::Strict, "ns1", "foo", "1.0.0", None, false)
+            let err = enforce_entry_trust(&outcome, &TrustPolicy::Strict, "ns1", "foo", "1.0.0", None, false, false)
                 .unwrap_err();
             let msg = err.message();
             assert!(msg.contains("no attestation-bundle source is configured"), "{msg}");

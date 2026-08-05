@@ -4457,6 +4457,7 @@ impl<'a> ResolveProvider<'a> {
                             &version_str,
                             cfg.bundle_store.as_deref(),
                             false,
+                            cfg.break_glass,
                         )?;
                     }
                 }
@@ -4541,6 +4542,7 @@ impl<'a> ResolveProvider<'a> {
                             &version_str,
                             cfg.bundle_store.as_deref(),
                             false,
+                            cfg.break_glass,
                         )?;
                     }
                 }

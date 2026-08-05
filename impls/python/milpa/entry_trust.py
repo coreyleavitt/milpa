@@ -536,6 +536,10 @@ class EntryTrustConfig:
     expected_vendor_signer: str
     verifier: "EntryBundleVerifier"
     bundle_store: "object | None"  # EntryBundleStore protocol; None disables acquisition
+    #: Break-glass (#196): forces a transient unfetchable-bundle outage through
+    #: under strict (loud, per-entry). True ONLY when both
+    #: MILPA_ENTRY_TRUST_BREAK_GLASS and --i-know-this-is-insecure are set.
+    break_glass: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -872,6 +876,7 @@ def enforce_entry_trust(
     version: str,
     bundle_store: "object | None" = None,
     verify_context: bool = False,
+    break_glass: bool = False,
 ) -> None:
     """warn/strict slug dispatch for one selected entry's gate outcome (D9).
 
@@ -921,6 +926,31 @@ def enforce_entry_trust(
     if outcome.cause is not None:
         hint = f"{hint} (cause: {outcome.cause})"
     hint = f"{hint}{_epoch_membership_hint_suffix(outcome.epoch_membership)}"
+
+    # Break-glass (RFC attestation-v1-normative.md, D1 resolved-with-recommendation
+    # block; #196): a TRANSIENT attestation-mirror outage (``BundleMissing`` with
+    # cause ``unfetchable``) under ``strict`` may be forced through ONLY when the
+    # caller resolved ``break_glass`` from BOTH ``MILPA_ENTRY_TRUST_BREAK_GLASS``
+    # and the explicit ``--i-know-this-is-insecure`` flag. It is deliberately
+    # NARROW: it never bypasses a present-but-invalid attestation
+    # (digest/subject/signature/signer mismatch = tampering) nor a
+    # ``no-pin``/``Unattested`` gap — only the "the mirror is unreachable right
+    # now" class — and it is loud + per-entry (never silent).
+    if (
+        break_glass
+        and effective_policy == "strict"
+        and outcome.result is BundleMissing
+        and outcome.cause == "unfetchable"
+    ):
+        print(
+            f"milpa: INSECURE — entry-trust break-glass engaged for {coordinate!r}: "
+            f"proceeding despite an unfetchable attestation bundle ({slug}). This "
+            "bypasses the strict mandate for a transient mirror outage only; unset "
+            "MILPA_ENTRY_TRUST_BREAK_GLASS and drop --i-know-this-is-insecure, then "
+            "re-run once the mirror recovers.",
+            file=_sys.stderr,
+        )
+        return
 
     if effective_policy == "strict":
         raise MilpaError(

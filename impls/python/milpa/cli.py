@@ -414,6 +414,20 @@ def _make_parser() -> argparse.ArgumentParser:
             "per-entry author-attribution axis (RFC per-entry-attestation.md §4)."
         ),
     )
+    # Break-glass (#196): the INSECURE half of the two-signal lever. Engages
+    # ONLY together with MILPA_ENTRY_TRUST_BREAK_GLASS; forces a TRANSIENT
+    # entry-trust bundle-outage (unfetchable) through under strict, loudly and
+    # per-entry. Never bypasses a present-but-invalid attestation (tampering).
+    parser.add_argument(
+        "--i-know-this-is-insecure",
+        action="store_true",
+        default=False,
+        help=(
+            "break-glass: with MILPA_ENTRY_TRUST_BREAK_GLASS set, force a "
+            "transient (unfetchable) entry-trust bundle outage through under "
+            "strict. INSECURE — emergency use only; both signals required."
+        ),
+    )
 
     subparsers = parser.add_subparsers(dest="command", metavar="<command>")
 
@@ -1230,6 +1244,7 @@ def _build_entry_trust(
         expected_vendor_signer=expected_signer,
         verifier=verifier,
         bundle_store=bundle_store,
+        break_glass=env.entry_trust_break_glass,
     )
 
 
@@ -5643,6 +5658,14 @@ def main(argv: list[str] | None = None) -> int:
     _refresh_index = getattr(args, "refresh_index", False)
     # P3a: entry-trust escalation flag (mirrors _require_attested_index).
     _require_attested_entries = getattr(args, "require_attested_entries", False)
+    # Break-glass (#196): a transient entry-trust mirror outage may be forced
+    # through ONLY when BOTH signals are present — the env var AND the explicit
+    # --i-know-this-is-insecure flag. Neither alone engages it.
+    _break_glass = bool(
+        getattr(args, "i_know_this_is_insecure", False)
+        and os.environ.get("MILPA_ENTRY_TRUST_BREAK_GLASS", "").strip()
+        not in ("", "0", "false")
+    )
 
     # Update the env with index-trust state (env vars + flags).
     # require_attested_index escalates the effective policy warn→strict per-verb
@@ -5653,6 +5676,7 @@ def main(argv: list[str] | None = None) -> int:
         refresh_index=_refresh_index,
         require_attested_index=_require_attested_index,
         require_attested_entries=_require_attested_entries,
+        entry_trust_break_glass=_break_glass,
     )
 
     # Dispatch.

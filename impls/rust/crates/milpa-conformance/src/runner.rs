@@ -2531,6 +2531,11 @@ fn fixture_entry_trust_config(
         expected_vendor_signer: expected_signer,
         verifier: Box::new(MockEntryVerifier::new(default_result, by_subject)),
         bundle_store,
+        // Break-glass (#196) is a CLI-only lever (--i-know-this-is-insecure +
+        // MILPA_ENTRY_TRUST_BREAK_GLASS); the conformance in-process runner
+        // has no CLI arg parsing seam, so this is always off here — mirrors
+        // the Python conformance adapter, which never wires it either.
+        break_glass: false,
     }))
 }
 

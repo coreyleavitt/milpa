@@ -101,6 +101,10 @@ class MilpaEnv:
     #: Mirrors ``require_attested_index`` — stored here (not read from env)
     #: because it comes from CLI arg parsing in main().
     require_attested_entries: bool = False
+    #: Break-glass (#196): forces a TRANSIENT entry-trust bundle-outage
+    #: (BundleMissing/unfetchable) through under strict. True ONLY when both
+    #: MILPA_ENTRY_TRUST_BREAK_GLASS and --i-know-this-is-insecure are set.
+    entry_trust_break_glass: bool = False
 
 
 @dataclass(frozen=True)

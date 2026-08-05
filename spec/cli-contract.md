@@ -947,6 +947,23 @@ like §5.3a).
 > - Produce output that is byte-identical between all conformant
 >   implementations.
 
+> NORMATIVE (break-glass — the two-signal transient-outage lever, #196):
+> a `strict` entry-trust failure of the **transient class only**
+> (`TNG-ENTRY-BUNDLE-MISSING` with cause `unfetchable` — the attestation
+> mirror is unreachable right now) MAY be forced through as a loud,
+> per-entry stderr warning (exit 0) instead of a hard failure, but ONLY
+> when BOTH signals are present in the SAME invocation: the environment
+> variable `MILPA_ENTRY_TRUST_BREAK_GLASS` set to a non-empty value other
+> than `0`/`false`, AND the explicit CLI flag `--i-know-this-is-insecure`.
+> Neither alone engages it. Break-glass MUST NOT bypass any other failure
+> class — a present-but-invalid attestation (`DIGEST-MISMATCH` /
+> `SUBJECT-MISMATCH` / `SIGNATURE-INVALID` / `SIGNER-MISMATCH` = tampering),
+> a `no-pin` `BUNDLE-MISSING` (the registry never published one, not
+> transient), or an `UNATTESTED` gap all still hard-fail under strict. It is
+> an emergency valve distinct from the durable manifest `entry-trust
+> "warn"/"off"` opt-outs; the warning names both signals so the operator can
+> unset them once the mirror recovers.
+
 > NORMATIVE: The output format uses the SAME fixed 16-character
 > label+colon column convention as §5.3a:
 >

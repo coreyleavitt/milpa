@@ -101,6 +101,13 @@ struct Cli {
     /// Identical semantics to `--require-attested-index` but for the
     /// per-entry author-attribution axis.
     require_attested_entries: bool,
+    /// Break-glass (#196): true ONLY when BOTH the `--i-know-this-is-insecure`
+    /// flag AND `MILPA_ENTRY_TRUST_BREAK_GLASS` (non-empty, not `0`/`false`)
+    /// are present. Forces a TRANSIENT entry-trust bundle outage
+    /// (`BundleMissing`/`unfetchable`) through under strict, loudly and
+    /// per-entry. Never bypasses a present-but-invalid attestation (tampering)
+    /// nor a no-pin/`Unattested` gap. Mirrors the Python CLI's `_break_glass`.
+    entry_trust_break_glass: bool,
     verb: String,
     rest: Vec<String>,
 }
@@ -224,12 +231,12 @@ fn run(args: &[String]) -> Result<i32, MilpaError> {
                 cmd_show(dir)
             }
         }
-        "verify" => cmd_verify(dir, cli.require_attested_metadata, cli.no_index, cli.require_attested_index, cli.refresh_index, cli.require_attested_entries),
+        "verify" => cmd_verify(dir, cli.require_attested_metadata, cli.no_index, cli.require_attested_index, cli.refresh_index, cli.require_attested_entries, cli.entry_trust_break_glass),
         "clean" => cmd_clean(dir),
-        "fetch" => cmd_fetch(dir, strategy_cli, cli.frozen, true, cert_path, cli.require_attested_metadata, cli.no_index, &cli.rest, cli.require_attested_index, cli.refresh_index, cli.require_attested_entries, exclude_newer_cli),
-        "lock" => cmd_fetch(dir, strategy_cli, cli.frozen, false, cert_path, cli.require_attested_metadata, cli.no_index, &cli.rest, cli.require_attested_index, cli.refresh_index, cli.require_attested_entries, exclude_newer_cli),
-        "update" => cmd_update(dir, strategy_cli, &cli.rest, cli.no_index, cli.require_attested_index, cli.refresh_index, cli.require_attested_entries),
-        "add" => cmd_add(dir, strategy_cli, &cli.rest, cli.no_index, cli.require_attested_index, cli.refresh_index, cli.require_attested_entries),
+        "fetch" => cmd_fetch(dir, strategy_cli, cli.frozen, true, cert_path, cli.require_attested_metadata, cli.no_index, &cli.rest, cli.require_attested_index, cli.refresh_index, cli.require_attested_entries, cli.entry_trust_break_glass, exclude_newer_cli),
+        "lock" => cmd_fetch(dir, strategy_cli, cli.frozen, false, cert_path, cli.require_attested_metadata, cli.no_index, &cli.rest, cli.require_attested_index, cli.refresh_index, cli.require_attested_entries, cli.entry_trust_break_glass, exclude_newer_cli),
+        "update" => cmd_update(dir, strategy_cli, &cli.rest, cli.no_index, cli.require_attested_index, cli.refresh_index, cli.require_attested_entries, cli.entry_trust_break_glass),
+        "add" => cmd_add(dir, strategy_cli, &cli.rest, cli.no_index, cli.require_attested_index, cli.refresh_index, cli.require_attested_entries, cli.entry_trust_break_glass),
         "remove" => cmd_remove(dir, strategy_cli, &cli.rest, cli.no_index, cli.require_attested_index, cli.refresh_index),
         "store" => cmd_store(&cli.rest),
         "workspace" => cmd_workspace(dir, &cli.rest, strategy_cli, cli.no_index, cli.require_attested_index, cli.refresh_index),
@@ -292,6 +299,9 @@ fn parse_args(args: &[String]) -> Option<Cli> {
     let mut refresh_index = false;
     // P3a: entry-trust escalation flag (mirrors require_attested_index).
     let mut require_attested_entries = false;
+    // Break-glass (#196): the raw `--i-know-this-is-insecure` flag. Combined
+    // with the env var below (AND, not OR) to produce entry_trust_break_glass.
+    let mut i_know_this_is_insecure = false;
     let mut i = 0;
     let verb;
     loop {
@@ -329,6 +339,15 @@ fn parse_args(args: &[String]) -> Option<Cli> {
                 require_attested_entries = true;
                 i += 1;
             }
+            // Break-glass (#196): the INSECURE half of the two-signal lever.
+            // Engages ONLY together with MILPA_ENTRY_TRUST_BREAK_GLASS; forces
+            // a TRANSIENT entry-trust bundle-outage (unfetchable) through
+            // under strict, loudly and per-entry. Never bypasses a
+            // present-but-invalid attestation (tampering).
+            "--i-know-this-is-insecure" => {
+                i_know_this_is_insecure = true;
+                i += 1;
+            }
             "--refresh-index" => {
                 refresh_index = true;
                 i += 1;
@@ -341,6 +360,13 @@ fn parse_args(args: &[String]) -> Option<Cli> {
             _ => return None,
         }
     }
+    // Break-glass (#196): a transient entry-trust mirror outage may be forced
+    // through ONLY when BOTH signals are present — the env var AND the
+    // explicit --i-know-this-is-insecure flag. Neither alone engages it.
+    let entry_trust_break_glass = i_know_this_is_insecure
+        && std::env::var("MILPA_ENTRY_TRUST_BREAK_GLASS")
+            .map(|v| parse_env_bool(&v))
+            .unwrap_or(false);
     Some(Cli {
         directory,
         frozen,
@@ -350,6 +376,7 @@ fn parse_args(args: &[String]) -> Option<Cli> {
         require_attested_index,
         refresh_index,
         require_attested_entries,
+        entry_trust_break_glass,
         verb,
         rest: args[i..].to_vec(),
     })
@@ -855,6 +882,7 @@ fn cmd_verify(
     require_attested_index: bool,
     refresh_index: bool,
     require_attested_entries: bool,
+    entry_trust_break_glass: bool,
 ) -> Result<i32, MilpaError> {
     // Gap-1 D: load_lockfile's `?` surfaces LOCK-FILE-NOT-FOUND via the Err path
     // in main (which now emits the milpa-error: slug automatically). No inline
@@ -1018,6 +1046,7 @@ fn cmd_verify(
         verify_index_bundle.clone(),
         require_attested_entries,
         no_index,
+        entry_trust_break_glass,
         &reverified_epoch_status,
     ) {
         Ok(n) => n,
@@ -1398,6 +1427,9 @@ fn cmd_fetch(
     require_attested_index: bool,
     refresh_index: bool,
     require_attested_entries: bool,
+    // Break-glass (#196): threaded through to build_entry_trust_gate the same
+    // way require_attested_entries is — see the Cli struct field doc comment.
+    entry_trust_break_glass: bool,
     // D2 (resolution-semantics RFC §3 Axis D): the CLI `--exclude-newer`
     // value (fetch/lock only — the ONLY two verbs `cmd_fetch` implements).
     // `None` when unspecified; resolved to the EFFECTIVE value against this
@@ -1496,6 +1528,7 @@ fn cmd_fetch(
                 ws.index_trust_bundle.clone(),
                 require_attested_entries,
                 no_index,
+                entry_trust_break_glass,
             )?;
 
             // S8 (RFC: workspace-completion §3.E): --certificate honored in workspace
@@ -1633,6 +1666,7 @@ fn cmd_fetch(
             manifest.index_trust_bundle.clone(),
             require_attested_entries,
             no_index,
+            entry_trust_break_glass,
         )?;
 
         if let Some(cert_dest) = cert_path {
@@ -1855,7 +1889,7 @@ fn cmd_fetch_workspace_with_cert(
 ///   drop ONLY that pin; pass all other pins to the resolver as `prior` so they
 ///   stay stable; re-resolve; write the new lockfile.
 #[allow(clippy::too_many_arguments)]
-fn cmd_update(dir: &Path, strategy_cli: Option<Strategy>, rest: &[String], no_index: bool, require_attested_index: bool, refresh_index: bool, require_attested_entries: bool) -> Result<i32, MilpaError> {
+fn cmd_update(dir: &Path, strategy_cli: Option<Strategy>, rest: &[String], no_index: bool, require_attested_index: bool, refresh_index: bool, require_attested_entries: bool, entry_trust_break_glass: bool) -> Result<i32, MilpaError> {
     let name = rest.first().cloned();
     let lock_path = dir.join("milpa.lock");
 
@@ -1910,6 +1944,7 @@ fn cmd_update(dir: &Path, strategy_cli: Option<Strategy>, rest: &[String], no_in
             ws.index_trust_bundle.clone(),
             require_attested_entries,
             no_index,
+            entry_trust_break_glass,
         )?;
         // C3/R9 (resolution-semantics RFC §3 Axis C / D-C2): resolve the
         // EFFECTIVE strategy (+ whether it was explicitly sourced) against
@@ -1968,6 +2003,7 @@ fn cmd_update(dir: &Path, strategy_cli: Option<Strategy>, rest: &[String], no_in
             ws.index_trust_bundle.clone(),
             require_attested_entries,
             no_index,
+            entry_trust_break_glass,
         )?;
         // Re-build prior against the SHARED lockfile, not a member-local one.
         // B4 (D-B3): same shared `strip_pins_for_upgrade` delegation as the
@@ -2041,6 +2077,7 @@ fn cmd_update(dir: &Path, strategy_cli: Option<Strategy>, rest: &[String], no_in
         manifest.index_trust_bundle.clone(),
         require_attested_entries,
         no_index,
+        entry_trust_break_glass,
     )?;
     // C3/R9: resolve the EFFECTIVE strategy (+ whether it was explicitly
     // sourced) against the current manifest — independent of `prior` above
@@ -2096,7 +2133,7 @@ fn parse_add_version_flag(rest: &[String]) -> Result<Option<Version>, MilpaError
 
 /// `milpa add <name> --git <url> [--ref <r>]` / `add <name> --mirror <url>`.
 #[allow(clippy::too_many_arguments)]
-fn cmd_add(dir: &Path, strategy_cli: Option<Strategy>, rest: &[String], no_index: bool, require_attested_index: bool, refresh_index: bool, require_attested_entries: bool) -> Result<i32, MilpaError> {
+fn cmd_add(dir: &Path, strategy_cli: Option<Strategy>, rest: &[String], no_index: bool, require_attested_index: bool, refresh_index: bool, require_attested_entries: bool, entry_trust_break_glass: bool) -> Result<i32, MilpaError> {
     let Some(name) = rest.first().cloned().filter(|n| !n.starts_with('-')) else {
         // Gap-1 C: no-name → usage error → exit 2 (no milpa-error: line).
         eprintln!("add: usage: milpa add <name> --git <url> [--ref <r>] | --mirror <url>");
@@ -2227,6 +2264,7 @@ fn cmd_add(dir: &Path, strategy_cli: Option<Strategy>, rest: &[String], no_index
             ws.index_trust_bundle.clone(),
             require_attested_entries,
             no_index,
+            entry_trust_break_glass,
         )?;
         let graph = resolve_workspace_with_features(
             &ws_with_override,
@@ -2363,6 +2401,7 @@ fn cmd_add(dir: &Path, strategy_cli: Option<Strategy>, rest: &[String], no_index
         existing.index_trust_bundle.clone(),
         require_attested_entries,
         no_index,
+        entry_trust_break_glass,
     )?;
     let graph = resolve_with_features(
         &proposed,
@@ -3760,6 +3799,7 @@ fn build_entry_trust_gate(
     manifest_bundle: Option<String>,
     require_attested_entries: bool,
     no_index: bool,
+    break_glass: bool,
 ) -> Result<Option<milpa_core::EntryTrustConfig>, MilpaError> {
     use milpa_core::entry_trust::{MockEntryVerifier, SigstoreEntryVerifier, VerifierOutcome};
     use milpa_core::{effective_trust_policy, EntryBundleVerifier, EntryTrustConfig};
@@ -3875,6 +3915,7 @@ fn build_entry_trust_gate(
         expected_vendor_signer: expected_signer,
         verifier,
         bundle_store,
+        break_glass,
     }))
 }
 
@@ -3918,6 +3959,7 @@ fn reverify_cached_entry_attestations(
     manifest_bundle: Option<String>,
     require_attested_entries: bool,
     no_index: bool,
+    entry_trust_break_glass: bool,
     epoch_status: &milpa_core::epoch_commitment::EpochCommitmentStatus,
 ) -> Result<u32, MilpaError> {
     use milpa_core::entry_trust::{classify_epoch_membership, EntryVerificationResult};
@@ -3930,6 +3972,7 @@ fn reverify_cached_entry_attestations(
         manifest_bundle,
         require_attested_entries,
         no_index,
+        entry_trust_break_glass,
     )?
     else {
         return Ok(0); // policy off
@@ -4004,6 +4047,7 @@ fn reverify_cached_entry_attestations(
             &dep.version,
             cfg.bundle_store.as_deref(),
             true, // verify_context: this IS milpa verify's offline reverify path
+            cfg.break_glass,
         )?;
     }
     Ok(trusted_count)
@@ -5315,12 +5359,12 @@ mod tests {
 
         // First, fetch to produce a baseline lockfile with both pins.
         unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
-        assert_eq!(cmd_fetch(&proj, Some(Strategy::default()), false, true, None, false, false, &[], false, false, false, None).unwrap(), 0);
+        assert_eq!(cmd_fetch(&proj, Some(Strategy::default()), false, true, None, false, false, &[], false, false, false, false, None).unwrap(), 0);
         let baseline = std::fs::read_to_string(proj.join("milpa.lock")).unwrap();
         assert!(baseline.contains("\"foo\"") && baseline.contains("\"bar\""));
 
         // Scoped update of foo: succeeds, writes the lockfile, leaves kdl intact.
-        let r = cmd_update(&proj, Some(Strategy::default()), &["foo".into()], false, false, false, false);
+        let r = cmd_update(&proj, Some(Strategy::default()), &["foo".into()], false, false, false, false, false);
         let after_kdl = std::fs::read_to_string(proj.join("milpa.kdl")).unwrap();
         let after_lock = std::fs::read_to_string(proj.join("milpa.lock")).unwrap();
         unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
@@ -5354,11 +5398,11 @@ mod tests {
         .unwrap();
 
         unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
-        let baseline = cmd_fetch(&proj, Some(Strategy::default()), false, true, None, false, false, &[], false, false, false, None);
+        let baseline = cmd_fetch(&proj, Some(Strategy::default()), false, true, None, false, false, &[], false, false, false, false, None);
         assert_eq!(baseline.unwrap(), 0);
 
         let locked_arg = vec!["--locked".to_string()];
-        let r = cmd_fetch(&proj, Some(Strategy::default()), false, true, None, false, false, &locked_arg, false, false, false, None);
+        let r = cmd_fetch(&proj, Some(Strategy::default()), false, true, None, false, false, &locked_arg, false, false, false, false, None);
         unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
 
         assert_eq!(r.unwrap(), 0, "--locked on an up-to-date lock should pass");
@@ -5382,11 +5426,11 @@ mod tests {
         .unwrap();
 
         unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
-        let baseline = cmd_fetch(&proj, Some(Strategy::default()), false, false, None, false, false, &[], false, false, false, None);
+        let baseline = cmd_fetch(&proj, Some(Strategy::default()), false, false, None, false, false, &[], false, false, false, false, None);
         assert_eq!(baseline.unwrap(), 0);
 
         let locked_arg = vec!["--locked".to_string()];
-        let r = cmd_fetch(&proj, Some(Strategy::default()), false, false, None, false, false, &locked_arg, false, false, false, None);
+        let r = cmd_fetch(&proj, Some(Strategy::default()), false, false, None, false, false, &locked_arg, false, false, false, false, None);
         unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
 
         assert_eq!(r.unwrap(), 0, "--locked on `lock` should also pass");
@@ -5411,7 +5455,7 @@ mod tests {
 
         unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
         let locked_arg = vec!["--locked".to_string()];
-        let r = cmd_fetch(&proj, Some(Strategy::default()), false, true, None, false, false, &locked_arg, false, false, false, None);
+        let r = cmd_fetch(&proj, Some(Strategy::default()), false, true, None, false, false, &locked_arg, false, false, false, false, None);
         unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
 
         assert_eq!(r.unwrap_err().code(), "RES-LOCKED-DRIFT");
@@ -5437,7 +5481,7 @@ mod tests {
 
         unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
         assert_eq!(
-            cmd_fetch(&proj, Some(Strategy::default()), false, true, None, false, false, &[], false, false, false, None).unwrap(),
+            cmd_fetch(&proj, Some(Strategy::default()), false, true, None, false, false, &[], false, false, false, false, None).unwrap(),
             0
         );
         let baseline_lock = std::fs::read_to_string(proj.join("milpa.lock")).unwrap();
@@ -5451,7 +5495,7 @@ mod tests {
         .unwrap();
 
         let locked_arg = vec!["--locked".to_string()];
-        let r = cmd_fetch(&proj, Some(Strategy::default()), false, true, None, false, false, &locked_arg, false, false, false, None);
+        let r = cmd_fetch(&proj, Some(Strategy::default()), false, true, None, false, false, &locked_arg, false, false, false, false, None);
         unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
 
         let err = r.unwrap_err();
@@ -5486,7 +5530,7 @@ mod tests {
         let ts = parse_iso8601_timestamp("2026-01-01T00:00:00Z").unwrap();
         unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
         // Baseline: fetch WITH --exclude-newer (records it in the lock).
-        let baseline = cmd_fetch(&proj, Some(Strategy::default()), false, true, None, false, false, &[], false, false, false, Some(ts));
+        let baseline = cmd_fetch(&proj, Some(Strategy::default()), false, true, None, false, false, &[], false, false, false, false, Some(ts));
         assert_eq!(baseline.unwrap(), 0);
         let baseline_lock = load_lockfile(&proj.join("milpa.lock")).unwrap();
         assert_eq!(baseline_lock.exclude_newer, Some(ts));
@@ -5495,7 +5539,7 @@ mod tests {
         // resolution{} block either) — the effective value is None, dropping
         // the committed bound. Must raise RES-LOCKED-DRIFT, not silently pass.
         let locked_arg = vec!["--locked".to_string()];
-        let r = cmd_fetch(&proj, Some(Strategy::default()), false, true, None, false, false, &locked_arg, false, false, false, None);
+        let r = cmd_fetch(&proj, Some(Strategy::default()), false, true, None, false, false, &locked_arg, false, false, false, false, None);
         unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
 
         let err = r.unwrap_err();
@@ -5522,12 +5566,12 @@ mod tests {
 
         let ts = parse_iso8601_timestamp("2026-01-01T00:00:00Z").unwrap();
         unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
-        let baseline = cmd_fetch(&proj, Some(Strategy::default()), false, true, None, false, false, &[], false, false, false, Some(ts));
+        let baseline = cmd_fetch(&proj, Some(Strategy::default()), false, true, None, false, false, &[], false, false, false, false, Some(ts));
         assert_eq!(baseline.unwrap(), 0);
 
         // Same --exclude-newer passed again alongside --locked: no drift.
         let locked_arg = vec!["--locked".to_string()];
-        let r = cmd_fetch(&proj, Some(Strategy::default()), false, true, None, false, false, &locked_arg, false, false, false, Some(ts));
+        let r = cmd_fetch(&proj, Some(Strategy::default()), false, true, None, false, false, &locked_arg, false, false, false, false, Some(ts));
         unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
 
         assert_eq!(r.unwrap(), 0, "--locked with an unchanged exclude_newer must pass");
@@ -5548,7 +5592,7 @@ mod tests {
         .unwrap();
 
         // No lockfile yet → scoped update fails with LOCK-FILE-NOT-FOUND.
-        let no_lock = cmd_update(&proj, Some(Strategy::default()), &["ghost".into()], false, false, false, false);
+        let no_lock = cmd_update(&proj, Some(Strategy::default()), &["ghost".into()], false, false, false, false, false);
         assert!(no_lock.is_err());
         assert_eq!(no_lock.unwrap_err().code(), "LOCK-FILE-NOT-FOUND");
 
@@ -5558,7 +5602,7 @@ mod tests {
             "// generated by milpa; reproducible build snapshot\nversion 1\nstrategy \"maxver\"\n",
         )
         .unwrap();
-        let r = cmd_update(&proj, Some(Strategy::default()), &["ghost".into()], false, false, false, false);
+        let r = cmd_update(&proj, Some(Strategy::default()), &["ghost".into()], false, false, false, false, false);
         assert_eq!(r.unwrap(), 1, "dep-not-in-lock → exit 1");
     }
 
@@ -5628,7 +5672,7 @@ mod tests {
         let proj = tmp.join(subdir);
         std::fs::create_dir_all(&proj).unwrap();
         std::fs::write(proj.join("milpa.kdl"), B4_ROOT_KDL).unwrap();
-        let rc = cmd_fetch(&proj, Some(Strategy::default()), false, true, None, false, false, &[], false, false, false, None).unwrap();
+        let rc = cmd_fetch(&proj, Some(Strategy::default()), false, true, None, false, false, &[], false, false, false, false, None).unwrap();
         assert_eq!(rc, 0);
         let versions = b4_versions(&proj.join("milpa.lock"));
         assert_eq!(
@@ -5726,7 +5770,7 @@ mod tests {
         unsafe { std::env::set_var("MILPA_INDEX_URL", format!("file://{}", index_v1v2_path.display())) };
 
         // Plain re-fetch (no --upgrade): minimal-change keeps both locked.
-        let rc = cmd_fetch(&proj, Some(Strategy::default()), false, true, None, false, false, &[], false, false, false, None).unwrap();
+        let rc = cmd_fetch(&proj, Some(Strategy::default()), false, true, None, false, false, &[], false, false, false, false, None).unwrap();
         assert_eq!(rc, 0);
         assert_eq!(
             b4_versions(&proj.join("milpa.lock")),
@@ -5738,7 +5782,7 @@ mod tests {
 
         // Bare --upgrade: opts out GLOBALLY -> both move to the newest.
         let upgrade_arg = vec!["--upgrade".to_string()];
-        let rc = cmd_fetch(&proj, Some(Strategy::default()), false, true, None, false, false, &upgrade_arg, false, false, false, None).unwrap();
+        let rc = cmd_fetch(&proj, Some(Strategy::default()), false, true, None, false, false, &upgrade_arg, false, false, false, false, None).unwrap();
         unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
         unsafe { std::env::remove_var("MILPA_INDEX_URL") };
         assert_eq!(rc, 0);
@@ -5773,7 +5817,7 @@ mod tests {
         unsafe { std::env::set_var("MILPA_INDEX_URL", format!("file://{}", index_v1v2_path.display())) };
 
         let upgrade_arg = vec!["--upgrade".to_string(), "foo".to_string()];
-        let rc = cmd_fetch(&proj, Some(Strategy::default()), false, true, None, false, false, &upgrade_arg, false, false, false, None).unwrap();
+        let rc = cmd_fetch(&proj, Some(Strategy::default()), false, true, None, false, false, &upgrade_arg, false, false, false, false, None).unwrap();
         unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
         unsafe { std::env::remove_var("MILPA_INDEX_URL") };
         assert_eq!(rc, 0);
@@ -5810,11 +5854,11 @@ mod tests {
         // Bare: fetch --upgrade vs bare update.
         let upgrade_bare = vec!["--upgrade".to_string()];
         assert_eq!(
-            cmd_fetch(&proj_a, Some(Strategy::default()), false, true, None, false, false, &upgrade_bare, false, false, false, None).unwrap(),
+            cmd_fetch(&proj_a, Some(Strategy::default()), false, true, None, false, false, &upgrade_bare, false, false, false, false, None).unwrap(),
             0
         );
         assert_eq!(
-            cmd_update(&proj_b, Some(Strategy::default()), &[], false, false, false, false).unwrap(),
+            cmd_update(&proj_b, Some(Strategy::default()), &[], false, false, false, false, false).unwrap(),
             0
         );
         assert_eq!(b4_versions(&proj_a.join("milpa.lock")), b4_versions(&proj_b.join("milpa.lock")));
@@ -5822,11 +5866,11 @@ mod tests {
         // Scoped: fetch --upgrade foo vs update foo.
         let upgrade_foo = vec!["--upgrade".to_string(), "foo".to_string()];
         assert_eq!(
-            cmd_fetch(&proj_c, Some(Strategy::default()), false, true, None, false, false, &upgrade_foo, false, false, false, None).unwrap(),
+            cmd_fetch(&proj_c, Some(Strategy::default()), false, true, None, false, false, &upgrade_foo, false, false, false, false, None).unwrap(),
             0
         );
         assert_eq!(
-            cmd_update(&proj_d, Some(Strategy::default()), &["foo".to_string()], false, false, false, false).unwrap(),
+            cmd_update(&proj_d, Some(Strategy::default()), &["foo".to_string()], false, false, false, false, false).unwrap(),
             0
         );
         unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
@@ -5934,8 +5978,7 @@ mod tests {
             false,
             false,
             false,
-            false,
-        );
+            false, false);
         unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
         unsafe { std::env::remove_var("MILPA_INDEX_URL") };
 
@@ -5983,7 +6026,7 @@ mod tests {
 
         unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
         unsafe { std::env::set_var("MILPA_INDEX_URL", format!("file://{}", index_v1_path.display())) };
-        let rc = cmd_fetch(&root, Some(Strategy::default()), false, true, None, false, false, &[], false, false, false, None).unwrap();
+        let rc = cmd_fetch(&root, Some(Strategy::default()), false, true, None, false, false, &[], false, false, false, false, None).unwrap();
         assert_eq!(rc, 0);
         assert_eq!(b4_versions(&root.join("milpa.lock"))["foo"], "1.0.0");
 
@@ -5998,8 +6041,7 @@ mod tests {
             false,
             false,
             false,
-            false,
-        );
+            false, false);
         unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
         unsafe { std::env::remove_var("MILPA_INDEX_URL") };
 
@@ -6054,7 +6096,7 @@ mod tests {
 
         unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
         unsafe { std::env::set_var("MILPA_INDEX_URL", format!("file://{}", index_v1_path.display())) };
-        let rc = cmd_fetch(&root, Some(Strategy::default()), false, true, None, false, false, &[], false, false, false, None).unwrap();
+        let rc = cmd_fetch(&root, Some(Strategy::default()), false, true, None, false, false, &[], false, false, false, false, None).unwrap();
         assert_eq!(rc, 0);
         assert_eq!(b4_versions(&root.join("milpa.lock"))["foo"], "1.0.0");
 
@@ -6113,7 +6155,7 @@ mod tests {
 
         unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
         unsafe { std::env::set_var("MILPA_INDEX_URL", format!("file://{}", index_v1_path.display())) };
-        let rc = cmd_fetch(&root, Some(Strategy::default()), false, true, None, false, false, &[], false, false, false, None).unwrap();
+        let rc = cmd_fetch(&root, Some(Strategy::default()), false, true, None, false, false, &[], false, false, false, false, None).unwrap();
         assert_eq!(rc, 0);
         let baseline = b4_versions(&root.join("milpa.lock"));
         assert_eq!(baseline["foo"], "1.0.0");
@@ -6209,7 +6251,7 @@ mod tests {
         // Real baseline fetch WITH --exclude-newer (records correct identities
         // for both deps + the exclude_newer bound) — avoids hand-fabricating
         // identity hashes that would spuriously trip FETCH-PROVENANCE-DIVERGENCE.
-        let baseline = cmd_fetch(&proj, Some(Strategy::default()), false, true, None, false, false, &[], false, false, false, Some(ts));
+        let baseline = cmd_fetch(&proj, Some(Strategy::default()), false, true, None, false, false, &[], false, false, false, false, Some(ts));
         assert_eq!(baseline.unwrap(), 0, "baseline fetch must succeed");
         let baseline_lock = load_lockfile(&proj.join("milpa.lock")).unwrap();
         assert_eq!(baseline_lock.exclude_newer, Some(ts));
@@ -6329,7 +6371,7 @@ mod tests {
         let mocked = make_mocked_fetches(tmp.path(), primary_url, "main", &sha, &[("foo.nim", b"version = \"1.0.0\"\n")]);
 
         unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
-        let r = cmd_update(&proj, Some(Strategy::default()), &["foo".into()], false, false, false, false);
+        let r = cmd_update(&proj, Some(Strategy::default()), &["foo".into()], false, false, false, false, false);
         unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
 
         assert_eq!(r.unwrap(), 0, "update must succeed");
@@ -6407,7 +6449,7 @@ mod tests {
 
         unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
         // Bare `update` — no dep arg, drops ALL pins, full re-resolve.
-        let r = cmd_update(&proj, None, &[], false, false, false, false);
+        let r = cmd_update(&proj, None, &[], false, false, false, false, false);
         unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
 
         assert_eq!(r.unwrap(), 0, "update must succeed");
@@ -6462,7 +6504,7 @@ mod tests {
         let mocked = make_mocked_fetches(tmp.path(), primary_url, "main", &sha, &[("foo.nim", b"version = \"1.0.0\"\n")]);
 
         unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
-        let r = cmd_update(&proj, Some(Strategy::default()), &["foo".into()], false, false, false, false);
+        let r = cmd_update(&proj, Some(Strategy::default()), &["foo".into()], false, false, false, false, false);
         unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
 
         assert_eq!(r.unwrap(), 0, "update must succeed");
@@ -6514,7 +6556,7 @@ mod tests {
 
         unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
         // Pass alias 'baz' as dep_name — must resolve to canonical 'foo'.
-        let r = cmd_update(&proj, Some(Strategy::default()), &["baz".into()], false, false, false, false);
+        let r = cmd_update(&proj, Some(Strategy::default()), &["baz".into()], false, false, false, false, false);
         unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
 
         assert_eq!(
@@ -6655,7 +6697,7 @@ mod tests {
         let mocked = make_mocked_fetches(tmp.path(), primary_url, "main", &sha, &[("foo.nim", b"version = \"1.0.0\"\n")]);
 
         unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
-        let r = cmd_update(&proj, Some(Strategy::default()), &["foo".into()], false, false, false, false);
+        let r = cmd_update(&proj, Some(Strategy::default()), &["foo".into()], false, false, false, false, false);
         unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
 
         assert_eq!(r.unwrap(), 0, "update with no mirrors must succeed");
@@ -6694,8 +6736,7 @@ mod tests {
             false,
             false,
             false,
-            false,
-        );
+            false, false);
         let after_add = std::fs::read_to_string(proj.join("milpa.kdl")).unwrap();
         let lock = std::fs::read_to_string(proj.join("milpa.lock")).unwrap_or_default();
 
@@ -6707,13 +6748,12 @@ mod tests {
             false,
             false,
             false,
-            false,
-        );
+            false, false);
 
         // (3) add a second dep with NO --ref → mocked default-branch discovery.
         let url2 = "https://example.com/bar.git";
         let _ = make_mocked_fetches(tmp.path(), url2, "trunk", &"c".repeat(40), &[("bar.nim", b"# bar")]);
-        let r2 = cmd_add(&proj, Some(Strategy::default()), &["bar".into(), "--git".into(), url2.into()], false, false, false, false);
+        let r2 = cmd_add(&proj, Some(Strategy::default()), &["bar".into(), "--git".into(), url2.into()], false, false, false, false, false);
         let after_add2 = std::fs::read_to_string(proj.join("milpa.kdl")).unwrap();
 
         unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
@@ -6749,9 +6789,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         assert_eq!(cmd_remove(tmp.path(), Some(Strategy::default()), &[], false, false, false).unwrap(), 2);
         // add with no name → exit 2.
-        assert_eq!(cmd_add(tmp.path(), Some(Strategy::default()), &[], false, false, false, false).unwrap(), 2);
+        assert_eq!(cmd_add(tmp.path(), Some(Strategy::default()), &[], false, false, false, false, false).unwrap(), 2);
         // add with no --git/--mirror → exit 2.
-        assert_eq!(cmd_add(tmp.path(), Some(Strategy::default()), &["foo".into()], false, false, false, false).unwrap(), 2);
+        assert_eq!(cmd_add(tmp.path(), Some(Strategy::default()), &["foo".into()], false, false, false, false, false).unwrap(), 2);
     }
 
     // --- MILPA_MOCKED_FETCHES integration -----------------------------------
@@ -6805,7 +6845,7 @@ mod tests {
 
         // SAFETY: serialized by ENV_MUTEX; unique env var name; cleaned up after.
         unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
-        let result = cmd_fetch(&proj, Some(Strategy::default()), false, true, None, false, false, &[], false, false, false, None);
+        let result = cmd_fetch(&proj, Some(Strategy::default()), false, true, None, false, false, &[], false, false, false, false, None);
         unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
 
         assert!(result.is_ok(), "expected Ok, got {result:?}");
@@ -6848,7 +6888,7 @@ mod tests {
         .unwrap();
 
         unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
-        let result = cmd_fetch(&proj, None, false, true, None, false, false, &[], false, false, false, None);
+        let result = cmd_fetch(&proj, None, false, true, None, false, false, &[], false, false, false, false, None);
         unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
         unsafe { std::env::remove_var("MILPA_CACHE_DIR") };
 
@@ -6882,7 +6922,7 @@ mod tests {
         .unwrap();
 
         unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
-        let result = cmd_fetch(&proj, Some(Strategy::Semver), false, true, None, false, false, &[], false, false, false, None);
+        let result = cmd_fetch(&proj, Some(Strategy::Semver), false, true, None, false, false, &[], false, false, false, false, None);
         unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
         unsafe { std::env::remove_var("MILPA_CACHE_DIR") };
 
@@ -6916,7 +6956,7 @@ mod tests {
         .unwrap();
 
         unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
-        let result = cmd_fetch(&proj, None, false, true, None, false, false, &[], false, false, false, None);
+        let result = cmd_fetch(&proj, None, false, true, None, false, false, &[], false, false, false, false, None);
         unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
         unsafe { std::env::remove_var("MILPA_CACHE_DIR") };
 
@@ -6994,7 +7034,7 @@ mod tests {
 
         // SAFETY: serialized by ENV_MUTEX.
         unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked_dir) };
-        let result = cmd_fetch(&proj, Some(Strategy::default()), false, true, None, false, false, &[], false, false, false, None);
+        let result = cmd_fetch(&proj, Some(Strategy::default()), false, true, None, false, false, &[], false, false, false, false, None);
         unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
         unsafe { std::env::remove_var("MILPA_CACHE_DIR") };
 
@@ -7055,7 +7095,7 @@ mod tests {
 
         // SAFETY: serialized by ENV_MUTEX.
         unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
-        let result = cmd_fetch(&proj, Some(Strategy::default()), false, true, None, false, false, &[], false, false, false, None);
+        let result = cmd_fetch(&proj, Some(Strategy::default()), false, true, None, false, false, &[], false, false, false, false, None);
         unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
 
         assert!(result.is_err(), "expected Err, got {result:?}");
@@ -7695,7 +7735,7 @@ mod tests {
 
         let proj = seed_verify_reverify_case(tmp.path(), index_url);
         // Minimal-valid project: the ONLY exit-1 condition is the cached-bundle reverify.
-        let result = cmd_verify(&proj, false, false, false, false, false);
+        let result = cmd_verify(&proj, false, false, false, false, false, false);
 
         unsafe { std::env::remove_var("MILPA_INDEX_URL") };
         unsafe { std::env::remove_var("MILPA_INDEX_TRUST") };
@@ -7720,7 +7760,7 @@ mod tests {
         unsafe { std::env::set_var("MILPA_INDEX_TRUST_MOCK_VERIFIER", "trusted") };
 
         let proj = seed_verify_reverify_case(tmp.path(), index_url);
-        let result = cmd_verify(&proj, false, false, false, false, false);
+        let result = cmd_verify(&proj, false, false, false, false, false, false);
 
         unsafe { std::env::remove_var("MILPA_INDEX_URL") };
         unsafe { std::env::remove_var("MILPA_INDEX_TRUST") };
@@ -7761,7 +7801,7 @@ mod tests {
         std::fs::write(&cache_file, &real_index).unwrap();
         std::fs::write(milpa_core::index_cache::bundle_path(&cache_file), &tampered).unwrap();
 
-        let result = cmd_verify(&proj, false, false, false, false, false);
+        let result = cmd_verify(&proj, false, false, false, false, false, false);
 
         unsafe { std::env::remove_var("MILPA_INDEX_URL") };
         unsafe { std::env::remove_var("MILPA_INDEX_TRUST") };
@@ -7837,7 +7877,7 @@ mod tests {
         unsafe { std::env::set_var("MILPA_INDEX_URL", "file:///some/index.kdl") };
         unsafe { std::env::set_var("MILPA_ENTRY_TRUST_MOCK_DEFAULT", "bogus-value") };
         unsafe { std::env::remove_var("MILPA_ENTRY_TRUST_MOCK_MAP") };
-        let result = build_entry_trust_gate(&milpa_manifest::TrustPolicy::Strict, None, None, false, false);
+        let result = build_entry_trust_gate(&milpa_manifest::TrustPolicy::Strict, None, None, false, false, false);
         unsafe { std::env::remove_var("MILPA_INDEX_URL") };
         unsafe { std::env::remove_var("MILPA_ENTRY_TRUST_MOCK_DEFAULT") };
         match result {
@@ -7855,7 +7895,7 @@ mod tests {
         unsafe { std::env::set_var("MILPA_INDEX_URL", "file:///some/index.kdl") };
         unsafe { std::env::set_var("MILPA_ENTRY_TRUST_MOCK_DEFAULT", "unattested") };
         unsafe { std::env::remove_var("MILPA_ENTRY_TRUST_MOCK_MAP") };
-        let result = build_entry_trust_gate(&milpa_manifest::TrustPolicy::Strict, None, None, false, false);
+        let result = build_entry_trust_gate(&milpa_manifest::TrustPolicy::Strict, None, None, false, false, false);
         unsafe { std::env::remove_var("MILPA_INDEX_URL") };
         unsafe { std::env::remove_var("MILPA_ENTRY_TRUST_MOCK_DEFAULT") };
         match result {
@@ -7870,7 +7910,7 @@ mod tests {
         unsafe { std::env::set_var("MILPA_INDEX_URL", "file:///some/index.kdl") };
         unsafe { std::env::set_var("MILPA_ENTRY_TRUST_MOCK_DEFAULT", "signature-invalid") };
         unsafe { std::env::remove_var("MILPA_ENTRY_TRUST_MOCK_MAP") };
-        let result = build_entry_trust_gate(&milpa_manifest::TrustPolicy::Strict, None, None, false, false);
+        let result = build_entry_trust_gate(&milpa_manifest::TrustPolicy::Strict, None, None, false, false, false);
         unsafe { std::env::remove_var("MILPA_INDEX_URL") };
         unsafe { std::env::remove_var("MILPA_ENTRY_TRUST_MOCK_DEFAULT") };
         match result {
@@ -7892,7 +7932,7 @@ mod tests {
                 r#"{"pkg:tianguis/ns1/bar@1.0.0": "bundle-missing"}"#,
             )
         };
-        let result = build_entry_trust_gate(&milpa_manifest::TrustPolicy::Strict, None, None, false, false);
+        let result = build_entry_trust_gate(&milpa_manifest::TrustPolicy::Strict, None, None, false, false, false);
         unsafe { std::env::remove_var("MILPA_INDEX_URL") };
         unsafe { std::env::remove_var("MILPA_ENTRY_TRUST_MOCK_MAP") };
         match result {
@@ -7920,7 +7960,7 @@ mod tests {
         let _guard = ENV_MUTEX.lock().unwrap();
         unsafe { std::env::remove_var("MILPA_INDEX_URL") };
         unsafe { std::env::remove_var("MILPA_ENTRY_BUNDLE_DIR") };
-        let result = build_entry_trust_gate(&milpa_manifest::TrustPolicy::Warn, None, None, false, false);
+        let result = build_entry_trust_gate(&milpa_manifest::TrustPolicy::Warn, None, None, false, false, false);
         match result {
             Ok(Some(cfg)) => {
                 let store = cfg.bundle_store.expect(
@@ -7938,7 +7978,7 @@ mod tests {
         let _guard = ENV_MUTEX.lock().unwrap();
         unsafe { std::env::set_var("MILPA_INDEX_URL", "") };
         unsafe { std::env::remove_var("MILPA_ENTRY_BUNDLE_DIR") };
-        let result = build_entry_trust_gate(&milpa_manifest::TrustPolicy::Warn, None, None, false, false);
+        let result = build_entry_trust_gate(&milpa_manifest::TrustPolicy::Warn, None, None, false, false, false);
         unsafe { std::env::remove_var("MILPA_INDEX_URL") };
         match result {
             Ok(Some(cfg)) => assert!(cfg.bundle_store.is_none()),
@@ -7953,7 +7993,7 @@ mod tests {
         let _guard = ENV_MUTEX.lock().unwrap();
         unsafe { std::env::set_var("MILPA_INDEX_URL", "file:///some/index.kdl") };
         unsafe { std::env::remove_var("MILPA_ENTRY_BUNDLE_DIR") };
-        let result = build_entry_trust_gate(&milpa_manifest::TrustPolicy::Warn, None, None, false, false);
+        let result = build_entry_trust_gate(&milpa_manifest::TrustPolicy::Warn, None, None, false, false, false);
         unsafe { std::env::remove_var("MILPA_INDEX_URL") };
         match result {
             Ok(Some(cfg)) => {
@@ -7985,7 +8025,7 @@ mod tests {
 
         unsafe { std::env::set_var("MILPA_INDEX_URL", &index_url) };
         unsafe { std::env::remove_var("MILPA_ENTRY_BUNDLE_DIR") };
-        let result = build_entry_trust_gate(&milpa_manifest::TrustPolicy::Warn, None, None, false, false);
+        let result = build_entry_trust_gate(&milpa_manifest::TrustPolicy::Warn, None, None, false, false, false);
         unsafe { std::env::remove_var("MILPA_INDEX_URL") };
 
         let cfg = result.unwrap().expect("entry-trust warn must build an active gate");
@@ -8204,8 +8244,7 @@ mod tests {
             false,
             false,
             false,
-            false,
-        );
+            false, false);
         unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
 
         assert_eq!(rc.unwrap(), 0, "add --optional must exit 0");
@@ -8240,8 +8279,7 @@ mod tests {
             false,
             false,
             false,
-            false,
-        );
+            false, false);
         unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
 
         assert_eq!(rc.unwrap(), 0, "add --features must exit 0");
@@ -8279,8 +8317,7 @@ mod tests {
             false,
             false,
             false,
-            false,
-        );
+            false, false);
         unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
 
         assert_eq!(rc.unwrap(), 0, "add --version must exit 0");
@@ -8311,8 +8348,7 @@ mod tests {
             false,
             false,
             false,
-            false,
-        );
+            false, false);
         unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
 
         assert_eq!(rc.unwrap(), 0);
@@ -8341,8 +8377,7 @@ mod tests {
             false,
             false,
             false,
-            false,
-        );
+            false, false);
         assert!(rc.is_err(), "malformed --version must reject");
         if let Err(e) = rc {
             assert_eq!(e.code(), "MAN-DEP-VERSION-INVALID");
@@ -8455,8 +8490,7 @@ mod tests {
             false,
             false,
             false,
-            false,
-        );
+            false, false);
         // Must exit non-zero.
         let code = match rc {
             Ok(n) => n,
@@ -8781,7 +8815,7 @@ mod tests {
         std::fs::write(proj.join("milpa.lock"), lock_text).unwrap();
 
         // verify must exit non-zero — optdep is in lock but flag is default=#false.
-        let rc = cmd_verify(&proj, false, false, false, false, false).unwrap();
+        let rc = cmd_verify(&proj, false, false, false, false, false, false).unwrap();
         assert_ne!(rc, 0, "verify must exit non-zero when active_flags mismatch");
     }
 
@@ -9080,8 +9114,7 @@ mod tests {
             false,
             false,
             false,
-            false,
-        );
+            false, false);
         unsafe { std::env::remove_var("MILPA_MOCKED_FETCHES") };
 
         assert_eq!(rc.unwrap(), 0, "cmd_add --strategy minver must succeed");
@@ -9127,7 +9160,7 @@ mod tests {
 
         // Fetch first so there's a lockfile and _deps/ to satisfy remove's resolve.
         unsafe { std::env::set_var("MILPA_MOCKED_FETCHES", &mocked) };
-        cmd_fetch(&proj, Some(Strategy::Minver), false, true, None, false, false, &[], false, false, false, None).unwrap();
+        cmd_fetch(&proj, Some(Strategy::Minver), false, true, None, false, false, &[], false, false, false, false, None).unwrap();
 
         // Remove dpa with minver strategy.
         let rc = cmd_remove(
