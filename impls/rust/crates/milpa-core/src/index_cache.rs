@@ -1022,22 +1022,33 @@ pub fn load_index_with_history(
                         // Non-404 transport error: bytes never arrived → BundleMissing
                         // (BundleMalformed is reserved for bytes that arrived but don't parse).
                         //
-                        // Spec §3.4.5: on the crash-recovery path, transport error is a
-                        // hard-fail MILPA-INDEX-UNREACHABLE regardless of policy.
-                        if is_recovery {
+                        // Spec §3.4.5's "hard-fail regardless of policy" on the
+                        // crash-recovery path is scoped to a re-fetch that ALSO FAILS
+                        // VERIFICATION (bytes arrived but don't verify — the active-adversary
+                        // signal, handled at the BundleMalformed / consecutive-failure arm).
+                        // A transport error is UNREACHABILITY, not a verification failure, so
+                        // it must respect the policy like the non-recovery path — else a
+                        // persistently-absent bundle under WARN (e.g. an unattested index
+                        // loaded twice in one `verify` invocation: setup fetch, then the
+                        // dep_decl edge check) hard-fails on the second load and silently
+                        // skips drift detection. Strict still fails closed on the recovery
+                        // re-fetch (fail-closed posture preserved; index-trust tier unchanged).
+                        if is_recovery && policy == TrustPolicy::Strict {
                             return Err(MilpaError::Core(CoreError::Tianguis(
                                 "MILPA-INDEX-UNREACHABLE",
                                 format!(
                                     "crash-recovery: bundle transport error at \
                                      {bundle_url:?} for index {url:?} — hard-fail \
-                                     (active-adversary signal per spec §3.4.5)"
+                                     (fail-closed under strict per spec §3.4.5)"
                                 ),
                             )));
                         }
-                        // Non-recovery transport error: no .no-bundle marker (transient;
-                        // next read goes through crash-recovery refetch without degraded side-channel).
-                        // Strict: fail closed — no cache write, no marker.
-                        // Warn: emit warning, then run the ratchet gate, then write index + stamp.
+                        // Warn (recovery or not): emit the warning, run the ratchet gate,
+                        // write index + stamp. On the recovery path, persist the .no-bundle
+                        // marker so the NEXT read serves this bundleless index directly as a
+                        // warning (no repeat crash-recovery re-fetch on a bundle that is
+                        // genuinely, persistently absent). Non-recovery keeps the transient
+                        // side-channel (no marker) so a truly transient blip re-fetches.
                         enforce_index_trust(VerificationResult::BundleMissing, &policy, url)?;
                         // Reached only under Warn (Strict already returned via `?`).
                         let decision = run_ratchet_gate(
@@ -1047,6 +1058,9 @@ pub fn load_index_with_history(
                             now_unix,
                             url,
                         )?;
+                        if is_recovery {
+                            let _ = std::fs::write(no_bundle_marker_path(&cache_file), b"");
+                        }
                         write_index_to_cache(&cache_file, &index_bytes, &stamp_file, now_unix)?;
                         ratchet_decision = Some(decision);
                     }
