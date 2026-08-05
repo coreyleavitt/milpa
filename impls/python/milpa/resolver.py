@@ -4600,13 +4600,14 @@ def _process_oci_worker(
     dest = deps_dir / dep.name
     try:
         result = env.fetcher.fetch(dep.name, prov, dest=dest)
-    except MilpaError as exc:
-        raise MilpaError(
-            "FETCH-ALL-FAILED",
-            f"all candidates for {dep.name!r} failed: {exc.message}",
-            name=dep.name,
-            inner_slug=exc.slug,
-        ) from exc
+    except MilpaError:
+        # An OCI dep has exactly one fetch candidate (the pinned
+        # registry/repository/digest triple) — there is no mirror list to
+        # fall back across, so "all candidates failed" is a category error
+        # here. Re-raise the definitive FETCH-OCI-* error unchanged so its
+        # real slug (and phase= context) reaches the CLI (rfc-native-oci-
+        # fetch.md §3.4, #198 S9).
+        raise
     except Exception as exc:
         raise MilpaError(
             "FETCH-ALL-FAILED",

@@ -85,6 +85,27 @@ pub enum FetchError {
     /// `FETCH-GIT-*` / `FETCH-DOWNLOAD-FAILED` / `FETCH-SHA256-MISMATCH` /
     /// `FETCH-OCI-*`), wired per-transport in S14c.
     Transport(&'static str, String),
+    /// A structured OCI transport failure — same catalog codes as
+    /// [`FetchError::Transport`] (`FETCH-OCI-PULL-FAILED` /
+    /// `FETCH-OCI-DIGEST-MISMATCH`) but carrying `phase`
+    /// (`"token"`/`"manifest"`/`"blob"`) as a **named field**, never baked
+    /// into the message string (M5 — RFC docs/rfc-native-oci-fetch.md §3.4:
+    /// "every FETCH-OCI-PULL-FAILED raise carries phase=... as a **kwarg**
+    /// ... the codebase asserts on structured fields, not substrings").
+    /// Mirrors Python's `MilpaError.context["phase"]`.
+    ///
+    /// A DEDICATED variant rather than adding a `phase` slot to `Transport`
+    /// itself: `Transport`'s 2-tuple positional constructor is used at
+    /// ~15 non-OCI call sites (`fetchers.rs`, `milpa-cli/main.rs`,
+    /// `bounded_http.rs`) that have no phase concept — this variant ripples
+    /// across none of them. `CoreError::RatchetViolation` (`error.rs`) is the
+    /// established precedent for a struct-shaped variant carrying a
+    /// caller-asserted structured field (`digest`) alongside `code`/`message`.
+    OciTransport {
+        code: &'static str,
+        message: String,
+        phase: &'static str,
+    },
 }
 
 impl FetchError {
@@ -95,6 +116,34 @@ impl FetchError {
             FetchError::AllFailed(_) => "FETCH-ALL-FAILED",
             FetchError::ProvenanceDivergence(_) => "FETCH-PROVENANCE-DIVERGENCE",
             FetchError::Extract(c, _) | FetchError::Transport(c, _) => c,
+            FetchError::OciTransport { code, .. } => code,
+        }
+    }
+
+    /// The OCI transport `phase` (`"token"`/`"manifest"`/`"blob"`) this error
+    /// occurred in — `Some` only for [`FetchError::OciTransport`], mirroring
+    /// Python's `MilpaError.context.get("phase")`. `None` for every other
+    /// variant, including a plain [`FetchError::Transport`] that has not
+    /// (yet) been given OCI phase context.
+    pub fn phase(&self) -> Option<&str> {
+        match self {
+            FetchError::OciTransport { phase, .. } => Some(phase),
+            _ => None,
+        }
+    }
+
+    /// The human-readable message, independent of `code()`. Callers that fold
+    /// a `FetchError` from `bounded_http::request` into a domain-specific
+    /// error (e.g. `dep_decl_store`/`entry_bundle_store`'s `TNG-*` slugs) use
+    /// this instead of `Debug`-formatting the whole variant.
+    pub fn message(&self) -> &str {
+        match self {
+            FetchError::Failed(m)
+            | FetchError::AllFailed(m)
+            | FetchError::ProvenanceDivergence(m)
+            | FetchError::Extract(_, m)
+            | FetchError::Transport(_, m) => m,
+            FetchError::OciTransport { message, .. } => message,
         }
     }
 
@@ -137,6 +186,10 @@ impl FetchError {
             "FETCH-OCI-PULL-FAILED",
             "FETCH-OCI-NO-TARBALL",
             "FETCH-OCI-AMBIGUOUS-TARBALL",
+            // native-pull blob/manifest sha256 integrity check (RFC native-oci-fetch
+            // §3.4): the transported compressed bytes did not hash to the pinned
+            // digest — a tampering signal, distinct from the post-extract content_hash.
+            "FETCH-OCI-DIGEST-MISMATCH",
             // mocked transport (issue #2 / differential-conformance-harness RFC):
             // the env-var-activated mocked fetcher (`MILPA_MOCKED_FETCHES`) found
             // no fixture directory for the requested `(url, ref)` key.

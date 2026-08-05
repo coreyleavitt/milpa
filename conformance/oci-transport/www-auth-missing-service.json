@@ -1,0 +1,16 @@
+{
+  "description": "The Bearer challenge is missing 'service' -> fail closed, phase=token.",
+  "exchanges": [
+    {
+      "method": "GET",
+      "url": "https://ghcr.io/v2/",
+      "response": {
+        "status": 401,
+        "headers": {
+          "WWW-Authenticate": "Bearer realm=\"https://ghcr.io/token\"",
+          "Content-Length": "0"
+        }
+      }
+    }
+  ]
+}

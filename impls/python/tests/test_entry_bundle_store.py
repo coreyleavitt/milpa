@@ -133,6 +133,91 @@ def test_http_store_not_found_raises_bundle_missing(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Size cap (mirrors dep_decl_store.py's R8) — driven against the REAL
+# production transport (file:// / a local http.server), RFC docs/rfc-native-
+# oci-fetch.md §3.3 slice S3.
+# ---------------------------------------------------------------------------
+
+from milpa.entry_bundle_store import _ENTRY_BUNDLE_MAX_ARTIFACT_BYTES  # noqa: E402
+
+
+def test_http_store_size_cap_exceeded_raises_bundle_missing(tmp_path: Path) -> None:
+    """HttpEntryBundleStore.get raises TNG-ENTRY-BUNDLE-MISSING when the
+    actual response body exceeds the cap — never buffer the whole body."""
+    pin = "f" * 64
+    origin = tmp_path / "origin"
+    (origin / "attestation").mkdir(parents=True)
+    oversized_body = b"x" * (_ENTRY_BUNDLE_MAX_ARTIFACT_BYTES + 1)
+    (origin / "attestation" / f"{pin}.bundle").write_bytes(oversized_body)
+    cache = tmp_path / "cache"
+
+    store = HttpEntryBundleStore(base_url=f"file://{origin}", cache_dir=cache)
+    with pytest.raises(MilpaError) as exc_info:
+        store.get(pin)
+    err = exc_info.value
+    assert err.slug == TNG_ENTRY_BUNDLE_MISSING
+    assert err.context.get("cause") == "unfetchable"
+    assert "exceed" in err.message.lower() or str(_ENTRY_BUNDLE_MAX_ARTIFACT_BYTES) in err.message
+
+
+def test_http_store_size_at_cap_succeeds(tmp_path: Path) -> None:
+    """A legitimate bundle of exactly the cap size must not be rejected."""
+    exact_body = b"z" * _ENTRY_BUNDLE_MAX_ARTIFACT_BYTES
+    pin = hashlib.sha256(exact_body).hexdigest()
+    origin = tmp_path / "origin"
+    (origin / "attestation").mkdir(parents=True)
+    (origin / "attestation" / f"{pin}.bundle").write_bytes(exact_body)
+    cache = tmp_path / "cache"
+
+    store = HttpEntryBundleStore(base_url=f"file://{origin}", cache_dir=cache)
+    result = store.get(pin)
+    assert result == exact_body
+
+
+def test_http_store_lying_content_length_no_longer_pre_rejected(tmp_path: Path) -> None:
+    """NAMED BEHAVIOR CHANGE (RFC docs/rfc-native-oci-fetch.md §3.3, slice S3):
+    mirrors dep_decl_store.py's identical change.  The Content-Length
+    early-reject optimization is dropped along with the direct
+    ``urllib.request.urlopen`` call site — ``bounded_http.request`` has no
+    pre-flight header-peek hook.  The actual-bytes-streamed cap (see
+    test_http_store_size_cap_exceeded_raises_bundle_missing, unchanged) is
+    now the sole enforcement point: a small actual body succeeds even when
+    the server advertises a Content-Length far exceeding the cap.
+    """
+    import http.server
+    import threading
+
+    small_body = b"tiny"
+    huge_declared_length = _ENTRY_BUNDLE_MAX_ARTIFACT_BYTES + 1
+    pin = hashlib.sha256(small_body).hexdigest()
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            self.send_response(200)
+            self.send_header("Content-Length", str(huge_declared_length))
+            self.end_headers()
+            self.wfile.write(small_body)
+
+        def log_message(self, *args: object) -> None:
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), _Handler)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever)
+    thread.daemon = True
+    thread.start()
+
+    try:
+        cache = tmp_path / "cache"
+        store = HttpEntryBundleStore(base_url=f"http://127.0.0.1:{port}", cache_dir=cache)
+        result = store.get(pin)
+        assert result == small_body
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+
+
+# ---------------------------------------------------------------------------
 # CR4 — fixed-temp-filename race (registry-protocol §3.5.2 NORMATIVE
 # (concurrency)): cache writes must use a per-write-unique temp sibling, and
 # a locally-corrupt cache entry must self-heal rather than poison forever.

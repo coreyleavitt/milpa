@@ -292,21 +292,16 @@ class TestOciTargetRebindsResolution:
         from milpa.cas import CAStore
         from milpa.lockfile import OciProvenanceRecord
         from milpa.resolver import resolve
+        from tests._oci_fake_client import FakeOciClient
 
         digest = "sha256:" + "c" * 64
         tar_bytes = _build_tar_gz(
             {"foo.nimble": b'version = "1.0.0"\nauthor = "a"\nlicense = "MIT"\n'}
         )
-        pull_calls: list[str] = []
-
-        def _fake_pull(reference: str, output_dir: Path) -> list[Path]:
-            pull_calls.append(reference)
-            out = output_dir / "foo.tar.gz"
-            out.write_bytes(tar_bytes)
-            return [out]
+        fake_client = FakeOciClient(tar_bytes)
 
         registry = FetcherRegistry()
-        registry.register(OciFetcher(oci_pull=_fake_pull))
+        registry.register(OciFetcher(client=fake_client))
         store = CAStore(root=tmp_path / ".cas")
         fetcher = CasAdmittingFetcher(registry, store)
         env = MilpaEnv(fetcher=fetcher, index=None, store=store)
@@ -317,7 +312,7 @@ class TestOciTargetRebindsResolution:
         )
         graph = resolve(manifest, tmp_path / "_deps", env, ResolveParams())
 
-        assert pull_calls == [f"ghcr.io/acme/foo@{digest}"]
+        assert fake_client.calls == [f"ghcr.io/acme/foo@{digest}"]
         dep = next(d for d in graph.deps if d.name == "foo")
         assert len(dep.provenances) == 1
         prov = dep.provenances[0]
@@ -344,9 +339,9 @@ class TestTarballTargetRebindsResolution:
         )
         fetch_calls: list[str] = []
 
-        def _fake_http_get(url: str) -> bytes:
+        def _fake_http_get(url: str, dest: Path) -> None:
             fetch_calls.append(url)
-            return tar_bytes
+            dest.write_bytes(tar_bytes)
 
         registry = FetcherRegistry()
         registry.register(TarballFetcher(http_get=_fake_http_get))
@@ -406,25 +401,21 @@ class TestRegistryTargetRebindsResolution:
             ]
         )
 
-    def _env(self, tmp_path: Path, pull_calls: list[str]) -> "object":
+    def _env(self, tmp_path: Path) -> "object":
         from milpa.context import MilpaEnv
         from milpa.fetchers.cas_admitting import CasAdmittingFetcher
         from milpa.fetchers.oci import OciFetcher
         from milpa.fetchers.types import FetcherRegistry
         from milpa.cas import CAStore
+        from tests._oci_fake_client import FakeOciClient
 
         tar_bytes = _build_tar_gz(
             {"widget.nimble": b'version = "0.0.0"\nauthor = "a"\nlicense = "MIT"\n'}
         )
-
-        def _fake_pull(reference: str, output_dir: Path) -> list[Path]:
-            pull_calls.append(reference)
-            out = output_dir / "widget.tar.gz"
-            out.write_bytes(tar_bytes)
-            return [out]
+        fake_client = FakeOciClient(tar_bytes)
 
         registry = FetcherRegistry()
-        registry.register(OciFetcher(oci_pull=_fake_pull))
+        registry.register(OciFetcher(client=fake_client))
         store = CAStore(root=tmp_path / ".cas")
         fetcher = CasAdmittingFetcher(registry, store)
         return MilpaEnv(fetcher=fetcher, index=self._index(), store=store)
@@ -438,8 +429,7 @@ class TestRegistryTargetRebindsResolution:
         from milpa.resolver import resolve
         from milpa.version import Strategy
 
-        pull_calls: list[str] = []
-        env = self._env(tmp_path, pull_calls)
+        env = self._env(tmp_path)
         manifest = _manifest_with_root_git_dep(
             "old-fork", '    pkg "old-fork" named="widget" namespace="acme"',
         )
@@ -461,8 +451,7 @@ class TestRegistryTargetRebindsResolution:
         from milpa.resolver import resolve
         from milpa.version import Strategy
 
-        pull_calls: list[str] = []
-        env = self._env(tmp_path, pull_calls)
+        env = self._env(tmp_path)
         manifest = _manifest_with_root_git_dep(
             "old-fork",
             '    pkg "old-fork" named="widget" namespace="acme" version="1.0.0"',

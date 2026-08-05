@@ -605,73 +605,46 @@ def test_index_base_url_case_insensitive(input_url: str, expected_base: str) -> 
 
 # ---------------------------------------------------------------------------
 # R8 — HttpDepDeclStore size cap (spec §3.3.1 NORMATIVE)
+#
+# These drive the REAL production transport (file:// / a local http.server)
+# rather than monkeypatching urllib.request.urlopen: RFC docs/rfc-native-oci-
+# fetch.md §3.3 (slice S3) moves HttpDepDeclStore off a direct
+# urllib.request.urlopen call onto bounded_http.request, which builds its own
+# OpenerDirector — a monkeypatch of the module-level urllib.request.urlopen
+# function no longer intercepts anything.  Driving the real transport is also
+# strictly more honest coverage of the production path.
 # ---------------------------------------------------------------------------
 
 from milpa.dep_decl_store import _DEP_DECL_MAX_ARTIFACT_BYTES  # noqa: E402
 
 
-class _FakeHTTPResponse:
-    """Minimal fake urllib response: returns fixed bytes from read()."""
-
-    def __init__(self, body: bytes, content_length: int | None = None) -> None:
-        self._body = body
-        self.headers = {"Content-Length": str(content_length)} if content_length is not None else {}
-
-    def read(self, limit: int = -1) -> bytes:
-        if limit < 0:
-            return self._body
-        return self._body[:limit]
-
-    def __enter__(self) -> "_FakeHTTPResponse":
-        return self
-
-    def __exit__(self, *_: object) -> None:
-        pass
-
-    def getheader(self, name: str, default: object = None) -> object:
-        return self.headers.get(name, default)
-
-
-def _patch_urlopen(monkeypatch: pytest.MonkeyPatch, body: bytes, content_length: int | None = None) -> None:
-    """Replace urllib.request.urlopen with a fake returning body."""
-    import milpa.dep_decl_store as dds_module
-
-    def _fake_urlopen(url: str, **kwargs: object) -> "_FakeHTTPResponse":  # noqa: ANN401
-        return _FakeHTTPResponse(body, content_length)
-
-    monkeypatch.setattr("urllib.request.urlopen", _fake_urlopen)
-
-
-def test_http_store_size_cap_exceeded_raises_fetch_failed(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """HttpDepDeclStore.get raises TNG-DEPDECL-FETCH-FAILED when response body > cap.
+def test_http_store_size_cap_exceeded_raises_fetch_failed(tmp_path: Path) -> None:
+    """HttpDepDeclStore.get raises TNG-DEPDECL-FETCH-FAILED when the actual
+    response body exceeds the cap.
 
     R8: A malicious/compromised index can point dep_decl at a multi-GB URL.
-    We must never buffer the whole body; the check must fire early.
+    We must never buffer the whole body — the streaming cap must fire before
+    the oversized body is fully read.
     """
+    hex_digest = "f" * 64
+    serve_dir = tmp_path / "serve"
+    dep_decl_dir = serve_dir / "dep-decl"
+    dep_decl_dir.mkdir(parents=True)
     oversized_body = b"x" * (_DEP_DECL_MAX_ARTIFACT_BYTES + 1)
-    _patch_urlopen(monkeypatch, oversized_body)
+    (dep_decl_dir / f"{hex_digest}.kdl").write_bytes(oversized_body)
 
     cache_dir = tmp_path / "cache"
     cache_dir.mkdir()
-    store = HttpDepDeclStore(
-        base_url="https://example.com/registry/",
-        cache_dir=cache_dir,
-    )
-    h = "sha256:" + "f" * 64
+    store = HttpDepDeclStore(base_url=f"file://{serve_dir}", cache_dir=cache_dir)
+    h = "sha256:" + hex_digest
     with pytest.raises(MilpaError) as exc_info:
         store.get(h)
     err = exc_info.value
     assert err.slug == TNG_DEPDECL_FETCH_FAILED
-    assert "exceeds" in err.message.lower() or str(_DEP_DECL_MAX_ARTIFACT_BYTES) in err.message
+    assert "exceed" in err.message.lower() or str(_DEP_DECL_MAX_ARTIFACT_BYTES) in err.message
 
 
-def test_http_store_size_at_cap_succeeds(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_http_store_size_at_cap_succeeds(tmp_path: Path) -> None:
     """HttpDepDeclStore.get succeeds when body is exactly at the cap.
 
     A legitimate 1 MiB artifact (edge-case) must not be rejected.
@@ -680,41 +653,70 @@ def test_http_store_size_at_cap_succeeds(
     # whose sha256 we can compute to produce a matching hash.
     exact_body = b"z" * _DEP_DECL_MAX_ARTIFACT_BYTES
     hash_str = dep_decl_hash(exact_body)
-    _patch_urlopen(monkeypatch, exact_body)
+    hex_digest = hash_str.removeprefix("sha256:")
+
+    serve_dir = tmp_path / "serve"
+    dep_decl_dir = serve_dir / "dep-decl"
+    dep_decl_dir.mkdir(parents=True)
+    (dep_decl_dir / f"{hex_digest}.kdl").write_bytes(exact_body)
 
     cache_dir = tmp_path / "cache"
     cache_dir.mkdir()
-    store = HttpDepDeclStore(
-        base_url="https://example.com/registry/",
-        cache_dir=cache_dir,
-    )
+    store = HttpDepDeclStore(base_url=f"file://{serve_dir}", cache_dir=cache_dir)
     # Must not raise FETCH-FAILED (size is OK); will raise HASH-MISMATCH only
     # if the hash pointer doesn't match — use the correct hash here so we get bytes back.
     result = store.get(hash_str)
     assert result == exact_body
 
 
-def test_http_store_content_length_too_large_raises_fetch_failed(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """HttpDepDeclStore.get raises TNG-DEPDECL-FETCH-FAILED when Content-Length > cap.
+def test_http_store_lying_content_length_no_longer_pre_rejected(tmp_path: Path) -> None:
+    """NAMED BEHAVIOR CHANGE (RFC docs/rfc-native-oci-fetch.md §3.3, slice S3):
+    the Content-Length early-reject optimization ("avoid starting the read
+    when a server lies about a huge Content-Length") is dropped along with
+    the direct ``urllib.request.urlopen`` call site.  ``bounded_http.request``
+    is a single atomic ``(cap, sink)`` call with no pre-flight header-peek
+    hook, so there is no seam left to reject on a merely-*declared* size.
 
-    Content-Length is an early-reject opportunity (avoids starting the read).
+    The actual-bytes-streamed cap (see test_http_store_size_cap_exceeded_
+    raises_fetch_failed, unchanged) is now the SOLE enforcement point: a
+    SMALL actual body succeeds even when the server advertises a
+    Content-Length far exceeding the cap.  This is a performance-only
+    regression (one fewer avoided-large-read optimization for a lying
+    server) — the real bound on bytes actually read off the wire is
+    unaffected, so no security property is weakened.
     """
-    # The body we serve is small — but the advertised Content-Length is huge.
-    # The implementation should reject on the header alone.
-    small_body = b"tiny"
-    _patch_urlopen(monkeypatch, small_body, content_length=_DEP_DECL_MAX_ARTIFACT_BYTES + 1)
+    import http.server
+    import threading
 
-    cache_dir = tmp_path / "cache"
-    cache_dir.mkdir()
-    store = HttpDepDeclStore(
-        base_url="https://example.com/registry/",
-        cache_dir=cache_dir,
-    )
-    h = "sha256:" + "a" * 64
-    with pytest.raises(MilpaError) as exc_info:
-        store.get(h)
-    err = exc_info.value
-    assert err.slug == TNG_DEPDECL_FETCH_FAILED
+    small_body = b"tiny"
+    huge_declared_length = _DEP_DECL_MAX_ARTIFACT_BYTES + 1
+    hash_str = dep_decl_hash(small_body)
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            self.send_response(200)
+            self.send_header("Content-Length", str(huge_declared_length))
+            self.end_headers()
+            self.wfile.write(small_body)
+
+        def log_message(self, *args: object) -> None:
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), _Handler)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever)
+    thread.daemon = True
+    thread.start()
+
+    try:
+        cache_dir = tmp_path / "cache"
+        cache_dir.mkdir()
+        # The fake handler ignores the request path and always serves
+        # small_body, so any base_url routes to it; hash_str must match
+        # small_body's real hash to pass the store's own hash-verify gate.
+        store = HttpDepDeclStore(base_url=f"http://127.0.0.1:{port}", cache_dir=cache_dir)
+        result = store.get(hash_str)
+        assert result == small_body
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)

@@ -1817,7 +1817,7 @@ fn resolve_named_dep_oci_provenance_produces_oci_record() {
     assert_eq!(graph.deps.len(), 1);
     let dep = graph.deps.iter().find(|d| d.name == "widget").unwrap();
 
-    // The fake oras-pull transport was actually invoked, with the full OCI
+    // The fake OCI-pull transport was actually invoked, with the full OCI
     // reference built from the index's provenance fields.
     let oci_ref = format!("{OCI_TEST_REGISTRY}/{OCI_TEST_REPOSITORY}@{OCI_TEST_DIGEST}");
     assert_eq!(
@@ -7237,7 +7237,7 @@ fn s8_same_url_ref_same_subpath_same_name_still_dedups() {
 
 /// R3 (code-review): a manifest OCI override with a malformed `digest=` is
 /// rejected with a clean coded error (TNG-BAD-OCI-DIGEST) at the fetch
-/// boundary, never reaching `oras pull` as a generic failure. The index path
+/// boundary, never reaching the OCI pull as a generic failure. The index path
 /// already validates OCI digests on parse; the manifest-override path did not.
 #[test]
 fn oci_override_malformed_digest_fails_with_coded_error_before_fetch() {
@@ -7312,6 +7312,103 @@ fn s8b_oci_target_rebinds_resolution() {
         }
         other => panic!("expected Oci provenance, got {other:?}"),
     }
+}
+
+/// A `FetcherRegistry` whose OCI fetch always fails with a fixed, definitive
+/// `FetchError` — used to prove `process_oci` surfaces that error's own
+/// code unchanged, never rewrapping it into `FETCH-ALL-FAILED` (rfc-native-
+/// oci-fetch.md §3.4, #198 S9). An OCI dep has exactly one fetch candidate
+/// (the pinned registry/repository/digest triple), so "all candidates
+/// failed" is a category error for this path.
+struct FailingOciReg {
+    error: FetchError,
+}
+
+impl FetcherRegistry for FailingOciReg {
+    fn fetch(&self, _name: &str, p: &Provenance, _dest: &Path) -> Result<Receipt, FetchError> {
+        match p {
+            Provenance::Oci { .. } => Err(self.error.clone()),
+            _ => panic!("FailingOciReg: unexpected non-OCI fetch"),
+        }
+    }
+}
+
+#[test]
+fn oci_override_digest_mismatch_surfaces_unchanged_not_all_failed() {
+    let digest = format!("sha256:{}", "c".repeat(64));
+    let reg = FailingOciReg {
+        error: FetchError::Transport(
+            "FETCH-OCI-DIGEST-MISMATCH",
+            "phase=blob: blob digest mismatch: expected ..., got ...".into(),
+        ),
+    };
+    let m = manifest_full(
+        vec![url_dep("foo", "https://example.com/foo-DO-NOT-FETCH.git", "main")],
+        Vec::new(),
+        vec![Override {
+            name: "foo".into(),
+            target: OverrideTarget::Oci {
+                registry: "ghcr.io".into(),
+                repository: "acme/foo".into(),
+                digest: digest.clone(),
+                subpath: None,
+            },
+            version: None,
+        }],
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    let err = resolve(
+        &m, None, &reg, None, None, Strategy::Maxver, true, &deps_dir(&tmp), None, false,
+        &cas_store(&tmp),
+    )
+    .expect_err("OCI fetch failure must propagate");
+
+    assert_eq!(err.code(), "FETCH-OCI-DIGEST-MISMATCH");
+    assert_ne!(err.code(), "FETCH-ALL-FAILED");
+    let MilpaError::Fetch(FetchError::Transport(code, msg)) = &err else {
+        panic!("expected Transport(FETCH-OCI-DIGEST-MISMATCH), got {err:?}");
+    };
+    assert_eq!(*code, "FETCH-OCI-DIGEST-MISMATCH");
+    assert!(msg.contains("phase=blob"), "phase context must survive, got: {msg}");
+}
+
+#[test]
+fn oci_override_pull_failed_surfaces_unchanged_not_all_failed() {
+    let digest = format!("sha256:{}", "c".repeat(64));
+    let reg = FailingOciReg {
+        error: FetchError::Transport(
+            "FETCH-OCI-PULL-FAILED",
+            "phase=token: token endpoint returned status 500".into(),
+        ),
+    };
+    let m = manifest_full(
+        vec![url_dep("foo", "https://example.com/foo-DO-NOT-FETCH.git", "main")],
+        Vec::new(),
+        vec![Override {
+            name: "foo".into(),
+            target: OverrideTarget::Oci {
+                registry: "ghcr.io".into(),
+                repository: "acme/foo".into(),
+                digest: digest.clone(),
+                subpath: None,
+            },
+            version: None,
+        }],
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    let err = resolve(
+        &m, None, &reg, None, None, Strategy::Maxver, true, &deps_dir(&tmp), None, false,
+        &cas_store(&tmp),
+    )
+    .expect_err("OCI fetch failure must propagate");
+
+    assert_eq!(err.code(), "FETCH-OCI-PULL-FAILED");
+    assert_ne!(err.code(), "FETCH-ALL-FAILED");
+    let MilpaError::Fetch(FetchError::Transport(code, msg)) = &err else {
+        panic!("expected Transport(FETCH-OCI-PULL-FAILED), got {err:?}");
+    };
+    assert_eq!(*code, "FETCH-OCI-PULL-FAILED");
+    assert!(msg.contains("phase=token"), "phase context must survive, got: {msg}");
 }
 
 #[test]

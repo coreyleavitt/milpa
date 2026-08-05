@@ -66,7 +66,7 @@ fn extracts_files_and_dirs() {
     let tar = finish(tar);
 
     let d = tmp();
-    let res = extract_tar(&tar, d.path(), 0, Limits::default()).unwrap();
+    let res = extract_tar(&tar[..], d.path(), 0, Limits::default()).unwrap();
     assert_eq!(res.file_count, 1);
     assert_eq!(
         std::fs::read(d.path().join("pkg/foo.nim")).unwrap(),
@@ -82,7 +82,7 @@ fn strip_components_drops_the_leading_dir() {
     let tar = finish(tar);
 
     let d = tmp();
-    extract_tar(&tar, d.path(), 1, Limits::default()).unwrap();
+    extract_tar(&tar[..], d.path(), 1, Limits::default()).unwrap();
     // The "pkg-1.0/" prefix is stripped → src/x.nim lands at the dest root.
     assert!(d.path().join("src/x.nim").is_file());
     assert!(!d.path().join("pkg-1.0").exists());
@@ -92,7 +92,7 @@ fn strip_components_drops_the_leading_dir() {
 fn zip_slip_via_parent_dir_is_rejected() {
     let tar = finish(entry("../escape.txt", b'0', "", b"pwned"));
     let d = tmp();
-    let err = extract_tar(&tar, d.path(), 0, Limits::default()).unwrap_err();
+    let err = extract_tar(&tar[..], d.path(), 0, Limits::default()).unwrap_err();
     assert_eq!(err.code(), "EXTRACT-ZIP-SLIP");
 }
 
@@ -101,7 +101,7 @@ fn symlink_escape_is_rejected() {
     // A symlink whose target climbs out of dest.
     let tar = finish(entry("link", b'2', "../../etc/passwd", b""));
     let d = tmp();
-    let err = extract_tar(&tar, d.path(), 0, Limits::default()).unwrap_err();
+    let err = extract_tar(&tar[..], d.path(), 0, Limits::default()).unwrap_err();
     assert_eq!(err.code(), "EXTRACT-SYMLINK-ESCAPE");
 }
 
@@ -112,7 +112,7 @@ fn in_tree_symlink_is_allowed() {
     tar.extend(entry("link", b'2', "a.nim", b""));
     let tar = finish(tar);
     let d = tmp();
-    let res = extract_tar(&tar, d.path(), 0, Limits::default()).unwrap();
+    let res = extract_tar(&tar[..], d.path(), 0, Limits::default()).unwrap();
     assert_eq!(res.file_count, 2);
     assert!(std::fs::symlink_metadata(d.path().join("link"))
         .unwrap()
@@ -129,7 +129,7 @@ fn per_file_size_cap_trips() {
         ..Limits::default()
     };
     assert_eq!(
-        extract_tar(&tar, d.path(), 0, limits).unwrap_err().code(),
+        extract_tar(&tar[..], d.path(), 0, limits).unwrap_err().code(),
         "EXTRACT-SIZE-LIMIT"
     );
 }
@@ -147,7 +147,7 @@ fn total_size_cap_trips() {
         ..Limits::default()
     };
     assert_eq!(
-        extract_tar(&tar, d.path(), 0, limits).unwrap_err().code(),
+        extract_tar(&tar[..], d.path(), 0, limits).unwrap_err().code(),
         "EXTRACT-SIZE-LIMIT"
     );
 }
@@ -165,7 +165,7 @@ fn file_count_cap_trips() {
         ..Limits::default()
     };
     assert_eq!(
-        extract_tar(&tar, d.path(), 0, limits).unwrap_err().code(),
+        extract_tar(&tar[..], d.path(), 0, limits).unwrap_err().code(),
         "EXTRACT-SIZE-LIMIT"
     );
 }
@@ -229,7 +229,7 @@ fn posix_prefix_field_combined_with_name() {
     let tar = finish(tar);
 
     let d = tmp();
-    extract_tar(&tar, d.path(), 0, Limits::default()).unwrap();
+    extract_tar(&tar[..], d.path(), 0, Limits::default()).unwrap();
     assert!(
         d.path().join(&expected_path).is_file(),
         "POSIX prefix+name must produce {expected_path}"
@@ -256,7 +256,7 @@ fn posix_prefix_creates_correct_tree_for_long_path() {
     let tar = finish(tar);
 
     let d = tmp();
-    extract_tar(&tar, d.path(), 0, Limits::default()).unwrap();
+    extract_tar(&tar[..], d.path(), 0, Limits::default()).unwrap();
     assert!(
         d.path().join(&expected_path).is_file(),
         "long POSIX prefix path must be extracted correctly: {expected_path}"
@@ -284,7 +284,7 @@ fn gnu_longlink_name_overrides_short_header_name() {
     let tar = finish(tar);
 
     let d = tmp();
-    extract_tar(&tar, d.path(), 0, Limits::default()).unwrap();
+    extract_tar(&tar[..], d.path(), 0, Limits::default()).unwrap();
     // The file MUST be at the FULL long_name path (not the truncated 100-char path).
     assert!(
         d.path().join(&long_name).is_file(),
@@ -342,7 +342,7 @@ fn pax_path_header_overrides_name() {
     let tar = finish(tar);
 
     let d = tmp();
-    extract_tar(&tar, d.path(), 0, Limits::default()).unwrap();
+    extract_tar(&tar[..], d.path(), 0, Limits::default()).unwrap();
     assert!(
         d.path().join(&long_name).is_file(),
         "PAX path= must produce full path: {long_name}"
@@ -415,7 +415,7 @@ fn pax_path_as_second_record_is_not_silently_dropped() {
     let tar = finish(tar);
 
     let d = tmp();
-    extract_tar(&tar, d.path(), 0, Limits::default()).unwrap();
+    extract_tar(&tar[..], d.path(), 0, Limits::default()).unwrap();
     assert!(
         d.path().join(&long_name).is_file(),
         "PAX path= record at non-zero pos must be applied (not silently dropped): {long_name}"
@@ -442,7 +442,7 @@ fn pax_path_as_third_record_is_not_silently_dropped() {
     let tar = finish(tar);
 
     let d = tmp();
-    extract_tar(&tar, d.path(), 0, Limits::default()).unwrap();
+    extract_tar(&tar[..], d.path(), 0, Limits::default()).unwrap();
     assert!(
         d.path().join(&long_name).is_file(),
         "PAX path= as third record must be applied: {long_name}"
@@ -463,7 +463,7 @@ fn existing_short_path_entries_still_extract_correctly() {
     let tar = finish(tar);
 
     let d = tmp();
-    let res = extract_tar(&tar, d.path(), 0, Limits::default()).unwrap();
+    let res = extract_tar(&tar[..], d.path(), 0, Limits::default()).unwrap();
     assert_eq!(res.file_count, 2);
     assert_eq!(std::fs::read(d.path().join("src/foo.nim")).unwrap(), b"foo");
     assert_eq!(std::fs::read(d.path().join("src/bar.nim")).unwrap(), b"bar");
@@ -508,7 +508,7 @@ fn corrupt_checksum_is_rejected_does_not_write_garbage() {
     // (passes without writing any file) until checksum validation is added.
     let tar = finish(entry_corrupt_checksum("garbage.nim", b'0', b"pwned-content"));
     let d = tmp();
-    let result = extract_tar(&tar, d.path(), 0, Limits::default());
+    let result = extract_tar(&tar[..], d.path(), 0, Limits::default());
 
     // Must return an error — FETCH-EXTRACT-FAILED or any EXTRACT-* code.
     match &result {
@@ -541,7 +541,7 @@ fn valid_checksum_entries_still_extract() {
     tar.extend(entry("valid.nim", b'0', "", b"valid-content"));
     let tar = finish(tar);
     let d = tmp();
-    let res = extract_tar(&tar, d.path(), 0, Limits::default()).unwrap();
+    let res = extract_tar(&tar[..], d.path(), 0, Limits::default()).unwrap();
     assert_eq!(res.file_count, 1);
     assert_eq!(
         std::fs::read(d.path().join("valid.nim")).unwrap(),
@@ -573,7 +573,7 @@ fn symlink_count_cap_trips() {
         max_file_count: 2,
         ..Limits::default()
     };
-    let err = extract_tar(&tar, d.path(), 0, limits).unwrap_err();
+    let err = extract_tar(&tar[..], d.path(), 0, limits).unwrap_err();
     assert_eq!(
         err.code(),
         "EXTRACT-SIZE-LIMIT",
@@ -595,7 +595,7 @@ fn hardlink_count_cap_trips() {
         max_file_count: 2,
         ..Limits::default()
     };
-    let err = extract_tar(&tar, d.path(), 0, limits).unwrap_err();
+    let err = extract_tar(&tar[..], d.path(), 0, limits).unwrap_err();
     assert_eq!(
         err.code(),
         "EXTRACT-SIZE-LIMIT",
@@ -615,7 +615,7 @@ fn hardlink_materialised_as_file_copy() {
     tar.extend(entry("a/bar.txt", b'1', "a/foo.txt", b""));
     let tar = finish(tar);
     let d = tmp();
-    let res = extract_tar(&tar, d.path(), 0, Limits::default()).unwrap();
+    let res = extract_tar(&tar[..], d.path(), 0, Limits::default()).unwrap();
     // bar.txt must be a real regular file with identical bytes
     let bar = d.path().join("a/bar.txt");
     assert!(bar.is_file(), "bar.txt must be a regular file");
@@ -637,7 +637,7 @@ fn hardlink_strip_components_applied_to_linkname() {
     tar.extend(entry("a/bar.txt", b'1', "a/foo.txt", b""));
     let tar = finish(tar);
     let d = tmp();
-    extract_tar(&tar, d.path(), 1, Limits::default()).unwrap();
+    extract_tar(&tar[..], d.path(), 1, Limits::default()).unwrap();
     let foo = d.path().join("foo.txt");
     let bar = d.path().join("bar.txt");
     assert!(foo.is_file(), "foo.txt must exist after strip");
@@ -658,7 +658,7 @@ fn hardlink_forward_reference_two_pass() {
     tar.extend(entry("a/foo.txt", b'0', "", b"forward ref")); // file SECOND
     let tar = finish(tar);
     let d = tmp();
-    let res = extract_tar(&tar, d.path(), 0, Limits::default()).unwrap();
+    let res = extract_tar(&tar[..], d.path(), 0, Limits::default()).unwrap();
     let bar = d.path().join("a/bar.txt");
     assert!(bar.is_file(), "bar.txt must exist even though hardlink was listed first");
     assert_eq!(std::fs::read(&bar).unwrap(), b"forward ref");
@@ -671,7 +671,7 @@ fn hardlink_escape_raises_zip_slip() {
     // No new slug — same code as a regular path-traversal escape.
     let tar = finish(entry("a/evil.txt", b'1', "../../etc/passwd", b""));
     let d = tmp();
-    let err = extract_tar(&tar, d.path(), 0, Limits::default()).unwrap_err();
+    let err = extract_tar(&tar[..], d.path(), 0, Limits::default()).unwrap_err();
     assert_eq!(
         err.code(),
         "EXTRACT-ZIP-SLIP",
@@ -709,7 +709,7 @@ fn write_failure_after_validation_raises_io_error() {
         return; // running as root or in a permissionless FS — can't induce failure
     }
 
-    let result = extract_tar(&tar, d.path(), 0, Limits::default());
+    let result = extract_tar(&tar[..], d.path(), 0, Limits::default());
     std::fs::set_permissions(d.path(), std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
 
     let err = result.unwrap_err();
@@ -727,10 +727,154 @@ fn zip_slip_via_parent_dir_still_raises_zip_slip_not_io_error() {
     // test but re-stated explicitly as the EXTRACT-IO-ERROR counterpart.
     let tar = finish(entry("../escape.txt", b'0', "", b"pwned"));
     let d = tmp();
-    let err = extract_tar(&tar, d.path(), 0, Limits::default()).unwrap_err();
+    let err = extract_tar(&tar[..], d.path(), 0, Limits::default()).unwrap_err();
     assert_eq!(
         err.code(),
         "EXTRACT-ZIP-SLIP",
         "path escape must still raise EXTRACT-ZIP-SLIP after R1-18; got: {err:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #202: streaming extract_tar — per-entry memory-safety (peak bounded by the
+// largest member, not the archive) — docs/rfc-native-oci-fetch.md §3.3
+// ---------------------------------------------------------------------------
+
+/// Build a single 512-byte header whose size FIELD claims `declared_size`
+/// bytes but which is NOT followed by that much (or any) data — the archive
+/// ends right after the header. Used to prove the streaming reader rejects an
+/// implausible declared size WITHOUT attempting to buffer or skip anywhere
+/// near that many bytes.
+fn header_with_lying_size(name: &str, typeflag: u8, declared_size: u64) -> Vec<u8> {
+    let mut h = [0u8; 512];
+    let nb = name.as_bytes();
+    h[..nb.len().min(100)].copy_from_slice(&nb[..nb.len().min(100)]);
+    let size_oct = format!("{:011o}\0", declared_size);
+    h[124..136].copy_from_slice(size_oct.as_bytes());
+    h[156] = typeflag;
+    write_checksum(&mut h);
+    h.to_vec()
+}
+
+#[test]
+fn streaming_extract_rejects_oversized_file_entry_before_buffering() {
+    // #202 (c): a File entry whose header declares an implausible size (6 GB,
+    // far beyond the default 256 MiB max_file_size) must be rejected by the
+    // pre-allocation cap check in `read_entry_data` BEFORE any buffer is
+    // allocated for it. Proof: the declared size isn't backed by any actual
+    // archive bytes (the header above is the entire "archive"), so a
+    // naively-streamed translation that read `size` bytes before checking the
+    // cap would attempt `vec![0u8; 6_000_000_000]` — an allocation this test
+    // process cannot satisfy, which aborts the process (Rust's global
+    // allocator calls `handle_alloc_error` on failure) rather than returning
+    // an `Err`. This test completing at all (fast, with a clean error) is the
+    // structural proof the guard fires before that allocation is attempted.
+    let tar = header_with_lying_size("huge.bin", b'0', 6_000_000_000);
+    let d = tmp();
+    let err = extract_tar(&tar[..], d.path(), 0, Limits::default()).unwrap_err();
+    assert_eq!(
+        err.code(),
+        "EXTRACT-SIZE-LIMIT",
+        "an implausibly large declared file size must be rejected before buffering"
+    );
+    assert!(!d.path().join("huge.bin").exists());
+}
+
+#[test]
+fn streaming_extract_skip_of_oversized_non_file_entry_does_not_allocate() {
+    // #202 (c) complementary: a NON-data-bearing entry (a Dir, typeflag '5')
+    // with an equally implausible declared size must ALSO be rejected
+    // quickly. Dir/Symlink/HardLink/Other entries' data is discarded via
+    // `skip_exact`'s fixed-size scratch buffer, never buffered — so unlike
+    // the File case above, there is no per-entry cap check here at all (none
+    // is needed): the archive has no data behind the huge declared size, so
+    // the skip loop simply runs out of bytes (`EXTRACT-SIZE-LIMIT`, "runs
+    // past end of archive") instead of an allocation attempt proportional to
+    // `declared_size` ever being made.
+    let tar = header_with_lying_size("huge/", b'5', 6_000_000_000);
+    let d = tmp();
+    let err = extract_tar(&tar[..], d.path(), 0, Limits::default()).unwrap_err();
+    assert_eq!(
+        err.code(),
+        "EXTRACT-SIZE-LIMIT",
+        "an implausibly large declared dir size must be rejected without hanging or aborting"
+    );
+}
+
+// --- read_entry_data error classification (code-review Fix 1) --------------
+
+/// Deterministic (non-cryptographic) byte generator — enough entropy that the
+/// gzip encoder actually Huffman/LZ77-codes the payload (rather than falling
+/// back to a "stored" raw block, which a single flipped byte would NOT
+/// corrupt structurally — see the test below for why that distinction
+/// matters).
+fn pseudo_random_bytes(seed: u64, n: usize) -> Vec<u8> {
+    let mut s = seed;
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        out.push((s >> 33) as u8);
+    }
+    out
+}
+
+fn gzip_default(bytes: &[u8]) -> Vec<u8> {
+    use flate2::{write::GzEncoder, Compression};
+    use std::io::Write;
+    let mut e = GzEncoder::new(Vec::new(), Compression::default());
+    e.write_all(bytes).unwrap();
+    e.finish().unwrap()
+}
+
+#[test]
+fn read_entry_data_genuine_mid_stream_error_is_fetch_extract_failed_not_size_limit() {
+    // Code-review Fix 1: `read_entry_data`'s `read_exact` error mapping used
+    // to collapse EVERY non-cap error into EXTRACT-SIZE-LIMIT ("runs past end
+    // of archive"), even a genuine mid-stream I/O error that has nothing to
+    // do with a size limit or a decompression bomb. Its siblings
+    // (`skip_exact`, `read_header`) already distinguish true short-reads
+    // (EXTRACT-SIZE-LIMIT) from a real underlying `io::Error`
+    // (FETCH-EXTRACT-FAILED) — `read_entry_data` must do the same.
+    //
+    // Build a gzip tar whose header decodes cleanly, but whose File entry's
+    // payload is corrupted partway through the declared-size data — a
+    // corrupt DEFLATE stream mid-entry, NOT a truncated archive. That must
+    // surface as FETCH-EXTRACT-FAILED, not be misreported as "possible
+    // decompression bomb".
+    let data = pseudo_random_bytes(0xC0FFEE, 8192);
+    let tar = finish(entry("payload.bin", b'0', "", &data));
+    let good_gz = gzip_default(&tar);
+
+    // Flip 128 bytes starting at the midpoint of the compressed stream: past
+    // the small header's compressed contribution (the 8192-byte payload
+    // dominates the stream) and well short of the trailer, so the corruption
+    // decodes to garbled *payload* bytes without breaking the DEFLATE
+    // bitstream's own syntax — i.e. `read_entry_data`'s `read_exact` runs to
+    // completion length-wise but the underlying gzip stream detects (via its
+    // trailing CRC32) that what it decoded doesn't match, and hands
+    // `read_exact` a genuine `io::Error` ("corrupt gzip stream does not have
+    // a matching checksum") — exactly the class of error this fix must route
+    // to FETCH-EXTRACT-FAILED instead of EXTRACT-SIZE-LIMIT. (Verified this
+    // offset/span reliably reproduces the bug — other offsets often instead
+    // garble the *next* tar header, which is a different, already-correct
+    // code path (`corrupt_checksum_is_rejected_does_not_write_garbage`).)
+    let mut corrupt_gz = good_gz.clone();
+    let at = corrupt_gz.len() / 2;
+    for b in &mut corrupt_gz[at..at + 128] {
+        *b ^= 0xff;
+    }
+
+    let d = tmp();
+    let err = extract_tar(
+        flate2::read::GzDecoder::new(&corrupt_gz[..]),
+        d.path(),
+        0,
+        Limits::default(),
+    )
+    .unwrap_err();
+    assert_eq!(
+        err.code(),
+        "FETCH-EXTRACT-FAILED",
+        "mid-entry-data DEFLATE corruption must not be misreported as a size-limit/bomb: {err:?}"
     );
 }

@@ -188,21 +188,27 @@ No mocked-fetches entry for the requested url@ref under the mocked transport.
 
 ### `FETCH-OCI-AMBIGUOUS-TARBALL`
 
-OCI artifact contained more than one *.tar.gz blob.
+OCI artifact manifest declared more than one `application/vnd.milpa.source.v1.tar+gzip` layer.
 
-**Triggered:** OciFetcher.fetch finds multiple *.tar.gz files; cannot determine which to extract.
+**Triggered:** `select_source_layer` (the native OCI client's artifact-policy gate, `registry-protocol.md` §7) finds more than one layer whose `mediaType` is `application/vnd.milpa.source.v1.tar+gzip` on an otherwise well-shaped manifest; milpa cannot determine which layer to fetch and extract.
+
+### `FETCH-OCI-DIGEST-MISMATCH`
+
+The bytes fetched from the registry for an OCI blob (or manifest) do not hash to the `sha256:` digest the fetch was pinned to — a tampering signal.
+
+**Triggered:** During a native OCI pull, the client reads a manifest (or streams a blob) addressed by a `sha256:` digest and computes `sha256` over the received bytes; the computed hash differs from the pinned digest. This is the compressed-transport-byte integrity check, distinct from the post-extract `content_hash` over the extracted source tree — the two cover different hash domains and neither makes the other optional. A registry or CDN serving different bytes than the pinned digest is an active supply-chain signal: it is raised immediately and MUST NOT be silently retried against another candidate. (Distinct from `TNG-BAD-OCI-DIGEST`, a parse-time *shape* gate on a malformed digest string, not a runtime content check.)
 
 ### `FETCH-OCI-NO-TARBALL`
 
-OCI artifact contained no *.tar.gz blob.
+OCI artifact manifest declared no `application/vnd.milpa.source.v1.tar+gzip` layer.
 
-**Triggered:** OciFetcher.fetch pulls the artifact but finds no *.tar.gz in the scratch directory.
+**Triggered:** `select_source_layer` finds zero layers whose `mediaType` is `application/vnd.milpa.source.v1.tar+gzip` — including the case where the manifest's `artifactType` or config descriptor's `mediaType` disagree with milpa's fixed values (`registry-protocol.md` §7), which collapses to the same "no valid milpa tarball present" outcome rather than a separate error.
 
 ### `FETCH-OCI-PULL-FAILED`
 
-oras pull exited non-zero.
+The native token/manifest/blob transport failed during an OCI pull.
 
-**Triggered:** OciFetcher.fetch runs `oras pull` and receives a non-zero exit code.
+**Triggered:** `OciRegistryClient` raises this error, carrying a structured `phase="token"|"manifest"|"blob"` field, at any of: the registry's `WWW-Authenticate` challenge cannot be parsed or advertises no `Bearer` scheme (`phase="token"`); the token or manifest HTTP request fails or returns a non-2xx status (`phase="token"`/`"manifest"`); the manifest response is not valid JSON, is not a JSON object, or is a manifest list/index rather than a single manifest (`phase="manifest"`); or the blob GET fails, is redirected to an unparseable location, or is aborted for exceeding the streaming cap (`phase="blob"`). Distinct from `FETCH-OCI-DIGEST-MISMATCH`, which fires only on a digest-verification failure within an otherwise successful fetch.
 
 ### `FETCH-PROVENANCE-DIVERGENCE`
 
@@ -1219,7 +1225,7 @@ A `git ls-tree` read of the (already HEAD-resolved) publish commit failed at the
 
 The just-pushed artifact's manifest could not be fetched or was not shaped as expected.
 
-**Triggered:** `make_oras_manifest_fetch`'s closure runs `oras manifest fetch <ref>` and JSON-parses its stdout; a non-zero exit, non-JSON output, or a non-object result raises this error. It is also raised by `execute`'s digest-verification step when the parsed manifest has no `layers` array, an empty one, or a first layer with no (or a non-string) `digest` field — in every case, milpa cannot establish what bytes the registry actually stored, so `sign` is never called.
+**Triggered:** `make_oras_manifest_fetch`'s closure runs `oras manifest fetch <ref>` and JSON-parses its stdout; a non-zero exit, non-JSON output, or a non-object result raises this error. It is also raised by `execute`'s digest-verification step (`_extract_layer_digest`), which mirrors the pull-side `select_source_layer` gate (`registry-protocol.md` §7.4) as defense in depth: a non-object manifest, an unexpected `artifactType`, an unexpected config descriptor `mediaType`, a missing/empty `layers` array, anything other than exactly one layer of the milpa source-tarball media type, or a matching layer with no (or a non-string) `digest` field, all raise this error — in every case, milpa cannot establish that the registry stored a valid single-milpa-layer artifact, so `sign` is never called.
 
 ### `PUBLISH-NO-DIGEST-IN-OUTPUT`
 
@@ -1416,7 +1422,7 @@ A `dep_decl` pointer in the index version-node is not in `sha256:<64 lowercase h
 
 An OCI provenance digest is not in `sha256:<64 lowercase hex>` format.
 
-**Triggered:** _validate_oci_digest finds the digest field does not match `^sha256:[0-9a-f]{64}$` — rejects malformed oras pull references.
+**Triggered:** _validate_oci_digest finds the digest field does not match `^sha256:[0-9a-f]{64}$` — a parse-time shape gate that rejects a malformed digest before it can reach the native OCI client's manifest-fetch request (`registry-protocol.md` §7.4).
 
 ### `TNG-BAD-VERSION`
 
@@ -1674,9 +1680,9 @@ A package name contains path-traversal characters and is unsafe as a filesystem 
 
 ### `TNG-UNSAFE-OCI-FIELD`
 
-An OCI provenance field (registry or repository) begins with `-` and would be interpreted as a CLI flag.
+An OCI provenance field (registry or repository) begins with `-`.
 
-**Triggered:** _validate_no_leading_dash finds an oci registry or repository value starting with `-` — flag-injection prevention for oras argv.
+**Triggered:** _validate_no_leading_dash finds an oci registry or repository value starting with `-` — a parse-time defense-in-depth shape gate before the value reaches the native OCI client's request URL and headers (`registry-protocol.md` §7); a leading dash is never a legitimate registry hostname or repository path segment. The same validator is independently re-checked on the separate, CI-only `milpa publish` path before any `oras` subprocess runs, where it retains its original flag-injection-prevention rationale.
 
 ### `TNG-UNSAFE-REF`
 

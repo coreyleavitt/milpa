@@ -44,6 +44,7 @@ from milpa.errors import (
     TNG_UNSAFE_OCI_FIELD,
 )
 from milpa.fetchers.oci import OciProvenance
+from milpa.fetchers.oci_client import SOURCE_LAYER_MEDIA_TYPE
 from milpa.fetchers.safe_extract import extract_tar
 from milpa.identity import compute_content_hash
 from milpa.publishing import (
@@ -84,7 +85,7 @@ def _make_fake_manifest_fetch(digest: str):
 
     def _fetch(oci_ref: str) -> dict:
         calls.append(oci_ref)
-        return {"layers": [{"digest": digest}]}
+        return {"layers": [{"digest": digest, "mediaType": SOURCE_LAYER_MEDIA_TYPE}]}
 
     _fetch.calls = calls  # type: ignore[attr-defined]
     return _fetch
@@ -1130,7 +1131,7 @@ def test_execute_pushes_before_signing(tmp_path: Path) -> None:
 
     def fake_manifest_fetch(oci_ref):
         order.append("verify")
-        return {"layers": [{"digest": local_digest}]}
+        return {"layers": [{"digest": local_digest, "mediaType": SOURCE_LAYER_MEDIA_TYPE}]}
 
     execute(plan, push=fake_push, sign=fake_sign, manifest_fetch=fake_manifest_fetch)
 
@@ -1792,6 +1793,113 @@ def test_execute_malformed_manifest_raises_manifest_fetch_failed(
 
     def fake_manifest_fetch(oci_ref):
         return manifest
+
+    with pytest.raises(MilpaError) as exc_info:
+        execute(plan, push=fake_push, sign=fake_sign, manifest_fetch=fake_manifest_fetch)
+
+    assert exc_info.value.slug == PUBLISH_MANIFEST_FETCH_FAILED
+    assert sign_calls == []
+
+
+def test_execute_multi_layer_manifest_raises_manifest_fetch_failed(
+    tmp_path: Path,
+) -> None:
+    """A manifest with more than one milpa source-tarball layer is ambiguous
+    and must be rejected — mirrors the pull side's FETCH-OCI-AMBIGUOUS-TARBALL
+    gate (select_source_layer), enforced here as a defense-in-depth check on
+    the publisher's own tool so it cannot emit an artifact shape the puller
+    would reject."""
+    repo, commit = _make_local_git_repo(tmp_path)
+    source = PublishSource(repo=repo, commit=commit)
+    target = _make_target()
+    plan = build_publish_plan(source, target)
+
+    local_digest = _local_artifact_digest(repo, commit)
+
+    def fake_push(artifact_path, registry_ref, artifact_type, layer_media_type):
+        return "sha256:" + "4" * 64
+
+    sign_calls: list[str] = []
+
+    def fake_sign(oci_ref):
+        sign_calls.append(oci_ref)
+
+    def fake_manifest_fetch(oci_ref):
+        return {
+            "layers": [
+                {"digest": local_digest, "mediaType": SOURCE_LAYER_MEDIA_TYPE},
+                {"digest": "sha256:" + "5" * 64, "mediaType": SOURCE_LAYER_MEDIA_TYPE},
+            ]
+        }
+
+    with pytest.raises(MilpaError) as exc_info:
+        execute(plan, push=fake_push, sign=fake_sign, manifest_fetch=fake_manifest_fetch)
+
+    assert exc_info.value.slug == PUBLISH_MANIFEST_FETCH_FAILED
+    assert sign_calls == []
+
+
+def test_execute_wrong_layer_media_type_raises_manifest_fetch_failed(
+    tmp_path: Path,
+) -> None:
+    """A manifest whose single layer is NOT the milpa source-tarball media
+    type is rejected rather than blindly trusting `layers[0]` — mirrors the
+    pull side's FETCH-OCI-NO-TARBALL gate (select_source_layer)."""
+    repo, commit = _make_local_git_repo(tmp_path)
+    source = PublishSource(repo=repo, commit=commit)
+    target = _make_target()
+    plan = build_publish_plan(source, target)
+
+    local_digest = _local_artifact_digest(repo, commit)
+
+    def fake_push(artifact_path, registry_ref, artifact_type, layer_media_type):
+        return "sha256:" + "6" * 64
+
+    sign_calls: list[str] = []
+
+    def fake_sign(oci_ref):
+        sign_calls.append(oci_ref)
+
+    def fake_manifest_fetch(oci_ref):
+        return {
+            "layers": [
+                {"digest": local_digest, "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip"}
+            ]
+        }
+
+    with pytest.raises(MilpaError) as exc_info:
+        execute(plan, push=fake_push, sign=fake_sign, manifest_fetch=fake_manifest_fetch)
+
+    assert exc_info.value.slug == PUBLISH_MANIFEST_FETCH_FAILED
+    assert sign_calls == []
+
+
+def test_execute_wrong_artifact_type_raises_manifest_fetch_failed(
+    tmp_path: Path,
+) -> None:
+    """A manifest declaring a non-milpa `artifactType` is rejected even when
+    its layer would otherwise match — the artifactType/config defense-in-depth
+    checks mirror select_source_layer's shape gate on the pull side."""
+    repo, commit = _make_local_git_repo(tmp_path)
+    source = PublishSource(repo=repo, commit=commit)
+    target = _make_target()
+    plan = build_publish_plan(source, target)
+
+    local_digest = _local_artifact_digest(repo, commit)
+
+    def fake_push(artifact_path, registry_ref, artifact_type, layer_media_type):
+        return "sha256:" + "7" * 64
+
+    sign_calls: list[str] = []
+
+    def fake_sign(oci_ref):
+        sign_calls.append(oci_ref)
+
+    def fake_manifest_fetch(oci_ref):
+        return {
+            "artifactType": "application/vnd.other.thing.v1",
+            "layers": [{"digest": local_digest, "mediaType": SOURCE_LAYER_MEDIA_TYPE}],
+        }
 
     with pytest.raises(MilpaError) as exc_info:
         execute(plan, push=fake_push, sign=fake_sign, manifest_fetch=fake_manifest_fetch)

@@ -3450,7 +3450,7 @@ impl<'a> ResolveProvider<'a> {
         // fetch boundary. A manifest `overrides { pkg oci=... digest=... }`
         // is otherwise unvalidated (unlike an index-parsed OCI digest, which
         // `registry.rs` validates on parse), so a malformed digest would reach
-        // `oras pull` as a generic FETCH failure rather than a clean coded
+        // the OCI pull as a generic FETCH failure rather than a clean coded
         // error. Reuses the single `validate_oci_digest` (TNG-BAD-OCI-DIGEST)
         // — mirrors Python's `OciProvenance.__post_init__` type invariant.
         crate::registry::validate_oci_digest(&dep.digest).map_err(MilpaError::Core)?;
@@ -6306,6 +6306,7 @@ fn fetch_msg(e: &FetchError) -> String {
         | FetchError::ProvenanceDivergence(m)
         | FetchError::Extract(_, m)
         | FetchError::Transport(_, m) => m.clone(),
+        FetchError::OciTransport { message, .. } => message.clone(),
     }
 }
 

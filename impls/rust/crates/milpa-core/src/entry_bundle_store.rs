@@ -5,14 +5,12 @@
 //! the registry's two-tier pattern: mutable signed map → immutable hash-pinned
 //! artifacts; DepDecl was the first).
 //!
-//! Mirrors `impls/python/milpa/entry_bundle_store.py`. This module intentionally
-//! DUPLICATES `dep_decl_store.rs`'s shape (fetch-or-cache + hash-verify trait
-//! pair) rather than generalizing it into one parametrized artifact store — the
-//! same extract-or-decline decision the Python module records: refactoring the
-//! already-battle-tested `dep_decl_store.rs` now would risk that module for no
-//! test-coverage gain in P3a (bundle HTTP-production correctness is untestable
-//! before P4 ships real bundles). Revisit the generalized extraction once both
-//! HTTP stores have real-world mileage (P4).
+//! Mirrors `impls/python/milpa/entry_bundle_store.py`. `HttpEntryBundleStore`
+//! is a thin wrapper around `dep_decl_store::ContentAddressedHttpArtifactStore`
+//! — the fetch-or-cache + hash-verify shape it shares with `HttpDepDeclStore`
+//! lives there once now (CLAUDE.md: "Duplicate code paths are bugs ... unify
+//! them" — issue #201). `FileEntryBundleStore` is untouched by the
+//! extraction — it never duplicated HTTP-store logic.
 //!
 //! SECURITY INVARIANT (NORMATIVE): `TNG-ENTRY-BUNDLE-PIN-MISMATCH` is raised
 //! HERE and ONLY HERE (`verify`), and is ALWAYS a hard error — never
@@ -26,6 +24,7 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
+use crate::dep_decl_store::ContentAddressedHttpArtifactStore;
 use crate::error::CoreError;
 use crate::MilpaError;
 
@@ -158,142 +157,64 @@ impl EntryBundleStore for FileEntryBundleStore {
 /// conservative ceiling pending real measurement at P4.
 const ENTRY_BUNDLE_MAX_ARTIFACT_BYTES: usize = 4 * 1024 * 1024;
 
+/// Build the `TNG-ENTRY-BUNDLE-MISSING` error for a fetch failure.
+///
+/// Passed to `ContentAddressedHttpArtifactStore::get` as
+/// `make_fetch_failed_error` (mirrors `dep_decl_store::dep_decl_fetch_
+/// failed_error`) — the ONE place that builds this error, regardless of
+/// whether the failure was a file-read error, a cap breach, a transport
+/// error, or an HTTP error status (`detail` carries the specifics).
+fn entry_bundle_fetch_failed_error(bundle_pin: &str, url: &str, detail: &str) -> MilpaError {
+    MilpaError::Core(CoreError::Tianguis(
+        "TNG-ENTRY-BUNDLE-MISSING",
+        format!("attestation bundle {bundle_pin:?} fetch failed from {url}: {detail}"),
+    ))
+}
+
 /// Production entry-bundle store: fetch from HTTP + immutable cache.
 ///
 /// Artifact URL = `<base_url>/attestation/<sha256_hex>.bundle` (RFC §7, same
 /// derivation convention as `dep-decl/`). Cache is
 /// `<cache_dir>/<sha256_hex>.bundle` — immutable forever, no TTL.
 ///
-/// Transport: subprocess `curl` (mirrors `dep_decl_store.rs`'s
-/// `http_get_bytes`, same pattern as the tianguis index client). Supports
-/// `http://`, `https://`, and `file://` schemes.
+/// Transport: the native `bounded_http` backend, via
+/// `ContentAddressedHttpArtifactStore` (shared with `HttpDepDeclStore`,
+/// issue #201). Supports `http://`, `https://`, and `file://` schemes.
 pub struct HttpEntryBundleStore {
-    base_url: String,
-    cache_dir: Option<PathBuf>,
+    core: ContentAddressedHttpArtifactStore,
 }
 
 impl HttpEntryBundleStore {
     pub fn new(base_url: impl Into<String>, cache_dir: Option<PathBuf>) -> Self {
         HttpEntryBundleStore {
-            base_url: base_url.into(),
-            cache_dir,
+            core: ContentAddressedHttpArtifactStore::new(
+                base_url,
+                cache_dir,
+                "attestation",
+                ".bundle",
+                ENTRY_BUNDLE_MAX_ARTIFACT_BYTES,
+            ),
         }
-    }
-
-    fn artifact_url(&self, bundle_pin: &str) -> String {
-        format!("{}attestation/{bundle_pin}.bundle", self.base_url)
-    }
-
-    fn cache_path(&self, bundle_pin: &str) -> Option<PathBuf> {
-        self.cache_dir
-            .as_ref()
-            .map(|d| d.join(format!("{bundle_pin}.bundle")))
     }
 }
 
 impl EntryBundleStore for HttpEntryBundleStore {
     fn get(&self, bundle_pin: &str) -> Result<Vec<u8>, MilpaError> {
-        // Cache-first (immutable: a hit is always valid; no staleness check).
-        // CR16: cached-read + self-heal is shared with HttpDepDeclStore via
-        // crate::atomic_cache::read_verified_or_self_heal — a locally
-        // corrupt/unreadable cache entry (e.g. a truncated write left behind
-        // by the pre-unique-temp-name concurrency race, or plain disk
-        // corruption) is discarded and treated as a cache miss so the caller
-        // re-fetches, rather than a permanent hard failure. A mismatch on
-        // FRESHLY FETCHED bytes below (the server genuinely served the wrong
-        // content) stays a hard error via `?` — that call never goes through
-        // the self-heal primitive.
-        if let Some(cache_path) = self.cache_path(bundle_pin) {
-            if let Some(cached) =
-                crate::atomic_cache::read_verified_or_self_heal(&cache_path, |b| verify(b, bundle_pin))
-            {
-                return Ok(cached);
-            }
-        }
-
-        let url = self.artifact_url(bundle_pin);
-        let bytes = http_get_bytes(&url, bundle_pin)?;
-        verify(&bytes, bundle_pin)?;
-
-        // Atomic best-effort cache write (unique-per-write temp sibling +
-        // rename — registry-protocol §3.5.2 NORMATIVE (concurrency); a
-        // write failure is non-fatal, the bytes were already verified).
-        if let Some(cache_path) = self.cache_path(bundle_pin) {
-            if let Some(parent) = cache_path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let _ = crate::atomic_cache::atomic_write_bytes(&cache_path, &bytes);
-        }
-
-        Ok(bytes)
+        self.core.get(
+            bundle_pin,
+            bundle_pin,
+            |b| verify(b, bundle_pin),
+            entry_bundle_fetch_failed_error,
+        )
     }
 
     fn is_cached(&self, bundle_pin: &str) -> bool {
-        self.cache_path(bundle_pin)
-            .map(|p| p.is_file())
-            .unwrap_or(false)
+        self.core.is_cached(bundle_pin)
     }
 
     fn backend(&self) -> BundleStoreBackend {
         BundleStoreBackend::Http
     }
-}
-
-/// Minimal synchronous HTTP GET returning raw bytes, with a size cap.
-/// Mirrors `dep_decl_store::http_get_bytes`.
-fn http_get_bytes(url: &str, bundle_pin: &str) -> Result<Vec<u8>, MilpaError> {
-    if let Some(path_str) = url.strip_prefix("file://") {
-        let bytes = std::fs::read(path_str).map_err(|e| {
-            MilpaError::Core(CoreError::Tianguis(
-                "TNG-ENTRY-BUNDLE-MISSING",
-                format!("attestation bundle {bundle_pin:?} fetch failed from {url}: {e}"),
-            ))
-        })?;
-        if bytes.len() > ENTRY_BUNDLE_MAX_ARTIFACT_BYTES {
-            return Err(MilpaError::Core(CoreError::Tianguis(
-                "TNG-ENTRY-BUNDLE-MISSING",
-                format!(
-                    "attestation bundle {bundle_pin:?} from {url} exceeds the \
-                     {ENTRY_BUNDLE_MAX_ARTIFACT_BYTES}-byte cap ({} bytes) — \
-                     rejecting to prevent resource exhaustion",
-                    bytes.len()
-                ),
-            )));
-        }
-        return Ok(bytes);
-    }
-
-    let max_str = ENTRY_BUNDLE_MAX_ARTIFACT_BYTES.to_string();
-    let out = std::process::Command::new("curl")
-        .args(["-fsSL", "--max-filesize", &max_str, url])
-        .output()
-        .map_err(|e| {
-            MilpaError::Core(CoreError::Tianguis(
-                "TNG-ENTRY-BUNDLE-MISSING",
-                format!("attestation bundle {bundle_pin:?}: curl failed: {e}"),
-            ))
-        })?;
-    if !out.status.success() {
-        return Err(MilpaError::Core(CoreError::Tianguis(
-            "TNG-ENTRY-BUNDLE-MISSING",
-            format!(
-                "attestation bundle {bundle_pin:?} fetch failed from {url}: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            ),
-        )));
-    }
-    if out.stdout.len() > ENTRY_BUNDLE_MAX_ARTIFACT_BYTES {
-        return Err(MilpaError::Core(CoreError::Tianguis(
-            "TNG-ENTRY-BUNDLE-MISSING",
-            format!(
-                "attestation bundle {bundle_pin:?} from {url} exceeds the \
-                 {ENTRY_BUNDLE_MAX_ARTIFACT_BYTES}-byte cap ({} bytes) — \
-                 rejecting to prevent resource exhaustion",
-                out.stdout.len()
-            ),
-        )));
-    }
-    Ok(out.stdout)
 }
 
 // ---------------------------------------------------------------------------

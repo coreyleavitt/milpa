@@ -8,14 +8,15 @@
 //!
 //! **This sub-slice wires Local + Git** (both offline-testable: Local is a pure
 //! directory copy; Git drives the `git` CLI, exercised against *local* repos in
-//! tests — no network). Tarball (http + gzip + safe_extract) and OCI (oras) land
-//! in the next sub-slice; their dispatch arms return a clearly-marked
-//! non-catalog placeholder until then.
+//! tests — no network). Tarball is http + gzip + safe_extract; OCI composes the
+//! native [`crate::oci_client::OciRegistryClient`] (token → manifest → blob)
+//! directly (RFC docs/rfc-native-oci-fetch.md §3.2 — no `oras` shell-out).
 
 use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
+use std::sync::Arc;
 
 use flate2::read::GzDecoder;
 use milpa_types::Provenance;
@@ -42,9 +43,14 @@ use sha2::{Digest, Sha256};
 /// given typical archive compression ratios.  Both impls use the SAME value
 /// for cross-impl byte-identity (Python `MAX_COMPRESSED_BYTES` = same formula).
 ///
-/// Enforced by `fetch_tarball` (and its `_with_cap` variant) after the
-/// transport call: if `len(bytes) > MAX_COMPRESSED_BYTES`, raises
-/// `FETCH-DOWNLOAD-FAILED` before any decompression or extraction.
+/// Enforced twice: the production transport ([`native_http_transport`])
+/// aborts mid-stream via `bounded_http::request`'s own cap check; a
+/// stat-based safety net in `fetch_tarball_with_decomp_cap` also rejects a
+/// downloaded archive file whose size exceeds `MAX_COMPRESSED_BYTES`,
+/// raising `FETCH-DOWNLOAD-SIZE-EXCEEDED` before any decompression or
+/// extraction — this catches injected transports (tests, mocked fetchers)
+/// that write the full archive directly without streaming/capping
+/// themselves.
 ///
 /// The mocked / build-mode fetchers bypass `http_get` entirely and are
 /// unaffected.
@@ -168,9 +174,32 @@ fn decompress_capped_xz(
     Ok(buf)
 }
 
+/// Harden a scratch-dir `tempfile::Builder` to mode `0700` on unix,
+/// regardless of the process umask (SecF1 finding).
+///
+/// Under the default umask (022), a bare `tempfile::Builder::new().tempdir()`
+/// is created `0755` — world-readable, exposing in-flight UNVERIFIED
+/// archive/blob bytes (pre-digest-check) to any local user; under umask
+/// `002` it is `0775` — group-writable, a TOCTOU window between the
+/// download write and the digest-verify read. Matches Python's
+/// `tempfile.TemporaryDirectory`, which is `0700` by default and
+/// umask-independent. Shared by both the tarball
+/// (`fetch_tarball_with_decomp_cap`) and OCI (`fetch_oci_with_client`)
+/// scratch dirs — one hardening helper, not two inline copies.
+fn harden_scratch_dir_permissions<'a>(
+    mut builder: tempfile::Builder<'a, 'a>,
+) -> tempfile::Builder<'a, 'a> {
+    #[cfg(unix)]
+    {
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    builder
+}
+
 use crate::dag_identity::{MaterializedEntry, MODE_EXECUTABLE, MODE_REGULAR, MODE_SYMLINK};
 use crate::fetch::{FetchError, FetcherRegistry, Receipt};
-use crate::safe_extract::{extract_tar, Limits};
+use crate::oci_client::{select_source_layer, OciRegistryClient, TokenCache};
+use crate::safe_extract::{extract_tar, DecompCapExceeded, Limits};
 
 /// git ls-tree blob mode → epoch-2 mode-byte (spec/identity.md §1.8.2.1).
 /// `100644` regular → 0x00, `100755` executable → 0x01, `120000` symlink → 0x80.
@@ -205,101 +234,143 @@ pub enum HttpGetError {
     Other(String),
 }
 
-/// A byte-fetching transport (an injected seam, like the index cache's): maps a
-/// URL to its bytes, or a typed [`HttpGetError`]. `DefaultRegistry::with_curl`
-/// uses the `curl` CLI; tests inject a closure.
-pub type HttpGet = Box<dyn Fn(&str) -> Result<Vec<u8>, HttpGetError>>;
+/// A streaming transport (an injected seam, like the index cache's): streams
+/// the response body for a URL directly into the file at `dest`, or returns a
+/// typed [`HttpGetError`]. `DefaultRegistry::production` uses the native
+/// [`crate::bounded_http`] transport; tests inject a closure.
+///
+/// H3 (finding — memory-safety per RFC docs/rfc-native-oci-fetch.md §3.3):
+/// the seam is `Path`-based, not bytes-returning.  A transport that returned
+/// the whole compressed archive as `Vec<u8>` would force every concurrent
+/// tarball worker to hold up to `MAX_COMPRESSED_BYTES` (4 GiB) in process
+/// memory at once — the RFC's own stated rationale for routing the tarball
+/// body (like the OCI blob) through a file `Path` sink instead.
+pub type HttpGet = Box<dyn Fn(&str, &Path) -> Result<(), HttpGetError>>;
 
 /// The reference [`FetcherRegistry`]: dispatch the closed `Provenance` enum to a
-/// per-transport fetch. Carries an [`HttpGet`] for the tarball transport.
+/// per-transport fetch. Carries an [`HttpGet`] for the tarball transport and
+/// an [`Arc<TokenCache>`] for the OCI transport.
 pub struct DefaultRegistry {
     http_get: HttpGet,
+    /// #203: ONE token cache for the life of this `DefaultRegistry` — which
+    /// itself is constructed once per resolve (`main.rs` builds a single
+    /// `DefaultRegistry::production()` and threads it through every dep
+    /// fetch). Cloning the `Arc` into each `fetch_oci` call (not the
+    /// `TokenCache` itself) is what lets N OCI deps sharing a `(registry,
+    /// scope)` in one resolve coalesce into a single token acquisition
+    /// instead of each paying the challenge round trip.
+    oci_token_cache: Arc<TokenCache>,
 }
 
 impl DefaultRegistry {
-    /// A registry whose tarball downloads use a custom byte transport.
-    pub fn new(http_get: impl Fn(&str) -> Result<Vec<u8>, HttpGetError> + 'static) -> Self {
+    /// A registry whose tarball downloads use a custom streaming transport.
+    pub fn new(http_get: impl Fn(&str, &Path) -> Result<(), HttpGetError> + 'static) -> Self {
         DefaultRegistry {
             http_get: Box::new(http_get),
+            oci_token_cache: Arc::new(TokenCache::new()),
         }
     }
 
-    /// The production registry: tarball downloads shell out to `curl -fsSL`.
+    /// The production registry: tarball downloads via the native
+    /// [`crate::bounded_http`] transport (RFC `rfc-native-oci-fetch.md` §3.3/S4
+    /// — replaces the former `curl -fsSL` subprocess).
     ///
-    /// H1 — streaming bounded read: spawns curl with `Stdio::piped()` stdout and
-    /// reads in chunks, aborting (killing curl) as soon as the cumulative byte
-    /// count exceeds `MAX_COMPRESSED_BYTES`.  The process never buffers more than
-    /// `MAX_COMPRESSED_BYTES + chunk_size` bytes from an oversized response.
+    /// H1 — streaming bounded read: `bounded_http::request` streams the body
+    /// in `CHUNK_SIZE` increments, aborting as soon as the cumulative byte
+    /// count exceeds `MAX_COMPRESSED_BYTES`. The process never buffers more
+    /// than `MAX_COMPRESSED_BYTES + chunk_size` bytes from an oversized
+    /// response.
+    ///
+    /// H3 — the body streams directly to the caller-supplied file `Path`
+    /// (`bounded_http::Sink::File`), never into an in-memory buffer: this is
+    /// the same sink kind the OCI blob path uses
+    /// (`OciRegistryClient::blob`), for the identical reason (an N-worker
+    /// concurrent resolve would otherwise hold N x `MAX_COMPRESSED_BYTES` at
+    /// once).
     ///
     /// On cap breach, returns `Err(HttpGetError::SizeExceeded(...))` so
     /// `fetch_tarball` can pattern-match the variant rather than string-matching
     /// a prefix.
-    pub fn with_curl() -> Self {
-        DefaultRegistry::new(curl_streaming_transport(MAX_COMPRESSED_BYTES))
+    pub fn production() -> Self {
+        DefaultRegistry::new(native_http_transport(MAX_COMPRESSED_BYTES))
     }
 }
 
-/// Chunk size for the streaming curl read (64 KiB).  Memory bound per response:
-/// at most `compressed_cap + CURL_CHUNK_SIZE` bytes before abort.
-const CURL_CHUNK_SIZE: usize = 65_536;
-
-/// Build a streaming curl transport bounded to `compressed_cap` bytes.
+/// Build a streaming native-transport fetcher bounded to `compressed_cap`
+/// bytes, backed by the single production HTTP backend
+/// ([`crate::bounded_http::request`], RFC §3.3 — the `curl` subprocess this
+/// replaced is deleted, not preserved as a fallback).
 ///
-/// The returned closure spawns curl with a piped stdout, reads in
-/// `CURL_CHUNK_SIZE` chunks, and kills the process the moment the cumulative
-/// read exceeds `compressed_cap`.  On cap breach the closure returns
-/// `Err(HttpGetError::SizeExceeded(...))` so the call site can pattern-match
-/// the variant rather than inspect a string prefix.
-pub(crate) fn curl_streaming_transport(
+/// The returned closure streams the response body directly into the file at
+/// `dest` (`Sink::File`) under `compressed_cap`; a cap breach mid-stream maps
+/// to `HttpGetError::SizeExceeded` (distinct from `HttpGetError::Other`) so
+/// the call site can pattern-match the variant rather than inspect a string
+/// prefix. A non-2xx HTTP status is also `Other` — `bounded_http` reports
+/// status as data (RFC §3.4), so this transport applies the `curl -f`-
+/// equivalent "fail on HTTP error" check itself.
+pub(crate) fn native_http_transport(
     compressed_cap: u64,
-) -> impl Fn(&str) -> Result<Vec<u8>, HttpGetError> + 'static {
-    move |url: &str| {
-        let mut child = Command::new("curl")
-            .args(["-fsSL", url])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| HttpGetError::Other(format!("cannot run curl: {e}")))?;
-
-        let mut stdout = child.stdout.take().expect("piped stdout");
-        let mut buf = Vec::new();
-        let mut chunk = vec![0u8; CURL_CHUNK_SIZE];
-
-        loop {
-            let n = stdout.read(&mut chunk).map_err(|e| HttpGetError::Other(format!("curl read: {e}")))?;
-            if n == 0 {
-                break;
-            }
-            buf.extend_from_slice(&chunk[..n]);
-            if buf.len() as u64 > compressed_cap {
-                // Kill curl immediately — no further bytes are read.
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(HttpGetError::SizeExceeded(format!(
-                    "compressed body ({} bytes read so far) \
-                     exceeds download cap ({compressed_cap} bytes); request aborted",
-                    buf.len()
-                )));
-            }
+) -> impl Fn(&str, &Path) -> Result<(), HttpGetError> + 'static {
+    move |url: &str, dest: &Path| {
+        // RustF2 (finding — regression + cross-impl divergence): `file://`
+        // cannot go through `bounded_http::request` — `ureq` is HTTP-only
+        // and `bounded_http`'s own scheme guard now rejects any non-http(s)
+        // scheme fail-closed. This was silently lost at the S4 curl→ureq
+        // swap (`curl -fsSL file://…` worked); Python's tarball.py still
+        // supports it (via `bounded_http.py`'s generic handling), and
+        // `dep_decl_store.rs::http_get_bytes` / `entry_bundle_store.rs` /
+        // `main.rs` all treat `file://` as a direct filesystem read BEFORE
+        // reaching `bounded_http`. Restore the same discipline here.
+        if let Some(path_str) = url.strip_prefix("file://") {
+            return fetch_file_scheme(path_str, dest, compressed_cap);
         }
-        drop(stdout);
 
-        let status = child.wait().map_err(|e| HttpGetError::Other(format!("curl wait: {e}")))?;
-        if status.success() {
-            Ok(buf)
-        } else {
-            let stderr = child
-                .stderr
-                .take()
-                .map(|mut s| {
-                    let mut v = Vec::new();
-                    let _ = s.read_to_end(&mut v);
-                    String::from_utf8_lossy(&v).trim().to_string()
-                })
-                .unwrap_or_default();
-            Err(HttpGetError::Other(format!("curl failed: {stderr}")))
+        let resp = crate::bounded_http::request(
+            "GET",
+            url,
+            &[],
+            compressed_cap,
+            crate::bounded_http::Sink::File(dest),
+        )
+        .map_err(|e| match e {
+            FetchError::Transport("FETCH-DOWNLOAD-SIZE-EXCEEDED", msg) => HttpGetError::SizeExceeded(msg),
+            FetchError::Transport(_, msg) => HttpGetError::Other(msg),
+            other => HttpGetError::Other(format!("{other:?}")),
+        })?;
+
+        if resp.status >= 400 {
+            return Err(HttpGetError::Other(format!(
+                "fetching {url}: HTTP {}",
+                resp.status
+            )));
         }
+        Ok(())
     }
+}
+
+/// Direct filesystem copy for a `tarball=(url)"file://…"` dep (RustF2).
+///
+/// Not a network transport, so there is no adversary-timed unbounded
+/// stream to guard against mid-read (`bounded_http`'s `CHUNK_SIZE`-at-a-time
+/// abort exists for that threat model) — but a giant local file must not
+/// bypass the same compressed-body cap the network path enforces, so the
+/// size is checked via `metadata()` (no content read) BEFORE the copy.
+/// `std::fs::copy` then streams the bytes at the OS level without holding
+/// the whole file in this process's memory, preserving H3's memory-safety
+/// property for this path too.
+fn fetch_file_scheme(path_str: &str, dest: &Path, compressed_cap: u64) -> Result<(), HttpGetError> {
+    let metadata = std::fs::metadata(path_str)
+        .map_err(|e| HttpGetError::Other(format!("fetching file://{path_str}: {e}")))?;
+    if metadata.len() > compressed_cap {
+        return Err(HttpGetError::SizeExceeded(format!(
+            "fetching file://{path_str}: local file ({} bytes) exceeds download cap \
+             ({compressed_cap} bytes); possible oversized source",
+            metadata.len()
+        )));
+    }
+    std::fs::copy(path_str, dest)
+        .map_err(|e| HttpGetError::Other(format!("fetching file://{path_str}: {e}")))?;
+    Ok(())
 }
 
 impl FetcherRegistry for DefaultRegistry {
@@ -336,7 +407,7 @@ impl FetcherRegistry for DefaultRegistry {
                 repository,
                 digest,
                 ..
-            } => fetch_oci(name, registry, repository, digest, dest)?,
+            } => fetch_oci(name, registry, repository, digest, dest, &self.oci_token_cache)?,
         };
         // Compute content identity for CAS-admissible provenances. Local/editable
         // sources carry no stable identity (lockfile-schema.md §4.3 NORMATIVE).
@@ -1706,6 +1777,60 @@ impl std::io::Write for LimitedWriter<'_> {
     }
 }
 
+/// A `Read` adapter enforcing the SA-1 decompression-bomb cap on a pull-based
+/// (`Read`) decoder — the streaming sibling of [`LimitedWriter`] (which caps
+/// the Write-based xz/lzma-alone decoders). `extract_tar` (#202,
+/// docs/rfc-native-oci-fetch.md §3.3) reads directly from this wrapper one
+/// tar block at a time, so the decompressed archive is never buffered in
+/// full — only [`CappedReader`] itself plus whatever `extract_tar` holds for
+/// the CURRENT tar member are ever in memory at once.
+///
+/// Same boundary semantics as `decompress_capped`'s `.take(decomp_cap + 1)`
+/// (R1-08): a stream of EXACTLY `cap` bytes is admitted; `cap + 1` or more is
+/// rejected. The cap trip surfaces as an `io::Error` wrapping
+/// [`crate::safe_extract::DecompCapExceeded`] so `extract_tar`'s streaming
+/// reader recognizes a deliberate cap trip (→ `EXTRACT-SIZE-LIMIT`) instead
+/// of misreporting it as generic archive corruption — mirrors
+/// `LimitedWriter::limit_hit()`, but as a returned error rather than a
+/// post-hoc flag: `extract_tar` takes ownership of its `R: Read` source, so
+/// there is no separate handle left to poll after the call returns.
+struct CappedReader<R> {
+    inner: R,
+    cap: u64,
+    read: u64,
+}
+
+impl<R> CappedReader<R> {
+    fn new(inner: R, cap: u64) -> Self {
+        CappedReader { inner, cap, read: 0 }
+    }
+}
+
+impl<R: Read> Read for CappedReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.read < self.cap {
+            // Still under budget: clamp this read so `self.read` never jumps
+            // past `cap` in one call, so the boundary check below always sees
+            // `self.read == self.cap` exactly (never overshoots silently).
+            let remaining = (self.cap - self.read) as usize;
+            let max_read = buf.len().min(remaining);
+            let n = self.inner.read(&mut buf[..max_read])?;
+            self.read += n as u64;
+            return Ok(n);
+        }
+        // `self.read == self.cap`: probe exactly one more byte to distinguish
+        // "the decompressed stream is legitimately exactly `cap` bytes" (inner
+        // yields EOF here → admitted, `Ok(0)`) from "the stream continues past
+        // `cap`" (inner yields data → reject as a decompression bomb; R1-08
+        // admits exactly `cap`, rejects `cap`+1).
+        let mut probe = [0u8; 1];
+        match self.inner.read(&mut probe)? {
+            0 => Ok(0),
+            _ => Err(std::io::Error::other(DecompCapExceeded)),
+        }
+    }
+}
+
 /// Download a tarball, verify its sha256 (before extraction), gunzip if needed,
 /// and safe-extract into `dest` (mirrors `TarballFetcher`). `FETCH-DOWNLOAD-FAILED`
 /// on transport error; `FETCH-SHA256-MISMATCH` if the declared hash differs (the
@@ -1720,7 +1845,7 @@ pub fn fetch_tarball(
     expected_sha256: Option<&str>,
     strip_components: u32,
     dest: &Path,
-    http_get: &dyn Fn(&str) -> Result<Vec<u8>, HttpGetError>,
+    http_get: &dyn Fn(&str, &Path) -> Result<(), HttpGetError>,
 ) -> Result<Receipt, FetchError> {
     fetch_tarball_with_cap(name, url, expected_sha256, strip_components, dest, http_get, MAX_COMPRESSED_BYTES)
 }
@@ -1733,7 +1858,7 @@ pub fn fetch_tarball_with_cap(
     expected_sha256: Option<&str>,
     strip_components: u32,
     dest: &Path,
-    http_get: &dyn Fn(&str) -> Result<Vec<u8>, HttpGetError>,
+    http_get: &dyn Fn(&str, &Path) -> Result<(), HttpGetError>,
     compressed_cap: u64,
 ) -> Result<Receipt, FetchError> {
     fetch_tarball_with_decomp_cap(
@@ -1756,17 +1881,95 @@ pub fn fetch_tarball_with_cap(
 /// The production path always calls this via `fetch_tarball_with_cap` with
 /// `Limits::default().decomp_cap()`; this variant is `pub(crate)` so tests
 /// can inject a tiny cap without touching the production default.
+///
+/// H3 (finding — memory-safety per RFC docs/rfc-native-oci-fetch.md §3.3):
+/// `http_get` streams the compressed archive to a scratch temp file rather
+/// than returning it as a buffered `Vec<u8>` — mirrors the OCI blob path
+/// (`pull_and_extract_oci` / `OciRegistryClient::blob`), which already
+/// streams to a `Path` and hashes it via a streaming sha256-of-file helper.
+/// A resolver running N tarball workers concurrently no longer holds N full
+/// compressed archives (up to `MAX_COMPRESSED_BYTES` each) in process memory
+/// for the (network-bound, adversary-timed) duration of the download.
+///
+/// #202 closes the remaining gap H3 left open: for gzip/bzip2 archives (the
+/// formats OCI and the vast majority of tarball deps use), extraction now
+/// ALSO streams — `open_streaming_tar` feeds the scratch file straight
+/// through `File -> decoder -> CappedReader -> extract_tar` with no
+/// intermediate whole-archive `Vec<u8>` at either the compressed or
+/// decompressed stage, so peak memory is bounded by the largest tar member,
+/// not the archive size. xz/lzma-alone (and the lzma-alone probe's plain-tar
+/// fallback) remain buffered — `lzma-rs` 0.3 is a synchronous, eager
+/// Write-sink decoder with no incremental `Read` API to stream from (see the
+/// `R3-design-L1` note on `decompress_capped_xz`/`_lzma`) — but that read is
+/// still bounded by `compressed_cap`/`decomp_cap`, unchanged from before #202.
 pub(crate) fn fetch_tarball_with_decomp_cap(
     name: &str,
     url: &str,
     expected_sha256: Option<&str>,
     strip_components: u32,
     dest: &Path,
-    http_get: &dyn Fn(&str) -> Result<Vec<u8>, HttpGetError>,
+    http_get: &dyn Fn(&str, &Path) -> Result<(), HttpGetError>,
     compressed_cap: u64,
     decomp_cap: u64,
 ) -> Result<Receipt, FetchError> {
-    let bytes = http_get(url).map_err(|e| {
+    // Scratch dir for the downloaded archive — a securely-random-named
+    // `tempfile::TempDir` (M7 finding), NOT the predictable sibling-of-`dest`
+    // path `.{name}.tarball-pull` this used to be. The predictable path was a
+    // local-attacker TOCTOU window: a symlink re-planted in the gap between
+    // the old `remove_dir_all` and `create_dir_all` calls would make the
+    // archive write follow it (no `O_NOFOLLOW`). `TempDir` mints a fresh,
+    // unguessable name and removes it on drop, so the raw archive never lands
+    // inside `dest` and scratch cleanup happens on every exit path, success
+    // or failure, exactly as before — mirrors the Python twin's
+    // `tempfile.TemporaryDirectory()`. Deliberately NOT co-located under
+    // `dest`'s parent: neither this function nor `extract_tar` ever `rename`s
+    // out of scratch (the archive is streamed off disk and extracted
+    // byte-for-byte into `dest`, #202), so there is no cross-device rename
+    // to protect against.
+    let tarball_scratch_prefix = format!(".{name}.tarball-pull-");
+    let mut tarball_scratch_builder = tempfile::Builder::new();
+    tarball_scratch_builder.prefix(&tarball_scratch_prefix);
+    let scratch = harden_scratch_dir_permissions(tarball_scratch_builder)
+        .tempdir()
+        .map_err(|e| {
+            transport("FETCH-DOWNLOAD-FAILED", format!("fetching {name:?}: tarball scratch dir: {e}"))
+        })?;
+    let archive_path = scratch.path().join("archive");
+
+    fetch_tarball_download_and_extract(
+        name,
+        url,
+        expected_sha256,
+        strip_components,
+        dest,
+        http_get,
+        compressed_cap,
+        decomp_cap,
+        &archive_path,
+    )
+    // `scratch` (a `tempfile::TempDir`) drops here regardless of outcome,
+    // removing the directory — the explicit `remove_dir_all` on every exit
+    // path this replaced is now the type's `Drop` impl.
+}
+
+/// The download → verify → extract body of [`fetch_tarball_with_decomp_cap`],
+/// factored out purely so that function's scratch-dir cleanup wraps every
+/// exit path (including the ones this helper returns via `?`) with a single
+/// `remove_dir_all`, instead of repeating the cleanup at each early return
+/// (mirrors `fetch_oci_with_client` / `pull_and_extract_oci`'s identical split).
+#[allow(clippy::too_many_arguments)]
+fn fetch_tarball_download_and_extract(
+    name: &str,
+    url: &str,
+    expected_sha256: Option<&str>,
+    strip_components: u32,
+    dest: &Path,
+    http_get: &dyn Fn(&str, &Path) -> Result<(), HttpGetError>,
+    compressed_cap: u64,
+    decomp_cap: u64,
+    archive_path: &Path,
+) -> Result<Receipt, FetchError> {
+    http_get(url, archive_path).map_err(|e| {
         // R1-22: match on the typed HttpGetError variant rather than a string prefix.
         match e {
             HttpGetError::SizeExceeded(msg) => transport(
@@ -1780,33 +1983,45 @@ pub(crate) fn fetch_tarball_with_decomp_cap(
         }
     })?;
 
-    // H1: cap the compressed body before decompression.  The production http_get
-    // (curl streaming) aborts and raises FETCH-DOWNLOAD-SIZE-EXCEEDED before
-    // reading beyond the cap; this check covers injected transports (tests,
-    // mocked fetchers) that return bytes directly without streaming.
-    // FETCH-DOWNLOAD-SIZE-EXCEEDED is distinct from FETCH-DOWNLOAD-FAILED so a
-    // security size-cap rejection is not conflated with a network failure.
-    if bytes.len() as u64 > compressed_cap {
+    // H1: cap the compressed body before decompression.  The production
+    // http_get (native streaming transport) aborts and raises
+    // FETCH-DOWNLOAD-SIZE-EXCEEDED before writing beyond the cap; this
+    // stat-based check covers injected transports (tests, mocked fetchers)
+    // that write the full archive directly without streaming/capping
+    // themselves.  FETCH-DOWNLOAD-SIZE-EXCEEDED is distinct from
+    // FETCH-DOWNLOAD-FAILED so a security size-cap rejection is not
+    // conflated with a network failure.
+    let archive_len = std::fs::metadata(archive_path)
+        .map(|m| m.len())
+        .map_err(|e| {
+            transport(
+                "FETCH-DOWNLOAD-FAILED",
+                format!("fetching {name:?}: reading downloaded archive: {e}"),
+            )
+        })?;
+    if archive_len > compressed_cap {
         return Err(transport(
             "FETCH-DOWNLOAD-SIZE-EXCEEDED",
             format!(
-                "fetching {name:?} from {url}: compressed body ({} bytes) exceeds \
+                "fetching {name:?} from {url}: compressed body ({archive_len} bytes) exceeds \
                  download cap ({compressed_cap} bytes); possible oversized mirror",
-                bytes.len()
             ),
         ));
     }
 
-    // Compute the archive digest once: it gates an existing pin (below) AND is
-    // returned as the TOFU receipt so the resolver can record/preserve it
-    // (`lockfile-schema.md §5`).
-    let actual_sha = sha256_hex(&bytes);
+    // Compute the archive digest once, streamed off disk (H3 — never loads
+    // the whole compressed archive into memory to hash it): it gates an
+    // existing pin (below) AND is returned as the TOFU receipt so the
+    // resolver can record/preserve it (`lockfile-schema.md §5`).
+    let actual_sha = sha256_of_file(archive_path).map_err(|e| {
+        transport("FETCH-DOWNLOAD-FAILED", format!("hashing downloaded archive: {e}"))
+    })?;
 
     if let Some(expected) = expected_sha256 {
         // Accept a bare hex digest or a `sha256:`-prefixed one; normalize to
         // lowercase so UPPERCASE or mixed-case pins from the manifest/lockfile
         // are accepted (case-insensitive comparison, both sides already lowercase
-        // from sha256_hex, so only `want` needs lowercasing).
+        // from sha256_of_file, so only `want` needs lowercasing).
         let want = expected.strip_prefix("sha256:").unwrap_or(expected).to_lowercase();
         if actual_sha != want {
             return Err(transport(
@@ -1824,7 +2039,17 @@ pub(crate) fn fetch_tarball_with_decomp_cap(
     // TarEntries sees < 512 bytes and returns zero entries → Ok-empty).  Detect
     // the ZIP magic bytes early and raise FETCH-EXTRACT-FAILED with an actionable
     // message rather than silently producing an empty dep tree (H0 §zip-guard).
-    if bytes.starts_with(MAGIC_ZIP) {
+    // Only the first 4 bytes are read here (not the whole file).
+    let mut magic = Vec::new();
+    std::fs::File::open(archive_path)
+        .and_then(|f| f.take(4).read_to_end(&mut magic))
+        .map_err(|e| {
+            transport(
+                "FETCH-EXTRACT-FAILED",
+                format!("fetching {name:?}: reading downloaded archive: {e}"),
+            )
+        })?;
+    if magic.starts_with(MAGIC_ZIP) {
         return Err(transport(
             "FETCH-EXTRACT-FAILED",
             format!(
@@ -1835,8 +2060,10 @@ pub(crate) fn fetch_tarball_with_decomp_cap(
         ));
     }
 
-    // Detect compression format by magic bytes, decompress with a size cap,
-    // then feed the raw tar bytes to extract_tar.
+    // Detect compression format by magic bytes and open a STREAMING,
+    // decompressed source for extract_tar (#202) — see `open_streaming_tar`'s
+    // doc comment for the gzip/bzip2 (fully streaming) vs xz/lzma-alone
+    // (still buffered — `lzma-rs` has no incremental Read API) split.
     //
     // Supported formats (spec/manifest-grammar.md §TarballDep):
     //   gzip  — magic 1f 8b
@@ -1844,18 +2071,15 @@ pub(crate) fn fetch_tarball_with_decomp_cap(
     //   xz    — magic fd 37 7a 58 5a 00
     //   uncompressed tar — no magic match (fall through)
     //
-    // SA-1 decompression-bomb guard: all decoders go through `decompress_capped`
-    // (the module-level SSOT) which wraps the decoder in `.take(decomp_cap)`.
-    // The cap formula (max_total_size + DECOMP_CAP_OVERHEAD) lives in exactly one
-    // place; fetch_oci uses the same helper so there is no parallel copy.
-    // R1-12 / R3-02: decomp_cap is a parameter (callers supply
-    // `Limits::default().decomp_cap()` for the production default; tests inject
-    // a small cap to exercise the lzma-alone decompressor guard end-to-end).
-
-    let tar_bytes = decompress_tar_archive(&bytes, decomp_cap, name)?;
+    // SA-1 decompression-bomb guard: every decoder path enforces the SAME cap
+    // formula (max_total_size + DECOMP_CAP_OVERHEAD, `Limits::decomp_cap`) —
+    // `CappedReader` for the streaming gzip/bzip2 path, `decompress_capped_xz`/
+    // `_lzma`'s `LimitedWriter` for the buffered xz/lzma-alone path. `fetch_oci`
+    // shares the same `CappedReader` primitive, so there is no parallel guard.
+    let stream = open_streaming_tar(archive_path, &magic, decomp_cap, name)?;
 
     clear_dest(dest).map_err(|e| transport("FETCH-EXTRACT-FAILED", e))?;
-    extract_tar(&tar_bytes, dest, strip_components, Limits::default()).map_err(|e| {
+    extract_tar(stream, dest, strip_components, Limits::default()).map_err(|e| {
         let _ = std::fs::remove_dir_all(dest);
         // Re-key any EXTRACT-* (or other) failure as the tarball-transport code.
         transport(
@@ -1869,20 +2093,92 @@ pub(crate) fn fetch_tarball_with_decomp_cap(
     })
 }
 
-/// Pull an OCI artifact via `oras` and safe-extract its single source tarball
-/// (mirrors `OciFetcher`). `FETCH-OCI-PULL-FAILED` (incl. `oras` absent);
-/// `FETCH-OCI-NO-TARBALL` / `FETCH-OCI-AMBIGUOUS-TARBALL` on 0 / >1 `*.tar.gz`.
+/// Streaming sha256 of a file's contents — never loads the whole file into
+/// memory (H3).
+///
+/// N1 (finding — duplicated streaming-hash-of-file helper): this is the
+/// single source of truth for both the tarball archive-digest (this module)
+/// and the OCI blob-digest (`oci_client.rs::OciRegistryClient::blob`)
+/// verification paths. `oci_client.rs` already imports [`MAX_COMPRESSED_BYTES`]
+/// from this module and `fetch_oci`'s decompression already shares
+/// [`decompress_capped`] across the same module boundary — this hoists the
+/// hash loop to match that established precedent instead of leaving a
+/// byte-for-byte duplicate in each module.
+///
+/// Returns a raw [`std::io::Result`] rather than a [`FetchError`] so each
+/// call site keeps its own error convention: the tarball path here raises
+/// bare `FETCH-DOWNLOAD-FAILED`, while `oci_client.rs::blob` raises
+/// `FETCH-OCI-PULL-FAILED` with a `phase="blob"` kwarg (RFC §3.4 NORMATIVE —
+/// every `FETCH-OCI-PULL-FAILED` raise carries a phase). Unifying the loop
+/// does not force those two distinct, already-established error shapes into
+/// one.
+pub(crate) fn sha256_of_file(path: &Path) -> std::io::Result<String> {
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 65_536];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+/// The scheme used for OCI registry requests (`token`/`manifest`/`blob`).
+///
+/// Registry-diversity (a non-`https` registry) is explicitly deferred (RFC
+/// docs/rfc-native-oci-fetch.md §2); this is the ONE place that deferral is
+/// encoded, so lifting it later is a one-line change here, not a hunt through
+/// three inlined `"https"` literals.
+const OCI_SCHEME: &str = "https";
+
+/// Pull an OCI artifact via the native [`OciRegistryClient`] (token →
+/// manifest → blob) and safe-extract its single milpa source-tarball layer
+/// (mirrors `OciFetcher`, RFC docs/rfc-native-oci-fetch.md §3.2 — no `oras`
+/// shell-out). `FETCH-OCI-PULL-FAILED` / `FETCH-OCI-DIGEST-MISMATCH` on
+/// transport failure; `FETCH-OCI-NO-TARBALL` / `FETCH-OCI-AMBIGUOUS-TARBALL`
+/// on 0 / >1 milpa source-tarball layers — the one gate,
+/// [`select_source_layer`], never re-implemented here.
 pub fn fetch_oci(
     name: &str,
     registry: &str,
     repository: &str,
     digest: &str,
     dest: &Path,
+    token_cache: &Arc<TokenCache>,
 ) -> Result<Receipt, FetchError> {
-    // R5: validate that registry and repository do not start with '-' so they
-    // cannot be interpreted as option flags by oras.  oras does not document
-    // --end-of-options, so we use an input-validation guard (mirrors
-    // Python's validate_oci_field / TNG-UNSAFE-OCI-FIELD).
+    // M6: the production transport is `bounded_http::request` itself, passed
+    // directly as the `OciTransport` closure alias — no adapter struct (a
+    // bare fn item coerces straight into `Box<dyn Fn(...) + Send + Sync>`).
+    //
+    // #203 (closed): `token_cache` is the caller's shared `Arc<TokenCache>`
+    // (`DefaultRegistry::oci_token_cache`, one per resolve) — cloning the
+    // `Arc` here is cheap and gives this fresh `OciRegistryClient` the SAME
+    // underlying cache every other OCI fetch in the resolve uses, so N deps
+    // sharing a `(registry, scope)` coalesce into one token acquisition.
+    let client = OciRegistryClient::new(Box::new(crate::bounded_http::request), Arc::clone(token_cache));
+    fetch_oci_with_client(&client, name, registry, repository, digest, dest)
+}
+
+/// Like [`fetch_oci`] but with an injectable [`OciRegistryClient`] — the
+/// testable seam. The client already owns its transport + token cache, so
+/// (unlike `fetch_tarball`'s bare `http_get` closure parameter) the client
+/// itself is what a test constructs over a fixture-replaying
+/// `crate::oci_client::OciTransport` (see `oci_client_tests.rs`'s
+/// `FixtureTransport`).
+pub(crate) fn fetch_oci_with_client(
+    client: &OciRegistryClient,
+    name: &str,
+    registry: &str,
+    repository: &str,
+    digest: &str,
+    dest: &Path,
+) -> Result<Receipt, FetchError> {
+    // R5: validate that registry and repository do not start with '-'
+    // (mirrors Python's validate_oci_field / TNG-UNSAFE-OCI-FIELD) — defense
+    // in depth on untrusted manifest/index input, independent of transport.
     // NOTE: `digest` is deliberately NOT checked here — it is format-validated
     // (`sha256:<64 hex>`) at the registry layer (`validate_oci_digest` →
     // TNG-BAD-OCI-DIGEST), which already rejects any `-`-prefixed or malformed
@@ -1898,78 +2194,138 @@ pub fn fetch_oci(
         }
     }
 
-    let oci_ref = format!("{registry}/{repository}@{digest}");
-    let scratch = dest
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join(format!(".{name}.oci-pull"));
-    let _ = std::fs::remove_dir_all(&scratch);
-    std::fs::create_dir_all(&scratch)
+    // Pull into a scratch directory so the raw tarball never lands inside
+    // `dest` alongside the extracted tree — `dest`'s content_hash is computed
+    // over the source tree alone (identity vs provenance).
+    //
+    // M7 finding: a securely-random-named `tempfile::TempDir`, NOT the
+    // predictable sibling-of-`dest` path `.{name}.oci-pull` this used to be —
+    // same TOCTOU rationale and the same fix shape as
+    // `fetch_tarball_with_decomp_cap`'s scratch dir (see that function's doc
+    // comment). `pull_and_extract_oci` never `rename`s out of scratch (the
+    // blob is read into memory via `std::fs::read`, then extracted
+    // byte-for-byte into `dest`), so there is no cross-device rename to
+    // protect against and this need not be co-located under `dest`'s parent.
+    let oci_scratch_prefix = format!(".{name}.oci-pull-");
+    let mut oci_scratch_builder = tempfile::Builder::new();
+    oci_scratch_builder.prefix(&oci_scratch_prefix);
+    let scratch = harden_scratch_dir_permissions(oci_scratch_builder)
+        .tempdir()
         .map_err(|e| transport("FETCH-OCI-PULL-FAILED", format!("oci scratch: {e}")))?;
+    let blob_path = scratch.path().join("source.tar.gz");
 
-    let pull = Command::new("oras")
-        .args(["pull", &oci_ref, "--output"])
-        .arg(&scratch)
-        .output();
-    let ok = matches!(&pull, Ok(o) if o.status.success());
-    if !ok {
-        let detail = match &pull {
-            Ok(o) => String::from_utf8_lossy(&o.stderr).trim().to_string(),
-            Err(e) => format!("cannot run oras: {e}"),
-        };
-        let _ = std::fs::remove_dir_all(&scratch);
-        return Err(transport(
+    pull_and_extract_oci(client, name, registry, repository, digest, &blob_path, dest)
+    // `scratch` drops here regardless of outcome, removing the directory.
+}
+
+/// The token → manifest → select-layer → blob → decompress → extract
+/// pipeline, factored out of [`fetch_oci_with_client`] purely so that
+/// function's scratch-dir cleanup wraps every exit path (including the ones
+/// this helper returns via `?`) with a single `remove_dir_all`, instead of
+/// repeating the cleanup at each early return.
+#[allow(clippy::too_many_arguments)]
+fn pull_and_extract_oci(
+    client: &OciRegistryClient,
+    name: &str,
+    registry: &str,
+    repository: &str,
+    digest: &str,
+    blob_path: &Path,
+    dest: &Path,
+) -> Result<Receipt, FetchError> {
+    let token = client.token(registry, repository, OCI_SCHEME)?;
+    let manifest = client.manifest(registry, repository, digest, &token, OCI_SCHEME)?;
+    let layer = select_source_layer(&manifest)?;
+    client.blob(
+        registry,
+        repository,
+        &layer.digest,
+        Some(layer.size),
+        &token,
+        blob_path,
+        OCI_SCHEME,
+    )?;
+
+    // #202: stream the pulled blob straight through `File -> GzDecoder ->
+    // CappedReader -> extract_tar`, never materializing the compressed OR
+    // decompressed bytes as a whole-archive `Vec<u8>`. Unlike the tarball
+    // fetcher, no magic-byte dispatch is needed here: `select_source_layer`'s
+    // contract guarantees exactly one milpa source-tarball layer, and OCI
+    // layers are always gzip.
+    //
+    // SA-1: `CappedReader` enforces the same cap formula (DECOMP_CAP_OVERHEAD)
+    // and the same EXTRACT-SIZE-LIMIT slug (via `extract_tar`'s
+    // `DecompCapExceeded` recognition) as the tarball fetcher's streaming
+    // gzip/bzip2 path — one guard mechanism, not a parallel copy.
+    let oci_decomp_cap: u64 = Limits::default().decomp_cap();
+    let file = std::fs::File::open(blob_path).map_err(|e| {
+        transport(
             "FETCH-OCI-PULL-FAILED",
-            format!("oras pull failed for {name:?} ({oci_ref}): {detail}"),
-        ));
-    }
-
-    let mut tarballs: Vec<std::path::PathBuf> = std::fs::read_dir(&scratch)
-        .map(|rd| {
-            rd.filter_map(|e| e.ok().map(|e| e.path()))
-                .filter(|p| p.to_string_lossy().ends_with(".tar.gz"))
-                .collect()
+            format!("fetching {name:?}: reading pulled tarball: {e}"),
+        )
+    })?;
+    let stream = CappedReader::new(GzDecoder::new(file), oci_decomp_cap);
+    clear_dest(dest).map_err(|e| transport("FETCH-EXTRACT-FAILED", e))?;
+    extract_tar(stream, dest, 0, Limits::default())
+        .map(|_| Receipt::default())
+        .map_err(|e| {
+            // L1: mirrors `fetch_tarball`'s analogous cleanup — a
+            // digest-verified but structurally hostile tar (e.g. a
+            // symlink-escape or size-limit violation caught partway through
+            // extraction) must not leave a partial tree at `dest`.
+            let _ = std::fs::remove_dir_all(dest);
+            transport("FETCH-EXTRACT-FAILED", e.code().to_string())
         })
-        .unwrap_or_default();
-    tarballs.sort();
+}
 
-    let result = match tarballs.as_slice() {
-        [] => Err(transport(
-            "FETCH-OCI-NO-TARBALL",
-            format!("OCI artifact {oci_ref} contained no *.tar.gz"),
-        )),
-        [one] => {
-            let bytes = std::fs::read(one).map_err(|e| {
-                transport(
-                    "FETCH-OCI-PULL-FAILED",
-                    format!("reading pulled tarball: {e}"),
-                )
-            })?;
-            // SA-1: use the shared decompress_capped helper — same cap formula
-            // (DECOMP_CAP_OVERHEAD) and same EXTRACT-SIZE-LIMIT slug as fetch_tarball.
-            // This is the fix for R2: no parallel inline copy of the cap logic.
-            // R1-12: single source of truth for the decompression cap formula.
-            let oci_decomp_cap: u64 = Limits::default().decomp_cap();
-            let tar = decompress_capped(GzDecoder::new(&bytes[..]), oci_decomp_cap, name, "gunzip")
-                .map_err(|e| {
-                    let _ = std::fs::remove_dir_all(&scratch);
-                    e
-                })?;
-            clear_dest(dest).map_err(|e| transport("FETCH-EXTRACT-FAILED", e))?;
-            extract_tar(&tar, dest, 0, Limits::default())
-                .map(|_| Receipt::default())
-                .map_err(|e| transport("FETCH-EXTRACT-FAILED", e.code().to_string()))
-        }
-        many => Err(transport(
-            "FETCH-OCI-AMBIGUOUS-TARBALL",
-            format!(
-                "OCI artifact {oci_ref} has {} *.tar.gz files; ambiguous",
-                many.len()
-            ),
-        )),
+/// Open `archive_path` as a streaming, decompressed `Read` source for
+/// `extract_tar`, dispatching on `magic` (the archive's leading bytes,
+/// already peeked by the caller for the ZIP guard) — the streaming sibling of
+/// [`decompress_tar_archive`] (#202).
+///
+/// gzip and bzip2 (the formats OCI and the vast majority of tarball deps use)
+/// are FULLY streaming: `File -> decoder -> CappedReader`, with `extract_tar`
+/// pulling bytes on demand — no intermediate `Vec<u8>` at either the
+/// compressed or decompressed stage, so peak memory is bounded by the
+/// largest tar member, not the archive size.
+///
+/// xz, lzma-alone, and the lzma-alone probe's plain-tar fallback reuse
+/// [`decompress_tar_archive`] UNCHANGED (delegating to
+/// `decompress_capped_xz`/`_lzma`, whose `LimitedWriter`-enforced cap and
+/// exact boundary semantics — R1-08 — are already pinned by their own direct
+/// unit tests): `lzma-rs` 0.3 is a synchronous, eager Write-sink decoder with
+/// no incremental `Read` API to stream from (see the `R3-design-L1` note on
+/// those two helpers), so their decompressed OUTPUT stays a cap-bounded
+/// `Vec<u8>`, same as before #202. Only their INPUT changes here: read
+/// directly off the already-on-disk, already-compressed-cap-bounded scratch
+/// file (`std::fs::read`, bounded to at most `compressed_cap` bytes by the
+/// caller's earlier stat check) rather than a second redundant buffer.
+fn open_streaming_tar(
+    archive_path: &Path,
+    magic: &[u8],
+    decomp_cap: u64,
+    name: &str,
+) -> Result<Box<dyn Read>, FetchError> {
+    let archive_read_err = |e: std::io::Error| {
+        transport(
+            "FETCH-EXTRACT-FAILED",
+            format!("fetching {name:?}: reading downloaded archive: {e}"),
+        )
     };
-    let _ = std::fs::remove_dir_all(&scratch);
-    result
+    if magic.starts_with(MAGIC_GZIP) {
+        let file = std::fs::File::open(archive_path).map_err(archive_read_err)?;
+        return Ok(Box::new(CappedReader::new(GzDecoder::new(file), decomp_cap)));
+    }
+    if magic.starts_with(MAGIC_BZ2) {
+        let file = std::fs::File::open(archive_path).map_err(archive_read_err)?;
+        return Ok(Box::new(CappedReader::new(
+            bzip2_rs::DecoderReader::new(file),
+            decomp_cap,
+        )));
+    }
+    let bytes = std::fs::read(archive_path).map_err(archive_read_err)?;
+    let tar_bytes = decompress_tar_archive(&bytes, decomp_cap, name)?;
+    Ok(Box::new(std::io::Cursor::new(tar_bytes)))
 }
 
 /// Decompress a tarball archive's raw bytes into uncompressed tar bytes, applying
@@ -2350,7 +2706,13 @@ impl FetcherRegistry for MockedFetcher {
                             None, // raw-bytes / build mode: no prior pin (first-fetch)
                             *strip_components,
                             dest,
-                            &move |_: &str| Ok(archive_bytes.clone()),
+                            // H3: fetch_tarball's HttpGet seam is Path-based, not
+                            // bytes-returning — write the already-loaded fixture
+                            // bytes to the dest path the real fetcher supplies.
+                            &move |_: &str, dest_path: &Path| {
+                                std::fs::write(dest_path, &archive_bytes)
+                                    .map_err(|e| HttpGetError::Other(format!("mock write: {e}")))
+                            },
                         );
                     }};
                 }

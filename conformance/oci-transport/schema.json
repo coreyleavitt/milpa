@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://milpa.dev/conformance/oci-transport/schema.json",
+  "title": "milpa OCI canned-transport contract fixture",
+  "description": "A checked-in, ordered request/response transcript that BOTH reference impls' OCI-client unit tests replay through their injected transport. It is a unit-tier cross-impl contract (RFC native-oci-fetch §3.7) and is deliberately OUTSIDE conformance/spec-v<N>/ — the black-box conformance corpus cannot observe the token/manifest/blob transport state machine. Same bytes on both sides => same behavior by construction.",
+  "type": "object",
+  "required": ["description", "exchanges"],
+  "additionalProperties": false,
+  "properties": {
+    "description": {
+      "type": "string",
+      "description": "What this transcript exercises (e.g. 'happy token->manifest->blob pull', 'blob digest mismatch', 'ghcr cross-host blob redirect strips Authorization')."
+    },
+    "exchanges": {
+      "type": "array",
+      "description": "The ordered list of request/response pairs. The fake transport answers each request the client issues, in order, matching on (method, url). A redirect (3xx + Location) is followed by the impl's REAL redirect handler, which issues the next request in this list.",
+      "items": { "$ref": "#/$defs/exchange" }
+    }
+  },
+  "$defs": {
+    "exchange": {
+      "type": "object",
+      "required": ["method", "url", "response"],
+      "additionalProperties": false,
+      "properties": {
+        "method": {
+          "enum": ["GET", "HEAD", "POST", "PUT"],
+          "description": "The request method the client is expected to issue."
+        },
+        "url": {
+          "type": "string",
+          "description": "The absolute request URL the client is expected to issue (exact match)."
+        },
+        "expect_request_headers": {
+          "type": "object",
+          "description": "Assertions on the request the client sends. Maps a header name to its expected value, OR to null to assert the header is ABSENT (used by the redirect Authorization-strip test to prove the bearer token is not forwarded cross-origin).",
+          "additionalProperties": { "type": ["string", "null"] }
+        },
+        "response": { "$ref": "#/$defs/response" }
+      }
+    },
+    "response": {
+      "type": "object",
+      "required": ["status"],
+      "additionalProperties": false,
+      "description": "The canned response the fake transport returns. At most ONE of body / body_base64 / body_file may be present; absent means an empty body.",
+      "properties": {
+        "status": {
+          "type": "integer",
+          "minimum": 100,
+          "maximum": 599,
+          "description": "HTTP status code."
+        },
+        "headers": {
+          "type": "object",
+          "description": "Response headers (e.g. 'WWW-Authenticate' for a token challenge, 'Location' for a redirect, 'Content-Length').",
+          "additionalProperties": { "type": "string" }
+        },
+        "body": {
+          "type": "string",
+          "description": "Inline UTF-8 response body — for text payloads (Bearer-token JSON, manifests)."
+        },
+        "body_base64": {
+          "type": "string",
+          "description": "Base64-encoded response body — for binary payloads (a blob whose sha256 must equal the pinned layer digest).",
+          "contentEncoding": "base64"
+        },
+        "body_file": {
+          "type": "string",
+          "description": "Path, relative to this fixture file, to a sibling file holding the raw response-body bytes — for large or binary blobs kept out of the JSON."
+        }
+      }
+    }
+  }
+}

@@ -1,8 +1,13 @@
-"""Tests for milpa.fetchers.oci (slice 7d-5).
+"""Tests for milpa.fetchers.oci (slice 7d-5; native client S6).
 
-All tests are offline — the OCI pull transport is injected; no real registry.
+All tests are offline. As of S6 the token/manifest/blob transport state
+machine (auth challenges, digest verification, manifest-list rejection,
+redirect handling, the `select_source_layer` NO-TARBALL/AMBIGUOUS-TARBALL
+gates) lives in ``milpa.fetchers.oci_client`` and is covered exhaustively by
+``test_oci_client.py`` against the shared canned-transport fixtures under
+``conformance/oci-transport/`` — those cases are NOT duplicated here.
 
-Coverage:
+This file covers what's unique to ``OciFetcher`` itself:
   TNG-* parse-path (registry-protocol.md §4 NORMATIVE):
     - validate_oci_digest: valid form accepted; any other raises TNG-BAD-OCI-DIGEST.
     - validate_oci_field: safe value accepted; leading dash raises TNG-UNSAFE-OCI-FIELD.
@@ -11,17 +16,11 @@ Coverage:
   Dispatch:
     - can_handle: True for OciProvenance, False for others.
 
-  Successful fetch:
-    - Single *.tar.gz in pull output → extracted, OciReceipt carries layer_digest.
-
-  Failure paths:
-    - Pull transport error → FETCH-OCI-PULL-FAILED.
-    - No *.tar.gz in pull output → FETCH-OCI-NO-TARBALL.
-    - Multiple *.tar.gz in pull output → FETCH-OCI-AMBIGUOUS-TARBALL.
-    - Corrupt tarball → FETCH-EXTRACT-FAILED.
-
-  Receipt:
-    - transport_fields() is non-empty, carries layer_digest.
+  Composition (OciFetcher.fetch wiring the client + select_source_layer +
+  safe_extract together, via the ``FakeOciClient`` test double):
+    - Successful fetch extracts the blob's content into dest.
+    - A corrupt blob raises FETCH-EXTRACT-FAILED.
+    - The receipt carries layer_digest from the provenance.
 """
 
 from __future__ import annotations
@@ -35,9 +34,6 @@ import pytest
 
 from milpa.errors import (
     FETCH_EXTRACT_FAILED,
-    FETCH_OCI_AMBIGUOUS_TARBALL,
-    FETCH_OCI_NO_TARBALL,
-    FETCH_OCI_PULL_FAILED,
     TNG_BAD_OCI_DIGEST,
     TNG_UNSAFE_OCI_FIELD,
     MilpaError,
@@ -50,6 +46,7 @@ from milpa.fetchers.oci import (
     validate_oci_field,
 )
 from milpa.fetchers.types import Provenance
+from tests._oci_fake_client import FakeOciClient
 
 # ---------------------------------------------------------------------------
 # Test helpers
@@ -66,24 +63,6 @@ def _build_tar_gz(files: dict[str, bytes]) -> bytes:
             info.size = len(content)
             tf.addfile(info, io.BytesIO(content))
     return buf.getvalue()
-
-
-def _make_pull_with_files(file_map: dict[str, bytes]) -> object:
-    """Return an OciPull that writes ``file_map`` into the output directory."""
-    def _pull(reference: str, output_dir: Path) -> list[Path]:
-        paths = []
-        for name, content in file_map.items():
-            p = output_dir / name
-            p.write_bytes(content)
-            paths.append(p)
-        return sorted(paths)
-    return _pull
-
-
-def _make_failing_pull(exc: Exception) -> object:
-    def _pull(reference: str, output_dir: Path) -> list[Path]:
-        raise exc
-    return _pull
 
 
 # ---------------------------------------------------------------------------
@@ -202,32 +181,33 @@ def test_oci_provenance_reference_format() -> None:
 
 
 def test_can_handle_oci_provenance() -> None:
-    fetcher = OciFetcher(oci_pull=_make_pull_with_files({}))
+    fetcher = OciFetcher(client=FakeOciClient(b""))
     assert fetcher.can_handle(OciProvenance(
         registry="ghcr.io", repository="org/pkg", digest=_VALID_DIGEST
     )) is True
 
 
 def test_can_handle_rejects_base_provenance() -> None:
-    fetcher = OciFetcher(oci_pull=_make_pull_with_files({}))
+    fetcher = OciFetcher(client=FakeOciClient(b""))
     assert fetcher.can_handle(Provenance()) is False
 
 
 # ---------------------------------------------------------------------------
-# Successful fetch
+# Successful fetch — OciFetcher composes client + select_source_layer +
+# safe_extract directly (RFC docs/rfc-native-oci-fetch.md §3.2)
 # ---------------------------------------------------------------------------
 
 
-def test_fetch_single_tarball_succeeds() -> None:
+def test_fetch_extracts_blob_content() -> None:
     tar_bytes = _build_tar_gz({"main.nim": b"# oci"})
-    pull = _make_pull_with_files({"artifact.tar.gz": tar_bytes})
+    fake_client = FakeOciClient(tar_bytes)
 
     prov = OciProvenance(
         registry="ghcr.io",
         repository="org/pkg",
         digest=_VALID_DIGEST,
     )
-    fetcher = OciFetcher(oci_pull=pull)
+    fetcher = OciFetcher(client=fake_client)
 
     with tempfile.TemporaryDirectory() as tmp:
         dest = Path(tmp) / "pkg"
@@ -236,134 +216,28 @@ def test_fetch_single_tarball_succeeds() -> None:
 
     assert isinstance(receipt, OciReceipt)
     assert receipt.layer_digest == _VALID_DIGEST
+    assert fake_client.calls == [f"ghcr.io/org/pkg@{_VALID_DIGEST}"]
 
 
-def test_fetch_tgz_suffix_also_accepted() -> None:
+def test_fetch_does_not_leave_the_raw_archive_in_dest() -> None:
+    """`dest` ends up as exactly the extracted tree — the raw tarball must
+    not sit alongside it (it would corrupt the CAS content_hash, which is
+    computed over every file under `dest`)."""
     tar_bytes = _build_tar_gz({"lib.nim": b"lib"})
-    pull = _make_pull_with_files({"source.tgz": tar_bytes})
+    fake_client = FakeOciClient(tar_bytes)
 
     prov = OciProvenance(
         registry="ghcr.io",
         repository="org/lib",
         digest=_VALID_DIGEST,
     )
-    fetcher = OciFetcher(oci_pull=pull)
+    fetcher = OciFetcher(client=fake_client)
 
     with tempfile.TemporaryDirectory() as tmp:
         dest = Path(tmp) / "lib"
-        receipt = fetcher.fetch("lib", prov, dest=dest)
-        assert (dest / "lib.nim").read_bytes() == b"lib"
-    assert receipt.layer_digest == _VALID_DIGEST
-
-
-# ---------------------------------------------------------------------------
-# FETCH-OCI-PULL-FAILED
-# ---------------------------------------------------------------------------
-
-
-def test_pull_failure_raises_fetch_oci_pull_failed() -> None:
-    def _fail(reference: str, output_dir: Path) -> list[Path]:
-        raise RuntimeError("registry unreachable")
-
-    fetcher = OciFetcher(oci_pull=_fail)
-    prov = OciProvenance(
-        registry="ghcr.io",
-        repository="org/pkg",
-        digest=_VALID_DIGEST,
-    )
-
-    with tempfile.TemporaryDirectory() as tmp:
-        dest = Path(tmp) / "pkg"
-        with pytest.raises(MilpaError) as exc_info:
-            fetcher.fetch("pkg", prov, dest=dest)
-    assert exc_info.value.slug == FETCH_OCI_PULL_FAILED
-
-
-def test_pull_milpa_error_propagates() -> None:
-    original = MilpaError(FETCH_OCI_PULL_FAILED, "oras absent", reference="x")
-
-    def _fail(reference: str, output_dir: Path) -> list[Path]:
-        raise original
-
-    fetcher = OciFetcher(oci_pull=_fail)
-    prov = OciProvenance(
-        registry="ghcr.io",
-        repository="org/pkg",
-        digest=_VALID_DIGEST,
-    )
-
-    with tempfile.TemporaryDirectory() as tmp:
-        dest = Path(tmp) / "pkg"
-        with pytest.raises(MilpaError) as exc_info:
-            fetcher.fetch("pkg", prov, dest=dest)
-    assert exc_info.value is original
-
-
-# ---------------------------------------------------------------------------
-# FETCH-OCI-NO-TARBALL
-# ---------------------------------------------------------------------------
-
-
-def test_no_tarball_in_artifact_raises_no_tarball() -> None:
-    # Pull returns only a non-.tar.gz file.
-    pull = _make_pull_with_files({"metadata.json": b"{}"})
-
-    fetcher = OciFetcher(oci_pull=pull)
-    prov = OciProvenance(
-        registry="ghcr.io",
-        repository="org/pkg",
-        digest=_VALID_DIGEST,
-    )
-
-    with tempfile.TemporaryDirectory() as tmp:
-        dest = Path(tmp) / "pkg"
-        with pytest.raises(MilpaError) as exc_info:
-            fetcher.fetch("pkg", prov, dest=dest)
-    assert exc_info.value.slug == FETCH_OCI_NO_TARBALL
-
-
-def test_empty_artifact_raises_no_tarball() -> None:
-    pull = _make_pull_with_files({})
-
-    fetcher = OciFetcher(oci_pull=pull)
-    prov = OciProvenance(
-        registry="ghcr.io",
-        repository="org/pkg",
-        digest=_VALID_DIGEST,
-    )
-
-    with tempfile.TemporaryDirectory() as tmp:
-        dest = Path(tmp) / "pkg"
-        with pytest.raises(MilpaError) as exc_info:
-            fetcher.fetch("pkg", prov, dest=dest)
-    assert exc_info.value.slug == FETCH_OCI_NO_TARBALL
-
-
-# ---------------------------------------------------------------------------
-# FETCH-OCI-AMBIGUOUS-TARBALL
-# ---------------------------------------------------------------------------
-
-
-def test_multiple_tarballs_raises_ambiguous() -> None:
-    tar1 = _build_tar_gz({"a.nim": b"a"})
-    tar2 = _build_tar_gz({"b.nim": b"b"})
-    pull = _make_pull_with_files({
-        "source-v1.tar.gz": tar1,
-        "source-v2.tar.gz": tar2,
-    })
-
-    fetcher = OciFetcher(oci_pull=pull)
-    prov = OciProvenance(
-        registry="ghcr.io",
-        repository="org/pkg",
-        digest=_VALID_DIGEST,
-    )
-
-    with tempfile.TemporaryDirectory() as tmp:
-        dest = Path(tmp) / "pkg"
-        with pytest.raises(MilpaError) as exc_info:
-            fetcher.fetch("pkg", prov, dest=dest)
-    assert exc_info.value.slug == FETCH_OCI_AMBIGUOUS_TARBALL
+        fetcher.fetch("lib", prov, dest=dest)
+        names = {p.name for p in dest.iterdir()}
+    assert names == {"lib.nim"}
 
 
 # ---------------------------------------------------------------------------
@@ -371,11 +245,9 @@ def test_multiple_tarballs_raises_ambiguous() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_corrupt_tarball_raises_extract_failed() -> None:
+def test_corrupt_blob_raises_extract_failed() -> None:
     garbage = b"not a tar at all"
-    pull = _make_pull_with_files({"source.tar.gz": garbage})
-
-    fetcher = OciFetcher(oci_pull=pull)
+    fetcher = OciFetcher(client=FakeOciClient(garbage))
     prov = OciProvenance(
         registry="ghcr.io",
         repository="org/pkg",
@@ -396,9 +268,7 @@ def test_corrupt_tarball_raises_extract_failed() -> None:
 
 def test_receipt_transport_fields_non_empty() -> None:
     tar_bytes = _build_tar_gz({"x.nim": b"x"})
-    pull = _make_pull_with_files({"x.tar.gz": tar_bytes})
-
-    fetcher = OciFetcher(oci_pull=pull)
+    fetcher = OciFetcher(client=FakeOciClient(tar_bytes))
     prov = OciProvenance(
         registry="ghcr.io",
         repository="org/pkg",

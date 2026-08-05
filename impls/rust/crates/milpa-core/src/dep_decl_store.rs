@@ -121,89 +121,173 @@ impl DepDeclStore for FileDepDeclStore {
 }
 
 // ---------------------------------------------------------------------------
-// HttpDepDeclStore
+// ContentAddressedHttpArtifactStore — generic fetch-or-cache + hash-verify
+// shape shared by every HTTP artifact store in milpa (issue #201).
 // ---------------------------------------------------------------------------
 
-/// Fetches DepDecl artifacts via HTTP from `<base_url>/dep-decl/<sha256_hex>.kdl`.
+/// Generic content-addressed fetch-or-cache + hash-verify HTTP store.
 ///
-/// Artifacts are immutable (content-addressed); once verified they are cached
-/// forever at `<cache_dir>/<sha256_hex>.kdl`. Selected when `MILPA_INDEX_URL`
-/// is set but `MILPA_DEP_DECL_DIR` is not.
-pub struct HttpDepDeclStore {
+/// `HttpDepDeclStore` (below) and `HttpEntryBundleStore`
+/// (`entry_bundle_store.rs`) are both thin wrappers around this struct.
+/// They were previously two hand-written, structurally identical copies of
+/// this exact fetch-or-cache + hash-verify sequence — unify them here
+/// (CLAUDE.md: "Duplicate code paths are bugs ... unify them" — issue
+/// #201; mirrors `dep_decl_store.py`'s `ContentAddressedHttpArtifactStore`).
+///
+/// What varies per artifact kind (URL sub-path, cache-file extension, size
+/// cap, the hash-verify predicate, and the concrete fetch-failed error) is
+/// supplied by the caller at each `get()` call; everything else —
+/// cache-first read with self-heal, cache-miss GET via `bounded_http`,
+/// HTTP-status-error handling, verify-before-cache, atomic cache write —
+/// lives here once.
+pub(crate) struct ContentAddressedHttpArtifactStore {
     base_url: String,
     cache_dir: Option<PathBuf>,
+    subpath: &'static str,
+    extension: &'static str,
+    max_bytes: usize,
 }
 
-impl HttpDepDeclStore {
-    /// Create a new `HttpDepDeclStore` with the given base URL and optional cache dir.
-    ///
-    /// `base_url` is derived from `MILPA_INDEX_URL` via `index_base_url()`.
-    /// `cache_dir` is where verified artifacts are stored for offline reuse.
-    pub fn new(base_url: impl Into<String>, cache_dir: Option<PathBuf>) -> Self {
-        HttpDepDeclStore {
+impl ContentAddressedHttpArtifactStore {
+    /// `base_url` is expected to already end in `/` (the `index_base_url()`
+    /// convention every caller derives it through).
+    pub(crate) fn new(
+        base_url: impl Into<String>,
+        cache_dir: Option<PathBuf>,
+        subpath: &'static str,
+        extension: &'static str,
+        max_bytes: usize,
+    ) -> Self {
+        ContentAddressedHttpArtifactStore {
             base_url: base_url.into(),
             cache_dir,
+            subpath,
+            extension,
+            max_bytes,
         }
     }
-}
 
-impl DepDeclStore for HttpDepDeclStore {
-    fn get(&self, dep_decl_hash_str: &str) -> Result<Vec<u8>, MilpaError> {
-        let hex = hex_of(dep_decl_hash_str);
+    fn artifact_url(&self, url_token: &str) -> String {
+        format!("{}{}/{url_token}{}", self.base_url, self.subpath, self.extension)
+    }
 
-        // Check cache first (immutable artifacts: no TTL, no re-fetch needed).
-        // CR16: cached-read + self-heal is shared with HttpEntryBundleStore
-        // via crate::atomic_cache::read_verified_or_self_heal — a locally
-        // corrupt/unreadable cache entry (e.g. a truncated write left behind
-        // by the pre-unique-temp-name concurrency race, or plain disk
-        // corruption) is discarded and treated as a cache miss so the caller
-        // re-fetches, rather than a permanent hard failure. A mismatch on
-        // FRESHLY FETCHED bytes below (the server genuinely served the wrong
-        // content) stays a hard error via `?` — that call never goes through
-        // the self-heal primitive.
-        if let Some(ref cache_dir) = self.cache_dir {
-            let cache_path = cache_dir.join(format!("{hex}.kdl"));
-            if let Some(bytes) = crate::atomic_cache::read_verified_or_self_heal(
-                &cache_path,
-                |b| verify(b, dep_decl_hash_str),
-            ) {
+    fn cache_path(&self, url_token: &str) -> Option<PathBuf> {
+        self.cache_dir
+            .as_ref()
+            .map(|d| d.join(format!("{url_token}{}", self.extension)))
+    }
+
+    /// Fetch + cache + hash-verify the artifact named by `url_token`
+    /// (the URL/cache-filename segment), reporting failures against
+    /// `report_key` — the caller's public hash pointer, which may differ
+    /// from `url_token` (e.g. `HttpDepDeclStore`'s `sha256:<hex>` pointer
+    /// vs. the bare hex used in the URL/cache filename; `HttpEntryBundleStore`
+    /// passes its bundle pin for both, since it has no such split).
+    pub(crate) fn get(
+        &self,
+        url_token: &str,
+        report_key: &str,
+        verify: impl Fn(&[u8]) -> Result<(), MilpaError>,
+        make_fetch_failed_error: impl Fn(&str, &str, &str) -> MilpaError,
+    ) -> Result<Vec<u8>, MilpaError> {
+        // Check cache first (immutable artifacts: no TTL, no re-fetch
+        // needed). CR16: cached-read + self-heal — a locally corrupt/
+        // unreadable cache entry (e.g. a truncated write left behind by the
+        // pre-unique-temp-name concurrency race, or plain disk corruption)
+        // is discarded and treated as a cache miss so the caller re-fetches,
+        // rather than a permanent hard failure. A mismatch on FRESHLY
+        // FETCHED bytes below (the server genuinely served the wrong
+        // content) stays a hard error via `?` — that call never goes
+        // through the self-heal primitive.
+        if let Some(cache_path) = self.cache_path(url_token) {
+            if let Some(bytes) =
+                crate::atomic_cache::read_verified_or_self_heal(&cache_path, |b| verify(b))
+            {
                 return Ok(bytes);
             }
         }
 
-        // Network fetch: derive artifact URL from base_url + hash.
-        let url = format!("{}dep-decl/{hex}.kdl", self.base_url);
-        let bytes = http_get_bytes(&url, dep_decl_hash_str)?;
-        verify(&bytes, dep_decl_hash_str)?;
+        let url = self.artifact_url(url_token);
+        let bytes = self.http_get_bytes(&url, report_key, &make_fetch_failed_error)?;
+        verify(&bytes)?;
 
         // Write to cache (best-effort: cache write failures are non-fatal).
         // Atomic: unique-per-write temp sibling + rename (registry-protocol
         // §3.5.2 NORMATIVE (concurrency)) — a bare `fs::write` to the final
-        // path (the pre-fix behavior here) is not just non-atomic under a
-        // fixed temp name, it has NO temp file at all, so a concurrent
-        // reader can observe a partial write directly at the cache path.
-        if let Some(ref cache_dir) = self.cache_dir {
-            if let Err(e) = std::fs::create_dir_all(cache_dir) {
-                eprintln!("milpa: dep-decl cache dir create failed: {e}");
-            } else {
-                let cache_path = cache_dir.join(format!("{hex}.kdl"));
-                if let Err(e) = crate::atomic_cache::atomic_write_bytes(&cache_path, &bytes) {
-                    eprintln!("milpa: dep-decl cache write failed: {e}");
-                }
+        // path is not just non-atomic under a fixed temp name, it has NO
+        // temp file at all, so a concurrent reader can observe a partial
+        // write directly at the cache path.
+        if let Some(cache_path) = self.cache_path(url_token) {
+            if let Some(parent) = cache_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
             }
+            let _ = crate::atomic_cache::atomic_write_bytes(&cache_path, &bytes);
         }
 
         Ok(bytes)
     }
 
-    fn is_cached(&self, dep_decl_hash_str: &str) -> bool {
-        let hex = hex_of(dep_decl_hash_str);
-        if let Some(ref cache_dir) = self.cache_dir {
-            return cache_dir.join(format!("{hex}.kdl")).is_file();
+    /// Minimal synchronous HTTP GET returning raw bytes, size-capped.
+    ///
+    /// Uses the single production HTTP backend (`crate::bounded_http::
+    /// request`, RFC `rfc-native-oci-fetch.md` §3.3/S4). `file://` URLs are
+    /// read from disk directly (used in tests + conformance fixtures) —
+    /// `bounded_http` is an HTTP-only transport.
+    fn http_get_bytes(
+        &self,
+        url: &str,
+        report_key: &str,
+        make_fetch_failed_error: &impl Fn(&str, &str, &str) -> MilpaError,
+    ) -> Result<Vec<u8>, MilpaError> {
+        if let Some(path_str) = url.strip_prefix("file://") {
+            let bytes = std::fs::read(path_str)
+                .map_err(|e| make_fetch_failed_error(report_key, url, &e.to_string()))?;
+            // R8: apply size cap even for file:// (consistent policy).
+            if bytes.len() > self.max_bytes {
+                return Err(make_fetch_failed_error(
+                    report_key,
+                    url,
+                    &format!(
+                        "exceeds the {}-byte cap ({} bytes) — rejecting to prevent \
+                         resource exhaustion",
+                        self.max_bytes,
+                        bytes.len()
+                    ),
+                ));
+            }
+            return Ok(bytes);
         }
-        false
+
+        // HTTP/HTTPS: the native bounded transport streams the body under
+        // the cap, aborting mid-stream on breach (FETCH-DOWNLOAD-SIZE-
+        // EXCEEDED).
+        let mut buf = Vec::new();
+        let resp = crate::bounded_http::request(
+            "GET",
+            url,
+            &[],
+            self.max_bytes as u64,
+            crate::bounded_http::Sink::Bytes(&mut buf),
+        )
+        .map_err(|e| make_fetch_failed_error(report_key, url, e.message()))?;
+        if resp.status >= 400 {
+            return Err(make_fetch_failed_error(
+                report_key,
+                url,
+                &format!("HTTP {}", resp.status),
+            ));
+        }
+        Ok(buf)
+    }
+
+    pub(crate) fn is_cached(&self, url_token: &str) -> bool {
+        self.cache_path(url_token).map(|p| p.is_file()).unwrap_or(false)
     }
 }
+
+// ---------------------------------------------------------------------------
+// HttpDepDeclStore
+// ---------------------------------------------------------------------------
 
 /// Maximum size of a DepDecl artifact fetched over HTTP (spec §3.3.1 NORMATIVE).
 ///
@@ -218,73 +302,82 @@ impl DepDeclStore for HttpDepDeclStore {
 /// failures).
 const DEP_DECL_MAX_ARTIFACT_BYTES: usize = 1024 * 1024; // 1 MiB
 
-/// Minimal synchronous HTTP GET returning raw bytes.
+/// Build the `TNG-DEPDECL-FETCH-FAILED` error for a fetch failure.
 ///
-/// Mirrors the CLI's `curl`-based fetch (same subprocess pattern used for
-/// the tianguis index client). Returns `TNG-DEPDECL-FETCH-FAILED` on any
-/// network or HTTP error.
+/// Passed to `ContentAddressedHttpArtifactStore::get` as
+/// `make_fetch_failed_error` — the ONE place that builds this error,
+/// regardless of whether the failure was a file-read error, a cap breach,
+/// a transport error, or an HTTP error status (`detail` carries the
+/// specifics).
+fn dep_decl_fetch_failed_error(dep_decl_hash_str: &str, url: &str, detail: &str) -> MilpaError {
+    MilpaError::Core(CoreError::DepDecl(
+        "TNG-DEPDECL-FETCH-FAILED",
+        format!("DepDecl artifact {dep_decl_hash_str:?} fetch failed from {url}: {detail}"),
+    ))
+}
+
+/// Fetches DepDecl artifacts via HTTP from `<base_url>/dep-decl/<sha256_hex>.kdl`.
 ///
-/// R8: enforces `DEP_DECL_MAX_ARTIFACT_BYTES` on every response.
-fn http_get_bytes(url: &str, dep_decl_hash_str: &str) -> Result<Vec<u8>, MilpaError> {
-    // file:// URLs: read from disk directly (used in tests + conformance fixtures).
-    if let Some(path_str) = url.strip_prefix("file://") {
-        let bytes = std::fs::read(path_str).map_err(|e| {
-            MilpaError::Core(CoreError::DepDecl(
-                "TNG-DEPDECL-FETCH-FAILED",
-                format!("DepDecl artifact {dep_decl_hash_str:?} fetch failed from {url}: {e}"),
-            ))
-        })?;
-        // R8: apply size cap even for file:// (consistent policy).
-        if bytes.len() > DEP_DECL_MAX_ARTIFACT_BYTES {
-            return Err(MilpaError::Core(CoreError::DepDecl(
-                "TNG-DEPDECL-FETCH-FAILED",
-                format!(
-                    "DepDecl artifact {dep_decl_hash_str:?} from {url} exceeds the \
-                     {DEP_DECL_MAX_ARTIFACT_BYTES}-byte cap ({} bytes) — \
-                     rejecting to prevent resource exhaustion",
-                    bytes.len()
-                ),
-            )));
+/// Artifacts are immutable (content-addressed); once verified they are cached
+/// forever at `<cache_dir>/<sha256_hex>.kdl`. Selected when `MILPA_INDEX_URL`
+/// is set but `MILPA_DEP_DECL_DIR` is not.
+pub struct HttpDepDeclStore {
+    core: ContentAddressedHttpArtifactStore,
+}
+
+impl HttpDepDeclStore {
+    /// Create a new `HttpDepDeclStore` with the given base URL and optional cache dir.
+    ///
+    /// `base_url` is derived from `MILPA_INDEX_URL` via `index_base_url()`.
+    /// `cache_dir` is where verified artifacts are stored for offline reuse.
+    pub fn new(base_url: impl Into<String>, cache_dir: Option<PathBuf>) -> Self {
+        HttpDepDeclStore {
+            core: ContentAddressedHttpArtifactStore::new(
+                base_url,
+                cache_dir,
+                "dep-decl",
+                ".kdl",
+                DEP_DECL_MAX_ARTIFACT_BYTES,
+            ),
         }
-        return Ok(bytes);
+    }
+}
+
+impl DepDeclStore for HttpDepDeclStore {
+    fn get(&self, dep_decl_hash_str: &str) -> Result<Vec<u8>, MilpaError> {
+        // OCI: not supported — direct the caller to MILPA_DEP_DECL_DIR. This
+        // is a dep_decl-only pre-check (HttpEntryBundleStore has no OCI-base
+        // concept), so it stays here rather than in the shared
+        // `ContentAddressedHttpArtifactStore` core. Mirrors
+        // `dep_decl_store.py`'s `HttpDepDeclStore.get` — without this guard
+        // an `oci://` base URL falls through to `bounded_http` and still
+        // lands on TNG-DEPDECL-FETCH-FAILED, but via a generic "unsupported
+        // URL scheme" message instead of actionable guidance.
+        if self.core.base_url.starts_with("oci://") {
+            let hex = hex_of(dep_decl_hash_str);
+            return Err(dep_decl_fetch_failed_error(
+                dep_decl_hash_str,
+                &self.core.base_url,
+                &format!(
+                    "OCI index base URLs do not support the DepDecl URL template — \
+                     set MILPA_DEP_DECL_DIR to a local directory containing {hex}.kdl"
+                ),
+            ));
+        }
+
+        let hex = hex_of(dep_decl_hash_str);
+        self.core.get(
+            hex,
+            dep_decl_hash_str,
+            |b| verify(b, dep_decl_hash_str),
+            dep_decl_fetch_failed_error,
+        )
     }
 
-    // HTTP/HTTPS: subprocess curl with --max-filesize cap (mirrors tianguis
-    // index client transport).  `--max-filesize` makes curl exit non-zero
-    // before the cap is exceeded; we also check stdout length as a second line
-    // of defence (Content-Length lies are a known attack vector).
-    let max_str = DEP_DECL_MAX_ARTIFACT_BYTES.to_string();
-    let out = std::process::Command::new("curl")
-        .args(["-fsSL", "--max-filesize", &max_str, url])
-        .output()
-        .map_err(|e| {
-            MilpaError::Core(CoreError::DepDecl(
-                "TNG-DEPDECL-FETCH-FAILED",
-                format!("DepDecl artifact {dep_decl_hash_str:?}: curl failed: {e}"),
-            ))
-        })?;
-    if !out.status.success() {
-        return Err(MilpaError::Core(CoreError::DepDecl(
-            "TNG-DEPDECL-FETCH-FAILED",
-            format!(
-                "DepDecl artifact {dep_decl_hash_str:?} fetch failed from {url}: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            ),
-        )));
+    fn is_cached(&self, dep_decl_hash_str: &str) -> bool {
+        let hex = hex_of(dep_decl_hash_str);
+        self.core.is_cached(hex)
     }
-    // Second-line defence: verify curl didn't silently exceed the cap.
-    if out.stdout.len() > DEP_DECL_MAX_ARTIFACT_BYTES {
-        return Err(MilpaError::Core(CoreError::DepDecl(
-            "TNG-DEPDECL-FETCH-FAILED",
-            format!(
-                "DepDecl artifact {dep_decl_hash_str:?} from {url} exceeds the \
-                 {DEP_DECL_MAX_ARTIFACT_BYTES}-byte cap ({} bytes) — \
-                 rejecting to prevent resource exhaustion",
-                out.stdout.len()
-            ),
-        )));
-    }
-    Ok(out.stdout)
 }
 
 // ---------------------------------------------------------------------------
@@ -561,6 +654,29 @@ mod tests {
         );
         let err = store.get("sha256:0000000000000000000000000000000000000000000000000000000000000000").unwrap_err();
         assert_eq!(err.code(), "TNG-DEPDECL-FETCH-FAILED");
+    }
+
+    #[test]
+    fn http_store_oci_base_raises_fetch_failed_with_actionable_guidance() {
+        // Code-review Fix 2 (cross-impl parity with `dep_decl_store.py`'s
+        // `HttpDepDeclStore.get`): an `oci://` index base URL has no DepDecl
+        // URL template — falling through to `bounded_http` would still land
+        // on TNG-DEPDECL-FETCH-FAILED (via "unsupported URL scheme"), but
+        // with a generic message instead of actionable guidance. Pre-check
+        // and raise with the same "set MILPA_DEP_DECL_DIR" guidance Python
+        // gives, without touching the network at all.
+        let store = HttpDepDeclStore::new(
+            "oci://myregistry.example.com/milpa",
+            Some(tempfile::tempdir().unwrap().path().to_path_buf()),
+        );
+        let h = format!("sha256:{}", "e".repeat(64));
+        let err = store.get(&h).unwrap_err();
+        assert_eq!(err.code(), "TNG-DEPDECL-FETCH-FAILED");
+        assert!(
+            err.message().contains("MILPA_DEP_DECL_DIR"),
+            "expected actionable MILPA_DEP_DECL_DIR guidance in message, got: {}",
+            err.message()
+        );
     }
 
     // -----------------------------------------------------------------------

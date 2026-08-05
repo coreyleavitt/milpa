@@ -25,6 +25,7 @@ import pytest
 from milpa.cli import cmd_publish, main
 from milpa.errors import PUBLISH_VERSION_TAG_MISMATCH
 from milpa.fetchers.oci import OciProvenance
+from milpa.fetchers.oci_client import SOURCE_LAYER_MEDIA_TYPE
 
 
 # ---------------------------------------------------------------------------
@@ -124,7 +125,7 @@ def _make_matching_manifest_fetch(repo: Path):
 
     def _fetch(oci_ref):
         calls.append(oci_ref)
-        return {"layers": [{"digest": local_digest}]}
+        return {"layers": [{"digest": local_digest, "mediaType": SOURCE_LAYER_MEDIA_TYPE}]}
 
     _fetch.calls = calls  # type: ignore[attr-defined]
     return _fetch

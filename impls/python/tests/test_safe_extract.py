@@ -17,6 +17,7 @@ import lzma
 import os
 import tarfile
 import tempfile
+import time
 from pathlib import Path
 
 import pytest
@@ -1254,3 +1255,247 @@ def test_zip_slip_escape_still_raises_extract_zip_slip(tmp_path: Path) -> None:
     with pytest.raises(MilpaError) as exc_info:
         extract_tar(tar, tmp_path / "dest")
     assert exc_info.value.slug == EXTRACT_ZIP_SLIP
+
+
+# ---------------------------------------------------------------------------
+# RFC docs/rfc-native-oci-fetch.md §3.3 (#202 parity, formerly R1-23b):
+# extract_tar STREAMS — it never buffers the whole compressed OR whole
+# decompressed archive.  Peak memory is O(largest member), not O(decomp_cap).
+# ---------------------------------------------------------------------------
+
+
+def test_streaming_multi_member_gz_archive_extracts_correctly() -> None:
+    """A valid multi-member gzip archive (dirs, files, a subdirectory, and a
+    safe symlink) extracts correctly through the streaming path (tarfile
+    stream mode ``"r|"`` against ``_CappedDecompressStream`` — mode "r|" is
+    forward-only, exercising the ``for member in tf:`` iteration rather than
+    ``tf.getmembers()``, and both pass 1 (dirs/files/symlinks) and pass 2
+    (hardlinks) run against it).
+    """
+    raw = _make_tar(
+        [
+            _make_dir_entry("pkg/"),
+            _make_file_entry("pkg/a.nim", b"# a"),
+            _make_dir_entry("pkg/sub/"),
+            _make_file_entry("pkg/sub/b.nim", b"# b"),
+            _make_symlink_entry("pkg/link.nim", "a.nim"),
+            _make_file_entry("pkg/c.nim", b"# c, a third file"),
+            _make_hardlink_entry("pkg/d.nim", "pkg/a.nim"),
+        ]
+    )
+    gz_buf = io.BytesIO()
+    with gzip.GzipFile(fileobj=gz_buf, mode="wb") as gz:
+        gz.write(raw.read())
+    gz_buf.seek(0)
+
+    with tempfile.TemporaryDirectory() as dest_str:
+        dest = Path(dest_str)
+        result = extract_tar(gz_buf, dest)
+        assert (dest / "pkg" / "a.nim").read_bytes() == b"# a"
+        assert (dest / "pkg" / "sub" / "b.nim").read_bytes() == b"# b"
+        assert (dest / "pkg" / "link.nim").is_symlink()
+        assert (dest / "pkg" / "c.nim").read_bytes() == b"# c, a third file"
+        assert (dest / "pkg" / "d.nim").read_bytes() == b"# a"  # hardlink copy
+
+    # a.nim, sub/b.nim, link.nim, c.nim, d.nim (hardlink counts) = 5.
+    assert result.file_count == 5
+    assert result.total_bytes == len(b"# a") + len(b"# b") + len(b"# c, a third file") + len(b"# a")
+
+
+def test_streaming_decompression_bomb_cap_fires_without_full_buffering() -> None:
+    """The SA-1 stream-level cap fires as bytes are PULLED through the
+    decompressor, not only after fully materializing the decompressed
+    stream — the direct behavioral proof of the streaming rewrite.
+
+    A gzip archive with a lying header (declared ``member.size = 0``) whose
+    compressed stream actually expands to ~200 MiB of zero padding (which
+    gzip compresses to a few hundred bytes) is deliberately much larger than
+    ``test_gz_lying_header_stream_cap_fires``'s 5 KB padding.  Under the OLD
+    (pre-streaming) design — decompress the ENTIRE stream into one ``bytes``
+    object before ever checking the cap — this would force materializing
+    ~200 MiB and take a measurable amount of time.  Under the streaming
+    design only ``decomp_cap + 1`` decompressed bytes are ever pulled before
+    ``_CappedDecompressStream`` raises, so this still completes almost
+    instantly despite the much larger nominal bomb size.
+    """
+    header = bytearray(512)
+    name = b"a.nim"
+    header[: len(name)] = name
+    header[100:108] = b"0000644\0"
+    header[108:116] = b"0000000\0"
+    header[116:124] = b"0000000\0"
+    header[124:136] = b"00000000000\0"  # size = 0 (the lie)
+    header[136:148] = b"00000000000\0"
+    header[156] = ord("0")
+    header[148:156] = b"        "
+    chksum = sum(header)
+    header[148:156] = f"{chksum:06o}\0 ".encode()
+
+    buf = io.BytesIO()
+    gz = gzip.GzipFile(fileobj=buf, mode="wb")
+    gz.write(bytes(header))
+    chunk = b"\0" * (1 << 20)  # 1 MiB zero chunk, written repeatedly
+    padding_target = 200 * (1 << 20)  # ~200 MiB of decompressed padding
+    written = 0
+    while written < padding_target:
+        gz.write(chunk)
+        written += len(chunk)
+    gz.write(b"\0" * 1024)
+    gz.close()
+    buf.seek(0)
+
+    limits = Limits(max_total_size=100, max_file_size=10_000, decomp_cap=200)
+    with tempfile.TemporaryDirectory() as dest_str:
+        start = time.monotonic()
+        with pytest.raises(MilpaError) as exc_info:
+            extract_tar(buf, Path(dest_str), limits=limits)
+        elapsed = time.monotonic() - start
+
+    assert exc_info.value.slug == EXTRACT_SIZE_LIMIT
+    # A non-streaming (buffer-then-check) implementation would need to fully
+    # decompress ~200 MiB before ever comparing against decomp_cap; the
+    # streaming implementation trips within microseconds of the first
+    # decomp_cap+1 bytes. 5s is a generous ceiling that would fail if
+    # streaming regressed back to eager full materialization.
+    assert elapsed < 5.0, (
+        f"extraction took {elapsed:.2f}s — the decompression-bomb cap must "
+        f"fire from the STREAM (RFC §3.3), not after buffering the full "
+        f"decompressed archive"
+    )
+
+
+class _ReadSizeTrackingBytesIO(io.BytesIO):
+    """Records every ``read(size)`` call's requested size.
+
+    Structural proof that the archive-input stream is never asked to yield
+    "everything at once" (the old ``archive.read()`` / ``Path.read_bytes()``
+    whole-archive buffering this fix removes) — only small, bounded chunk
+    requests, consistent with tarfile's own internal block size.
+    """
+
+    def __init__(self, initial_bytes: bytes) -> None:
+        super().__init__(initial_bytes)
+        self.read_sizes: list[int | None] = []
+
+    def read(self, size: int | None = -1) -> bytes:  # type: ignore[override]
+        self.read_sizes.append(size)
+        return super().read(size)
+
+
+def _make_concatenated_trailing_bomb_gz(padding_bytes: int) -> io.BytesIO:
+    """A valid, small gzip-compressed tar followed by a SECOND, unrelated
+    gzip member concatenated onto the same byte stream, whose decompressed
+    payload is ``padding_bytes`` of zeros.
+
+    ``gzip.GzipFile`` reads consecutive gzip members transparently
+    (multistream support), so the two members form one continuous
+    decompressed byte stream from the decompressor's point of view.  But
+    ``tarfile`` (stream mode ``"r|"``) stops asking the stream for more bytes
+    the moment it hits the FIRST archive's end-of-archive marker (two zero
+    blocks) — it never even knows the second gzip member exists.
+    """
+    first_archive = _make_compressible_tar(50).read()
+    second_member = gzip.compress(b"\0" * padding_bytes)
+    combined = io.BytesIO(first_archive + second_member)
+    combined.seek(0)
+    return combined
+
+
+def test_trailing_gzip_member_beyond_tar_terminator_counts_toward_decomp_cap() -> None:
+    """SECURITY (docs/rfc-native-oci-fetch.md §3.3): a second, concatenated
+    gzip member appended AFTER a well-formed tar's logical end-of-archive
+    marker must still count toward ``decomp_cap`` — Layer 1's documented
+    guarantee is that the cap covers the WHOLE decompressed stream, not just
+    the prefix ``tarfile`` happened to read.
+
+    ``tarfile`` stops pulling from ``_CappedDecompressStream`` at the first
+    archive's zero-block terminator, so the trailing member's decompressed
+    bytes are never pulled through the wrapper and never counted UNLESS
+    ``extract_tar`` explicitly drains the remainder after extraction
+    completes.
+
+    ``decomp_cap`` is set comfortably above the first (legitimate) archive's
+    own decompressed size (~10 KiB — tarfile pads to a 10 KiB record) but
+    well below the combined total once the trailing bomb member is added, so
+    this test isolates the DRAIN behavior specifically — it must not simply
+    be re-testing "the first archive alone already exceeds the cap".
+
+    RED against the pre-drain implementation: the trailing member is never
+    read, so extraction SUCCEEDS with no EXTRACT-SIZE-LIMIT despite the total
+    decompressed stream vastly exceeding decomp_cap.
+    """
+    padding = 500_000  # 500 KB of trailing decompressed zeros
+    archive = _make_concatenated_trailing_bomb_gz(padding)
+    limits = Limits(max_total_size=10_000_000, max_file_size=10_000_000, decomp_cap=20_000)
+    with tempfile.TemporaryDirectory() as dest_str:
+        with pytest.raises(MilpaError) as exc_info:
+            extract_tar(archive, Path(dest_str), limits=limits)
+    assert exc_info.value.slug == EXTRACT_SIZE_LIMIT
+
+
+def test_trailing_ordinary_record_padding_does_not_false_positive() -> None:
+    """The drain must not raise on a NORMAL archive's own trailing
+    record-size zero-padding — only a cap-exceeding tail is a bomb.
+
+    ``_make_compressible_tar`` already produces an archive with real trailing
+    padding (tarfile pads its output to a 10 KiB record boundary), so this is
+    the direct "legitimate trailing bytes" companion to the attack test
+    above: same archive shape, but ``decomp_cap`` stays comfortably above the
+    true (padded) size, so the drain must read the small remainder and hit
+    EOF cleanly rather than raising.
+    """
+    gz_archive = _make_compressible_tar(50)
+    limits = Limits(max_total_size=1_000, max_file_size=1_000, decomp_cap=20_000)
+    with tempfile.TemporaryDirectory() as dest_str:
+        result = extract_tar(gz_archive, Path(dest_str), limits=limits)
+    assert result.file_count == 1
+    assert result.total_bytes == 50
+
+
+def test_extract_tar_never_issues_a_single_whole_archive_read() -> None:
+    """Structural proof (RFC §3.3 / R1-23b closed): the pre-fix implementation's
+    first move was an unconditional ``archive.read()`` — one call with no size
+    argument, slurping the entire archive into a single ``bytes`` object (then
+    doing the same again for the decompressed output). The streaming rewrite
+    must never do that: every read the archive-input stream sees must be a
+    small, bounded chunk request (tarfile's own internal block size, plus our
+    own bounded magic-byte peek) — never a single unbounded "read everything"
+    call, and never a request anywhere near the archive's own size.
+    """
+    # Incompressible content so the compressed archive stays large — if the
+    # implementation ever read the WHOLE archive in one call, that call's
+    # size would be on the order of this payload, not a small fixed chunk.
+    payload = os.urandom(8_000_000)
+    raw_buf = io.BytesIO()
+    with tarfile.open(fileobj=raw_buf, mode="w:") as tf:
+        info = tarfile.TarInfo(name="big.bin")
+        info.size = len(payload)
+        tf.addfile(info, io.BytesIO(payload))
+    raw_buf.seek(0)
+
+    gz_buf = io.BytesIO()
+    with gzip.GzipFile(fileobj=gz_buf, mode="wb") as gz:
+        gz.write(raw_buf.read())
+    archive_bytes = gz_buf.getvalue()
+    assert len(archive_bytes) > 4_000_000, (
+        "test precondition: compressed archive must stay large (incompressible payload)"
+    )
+
+    tracked = _ReadSizeTrackingBytesIO(archive_bytes)
+    limits = Limits(max_total_size=10_000_000, max_file_size=10_000_000)
+    with tempfile.TemporaryDirectory() as dest_str:
+        result = extract_tar(tracked, Path(dest_str), limits=limits)
+        assert result.file_count == 1
+        assert (Path(dest_str) / "big.bin").read_bytes() == payload
+
+    assert tracked.read_sizes, "expected at least one read() call on the archive stream"
+    for size in tracked.read_sizes:
+        assert size is not None and size >= 0, (
+            f"archive stream read() called with unbounded size {size!r} — "
+            f"this is exactly the whole-archive buffering this fix removes"
+        )
+        assert size <= (1 << 20), (
+            f"archive stream read() requested {size} bytes in one call "
+            f"(archive is {len(archive_bytes)} bytes) — expected small "
+            f"bounded chunks (streaming), not a large/whole-archive slurp"
+        )

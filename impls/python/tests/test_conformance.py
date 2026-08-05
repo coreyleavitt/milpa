@@ -2978,6 +2978,21 @@ def _assert_corpus_non_empty() -> None:
 _assert_corpus_non_empty()
 
 
+def test_oci_transport_dir_is_not_a_conformance_fixture_group() -> None:
+    """``conformance/oci-transport/`` is a unit-tier canned-transport contract
+    (RFC native-oci-fetch §3.7), NOT a spec-conformance fixture group. The
+    corpus runner scans only ``spec-v<N>/fixture-*``; guard structurally that
+    it never absorbs this sibling directory's transcripts (a future refactor
+    widening the discovery glob would otherwise silently break the corpus)."""
+    ids = [f.id for f in _discover_fixtures(_CORPUS_ROOT)]
+    assert ids, "corpus resolved to 0 fixtures"
+    assert not any(fid.startswith("oci-transport") for fid in ids), (
+        "conformance/oci-transport/ leaked into the black-box corpus: " + repr(ids)
+    )
+    # Keep the guard live, not vacuous: the directory + its pinned schema exist.
+    assert (_CORPUS_ROOT / "oci-transport" / "schema.json").is_file()
+
+
 # ---------------------------------------------------------------------------
 # Fixture collection and parametrization
 # ---------------------------------------------------------------------------

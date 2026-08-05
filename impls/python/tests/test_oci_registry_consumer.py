@@ -5,9 +5,9 @@ Closes the resolver gap where an index entry whose provenance is ``oci`` (not
 in ``_materialize``. This is the registry named-dep path only — NOT the
 manifest ``oci=`` dep form (out of scope; see resolver.py::_materialize).
 
-End-to-end: ``resolve()`` with a real ``OciFetcher`` (injected fake
-``oci_pull`` transport — no real ``oras``/network) against an ``Index`` whose
-single provenance is ``OciIndexProvenance``. Asserts:
+End-to-end: ``resolve()`` with a real ``OciFetcher`` (injected ``FakeOciClient``
+— no real registry/network) against an ``Index`` whose single provenance is
+``OciIndexProvenance``. Asserts:
   - the fetch is actually invoked (via the fake pull closure)
   - the resulting ``ResolvedDep`` carries an ``OciProvenanceRecord`` (not git)
   - the lockfile round-trips: ``from_graph`` -> format -> parse recovers the
@@ -30,6 +30,8 @@ from milpa.manifest import Manifest, NamedDep
 from milpa.registry import Index, IndexVersion, OciIndexProvenance, Package
 from milpa.resolver import resolve
 from milpa.version import Strategy
+
+from tests._oci_fake_client import FakeOciClient
 
 _REGISTRY = "ghcr.io"
 _REPOSITORY = "acme/widget"
@@ -88,31 +90,28 @@ def _build_tar_gz(files: dict[str, bytes]) -> bytes:
     return buf.getvalue()
 
 
-def _make_env(tmp_path: Path, index: Index, pull_calls: list[str]) -> MilpaEnv:
-    """Build a MilpaEnv with a real OciFetcher whose ``oci_pull`` transport is
-    faked (no real ``oras``/network) — mirrors test_oci_fetcher.py's pattern.
+def _make_env(tmp_path: Path, index: Index) -> tuple[MilpaEnv, FakeOciClient]:
+    """Build a MilpaEnv with a real OciFetcher whose client is a ``FakeOciClient``
+    (no real registry/network). Returns the client too, so a test can inspect
+    ``fake_client.calls`` after ``resolve()`` runs.
     """
     tar_bytes = _build_tar_gz(
         {"widget.nimble": b'version = "1.0.0"\nauthor = "a"\nlicense = "MIT"\n'}
     )
 
-    def _fake_pull(reference: str, output_dir: Path) -> list[Path]:
-        pull_calls.append(reference)
-        out = output_dir / "widget.tar.gz"
-        out.write_bytes(tar_bytes)
-        return [out]
+    fake_client = FakeOciClient(tar_bytes)
 
     registry = FetcherRegistry()
-    registry.register(OciFetcher(oci_pull=_fake_pull))
+    registry.register(OciFetcher(client=fake_client))
     store = CAStore(root=tmp_path / ".cas")
     fetcher = CasAdmittingFetcher(registry, store)
-    return MilpaEnv(fetcher=fetcher, index=index, store=store)
+    env = MilpaEnv(fetcher=fetcher, index=index, store=store)
+    return env, fake_client
 
 
 class TestOciNamedDepResolution:
     def test_named_dep_with_oci_provenance_resolves(self, tmp_path: Path) -> None:
-        pull_calls: list[str] = []
-        env = _make_env(tmp_path, _index_with_oci(), pull_calls)
+        env, fake_client = _make_env(tmp_path, _index_with_oci())
 
         m = _manifest([NamedDep(name="widget", constraint=None)])
         graph = resolve(m, tmp_path / "_deps", env, ResolveParams(strategy=Strategy.MAXVER))
@@ -121,9 +120,9 @@ class TestOciNamedDepResolution:
         dep = graph.deps[0]
         assert dep.name == "widget"
 
-        # The fake oras-pull transport was actually invoked, with the full
-        # OCI reference built from the index's provenance fields.
-        assert pull_calls == [f"{_REGISTRY}/{_REPOSITORY}@{_DIGEST}"]
+        # The fake client was actually invoked, with the full OCI reference
+        # built from the index's provenance fields.
+        assert fake_client.calls == [f"{_REGISTRY}/{_REPOSITORY}@{_DIGEST}"]
 
         # The candidate carries an OciProvenanceRecord, not a GitProvenanceRecord.
         assert len(dep.provenances) == 1
@@ -136,8 +135,7 @@ class TestOciNamedDepResolution:
         assert prov.origin == "observed"
 
     def test_oci_provenance_round_trips_through_lockfile(self, tmp_path: Path) -> None:
-        pull_calls: list[str] = []
-        env = _make_env(tmp_path, _index_with_oci(), pull_calls)
+        env, _fake_client = _make_env(tmp_path, _index_with_oci())
 
         m = _manifest([NamedDep(name="widget", constraint=None)])
         graph = resolve(m, tmp_path / "_deps", env, ResolveParams(strategy=Strategy.MAXVER))

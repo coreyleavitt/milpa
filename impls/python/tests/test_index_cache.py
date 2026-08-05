@@ -38,6 +38,7 @@ from milpa.index_cache import (
     derive_bundle_url,
     index_url_from_env,
     load_index,
+    urllib_bundle_http_get,
     urllib_http_get,
 )
 from milpa.index_trust import (
@@ -286,6 +287,135 @@ class TestOfflineFallback:
         # Very stale: age = 1_000_000 - 1 >> ttl 100. Network down.
         idx = load_index(URL, tmp_path, failing_get, 100, 1_000_000)
         assert idx.packages[0].name == "bar"
+
+
+# ---------------------------------------------------------------------------
+# 4b. Offline fallback against the PRODUCTION transport (RFC
+# docs/rfc-native-oci-fetch.md §3.3, slice S3) — characterization tests for
+# the curl-free/urllib-free bounded_http migration.  TestOfflineFallback
+# above only exercises load_index's own state machine via an injected fake
+# (failing_get); these drive the SAME state machine through the real
+# production urllib_http_get / urllib_bundle_http_get so the transport-level
+# translation (today: urllib.error.URLError / HTTPError; after migration:
+# MilpaError from bounded_http.request) is verified end to end.
+# ---------------------------------------------------------------------------
+
+
+class TestOfflineFallbackProductionTransport:
+    def test_offline_fallback_with_real_network_failure(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A genuine connection-refused failure (not an injected fake) must
+        trigger the SAME State-3 stale-cache fallback as failing_get, and the
+        resulting warning must still not leak the MilpaError wire-format
+        'milpa-error:' prefix (R3) — even though the production transport now
+        raises MilpaError where it used to raise urllib.error.URLError.
+        """
+        import http.server
+        import threading
+
+        class _Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                body = VALID_INDEX.encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args: object) -> None:
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), _Handler)
+        port = server.server_address[1]
+        thread = threading.Thread(target=server.serve_forever)
+        thread.daemon = True
+        thread.start()
+        url = f"http://127.0.0.1:{port}/index.kdl"
+
+        try:
+            # State 2: real network fetch via the PRODUCTION transport populates
+            # the cache.
+            idx = load_index(url, tmp_path, urllib_http_get, 100, 1000)
+            assert idx.packages[0].name == "bar"
+        finally:
+            server.shutdown()
+            # server_close() releases the listening socket itself — shutdown()
+            # alone only stops the serve_forever loop, leaving the port still
+            # accepting connections into the kernel backlog (which would hang
+            # the "network down" fetch below instead of refusing it).
+            server.server_close()
+            thread.join(timeout=5)
+
+        # Server is now down; the same URL refuses connections.  Same
+        # production transport, timestamp beyond TTL -> State 3 fallback.
+        idx2 = load_index(url, tmp_path, urllib_http_get, 100, 9999)
+        assert idx2.packages[0].name == "bar"
+
+        captured = capsys.readouterr()
+        assert captured.err, "state 3 must emit a warning to stderr"
+        assert "milpa-error:" not in captured.err, (
+            "R3: offline-fallback warning must NOT leak the MilpaError "
+            "wire-format prefix even when the production transport raises "
+            f"MilpaError\nstderr was: {captured.err!r}"
+        )
+
+
+class TestProductionBundleTransport404:
+    def test_urllib_bundle_http_get_404_raises_bundle_not_found(self) -> None:
+        """Production BundleHttpGet transport: HTTP 404 -> _BundleNotFound.
+
+        Pins today's urllib.error.HTTPError(404)-based translation before the
+        bounded_http migration; must still hold after (native status-as-data
+        checked explicitly for 404 by the adapter).
+        """
+        import http.server
+        import threading
+
+        class _Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                self.send_response(404)
+                self.end_headers()
+
+            def log_message(self, *args: object) -> None:
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), _Handler)
+        port = server.server_address[1]
+        thread = threading.Thread(target=server.serve_forever)
+        thread.daemon = True
+        thread.start()
+        try:
+            with pytest.raises(_BundleNotFound):
+                urllib_bundle_http_get(f"http://127.0.0.1:{port}/missing.bundle")
+        finally:
+            server.shutdown()
+            thread.join(timeout=5)
+
+    def test_urllib_http_get_500_raises(self) -> None:
+        """Production HttpGet transport: a 5xx status must raise (not return
+        the error-page body as if it were a successful fetch)."""
+        import http.server
+        import threading
+
+        class _Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                self.send_response(500)
+                self.end_headers()
+
+            def log_message(self, *args: object) -> None:
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), _Handler)
+        port = server.server_address[1]
+        thread = threading.Thread(target=server.serve_forever)
+        thread.daemon = True
+        thread.start()
+        try:
+            with pytest.raises(Exception):  # noqa: B017 - any exception ⇒ "fetch failed"
+                urllib_http_get(f"http://127.0.0.1:{port}/index.kdl")
+        finally:
+            server.shutdown()
+            thread.join(timeout=5)
 
 
 # ---------------------------------------------------------------------------

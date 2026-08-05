@@ -299,8 +299,11 @@ def _run_bytes_through_real_fetcher(
     straight to the real extractor.
     """
 
-    def _http_get_from_bytes(_url: str) -> bytes:
-        return archive_bytes
+    def _http_get_from_bytes(_url: str, dest: Path) -> None:
+        # H3 (docs/rfc-native-oci-fetch.md §3.3): TarballFetcher's HttpGet
+        # seam is Path-based, not bytes-returning — write the already-loaded
+        # fixture bytes to the dest path the real fetcher supplies.
+        dest.write_bytes(archive_bytes)
 
     fetcher = TarballFetcher(http_get=_http_get_from_bytes)
     receipt = fetcher.fetch(

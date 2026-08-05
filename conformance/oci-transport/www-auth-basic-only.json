@@ -1,0 +1,16 @@
+{
+  "description": "WWW-Authenticate carries only a Basic challenge -> FETCH-OCI-PULL-FAILED, phase=token, distinguishable 'unsupported auth scheme' message.",
+  "exchanges": [
+    {
+      "method": "GET",
+      "url": "https://ghcr.io/v2/",
+      "response": {
+        "status": 401,
+        "headers": {
+          "WWW-Authenticate": "Basic realm=\"registry.example\"",
+          "Content-Length": "0"
+        }
+      }
+    }
+  ]
+}

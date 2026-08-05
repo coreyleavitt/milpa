@@ -66,18 +66,23 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import io
 import os
 import sys
-import urllib.error
-import urllib.request
 from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import urlparse, urlunparse
 
+from milpa import bounded_http
 from milpa.atomic_cache import atomic_write_bytes as _atomic_write_bytes
 from milpa.atomic_cache import unique_temp_path as _unique_temp_path
-from milpa.errors import MILPA_INDEX_UNREACHABLE, MILPA_INTERNAL, MilpaError
+from milpa.errors import (
+    FETCH_DOWNLOAD_FAILED,
+    MILPA_INDEX_UNREACHABLE,
+    MILPA_INTERNAL,
+    MilpaError,
+)
 
 if TYPE_CHECKING:
     from milpa.epoch_commitment import EpochCommitmentStatus
@@ -104,6 +109,29 @@ DEFAULT_TTL_SECONDS: int = 24 * 60 * 60
 _BUNDLE_404_SENTINEL = "BUNDLE-404"
 
 # ---------------------------------------------------------------------------
+# RFC docs/rfc-native-oci-fetch.md §3.3/§3.5 — download caps for the
+# production transports below.  Both were UNCAPPED before this migration
+# (a bare ``resp.read()``); bounded_http.request requires an explicit cap on
+# every call.
+# ---------------------------------------------------------------------------
+
+#: Maximum bytes accepted for the tianguis package index document itself.
+#: The index is KDL text listing every published package; today's real
+#: index is comfortably under 1 MiB, but the registry is expected to grow
+#: over the project's lifetime.  32 MiB is a generous ceiling — orders of
+#: magnitude beyond any plausible near-term index size — that still bounds
+#: the resource-exhaustion surface of a compromised or misconfigured
+#: MILPA_INDEX_URL.
+_INDEX_MAX_BYTES: int = 32 * 1024 * 1024  # 32 MiB
+
+#: Maximum bytes accepted for the index's own Sigstore attestation bundle
+#: (cert chain + inclusion proof + SET).  Mirrors entry_bundle_store.py's
+#: sizing rationale for per-entry bundles (the same kind of artifact): 4 MiB
+#: is a conservative ceiling pending real-corpus measurement, meaningfully
+#: larger than the KDL index text itself would need but still bounded.
+_INDEX_BUNDLE_MAX_BYTES: int = 4 * 1024 * 1024  # 4 MiB
+
+# ---------------------------------------------------------------------------
 # Transport types
 # ---------------------------------------------------------------------------
 
@@ -120,6 +148,25 @@ BundleHttpGet = Callable[[str], bytes]
 
 class _BundleNotFound(Exception):
     """Raised by ``bundle_http_get`` when the bundle URL returns HTTP 404."""
+
+
+def _transport_exc_text(exc: Exception) -> str:
+    """Human-readable text for a transport failure, embeddable in a warning
+    or error message without leaking MilpaError's ``"milpa-error: SLUG — "``
+    wire-format prefix (``MilpaError.__init__``, errors.py).
+
+    R3 requires the State-3 offline-fallback warning to never contain a
+    'milpa-error:' line (test_offline_fallback_warning_no_milpa_error_line).
+    Before the native-transport migration (docs/rfc-native-oci-fetch.md
+    §3.3), ``http_get``/``bundle_http_get`` failures were plain
+    ``urllib.error.URLError``/``OSError`` instances whose ``str()`` was
+    already clean.  ``bounded_http.request`` raises ``MilpaError`` on the
+    same failures instead, and ``str(MilpaError(...))`` embeds that reserved
+    prefix — so callers that fold a caught exception's text into a
+    higher-level message must go through this helper instead of a bare
+    ``str(exc)``.
+    """
+    return exc.message if isinstance(exc, MilpaError) else str(exc)
 
 
 # ---------------------------------------------------------------------------
@@ -852,7 +899,7 @@ def load_index(
     try:
         fetched_bytes = http_get(url)
     except Exception as exc:
-        fetch_error = str(exc)
+        fetch_error = _transport_exc_text(exc)
 
     if fetch_error is not None:
         # Network failed.
@@ -1194,7 +1241,7 @@ def _refetch_with_recovery(
     try:
         fetched_bytes = http_get(url)
     except Exception as exc:
-        fetch_error = str(exc)
+        fetch_error = _transport_exc_text(exc)
 
     if fetch_error is not None:
         raise MilpaError(
@@ -1291,30 +1338,50 @@ def _refetch_with_recovery(
 
 
 def urllib_http_get(url: str) -> bytes:
-    """Production ``HttpGet`` transport using ``urllib``.
+    """Production ``HttpGet`` transport using ``bounded_http.request``
+    (RFC docs/rfc-native-oci-fetch.md §3.3) — the in-process transport that
+    replaced the direct ``urllib.request.urlopen`` call (and its unbounded
+    ``resp.read()``).
 
     Supports ``http://``, ``https://``, and ``file://`` schemes.
-    Returns raw bytes (index_cache.py now uses bytes throughout).
-    On any error raises an exception whose ``str()`` is used in the
-    ``MILPA-INDEX-UNREACHABLE`` message.
+    Returns raw bytes (index_cache.py now uses bytes throughout), capped at
+    ``_INDEX_MAX_BYTES``.  Raises ``MilpaError(FETCH_DOWNLOAD_FAILED)`` on a
+    non-2xx HTTP status or a transport failure — callers treat any raised
+    exception here as "fetch failed" (see ``load_index``'s State 3/4
+    handling, and ``_transport_exc_text`` for how its text reaches the
+    offline-fallback warning without leaking the MilpaError wire prefix).
     """
-    with urllib.request.urlopen(url) as resp:  # noqa: S310 — URL is user-controlled; known risk
-        return resp.read()
+    sink = io.BytesIO()
+    resp = bounded_http.request("GET", url, cap=_INDEX_MAX_BYTES, sink=sink)
+    # file:// responses carry no HTTP status (bounded_http leaves it None) —
+    # only a genuine HTTP error status is a failure here.
+    if resp.status is not None and resp.status >= 400:
+        raise MilpaError(
+            FETCH_DOWNLOAD_FAILED,
+            f"fetching index from {url!r} failed: HTTP {resp.status}",
+            url=url,
+        )
+    return sink.getvalue()
 
 
 def urllib_bundle_http_get(url: str) -> bytes:
-    """Production ``BundleHttpGet`` transport using ``urllib``.
+    """Production ``BundleHttpGet`` transport using ``bounded_http.request``
+    (RFC docs/rfc-native-oci-fetch.md §3.3).
 
-    Raises ``_BundleNotFound`` on HTTP 404; raises other ``Exception`` on
-    other network errors.
+    Raises ``_BundleNotFound`` on HTTP 404; raises ``MilpaError`` on any
+    other network or HTTP-status failure, capped at ``_INDEX_BUNDLE_MAX_BYTES``.
     """
-    try:
-        with urllib.request.urlopen(url) as resp:  # noqa: S310
-            return resp.read()
-    except urllib.error.HTTPError as exc:
-        if exc.code == 404:
-            raise _BundleNotFound(f"bundle not found at {url!r}: HTTP 404") from exc
-        raise
+    sink = io.BytesIO()
+    resp = bounded_http.request("GET", url, cap=_INDEX_BUNDLE_MAX_BYTES, sink=sink)
+    if resp.status == 404:
+        raise _BundleNotFound(f"bundle not found at {url!r}: HTTP 404")
+    if resp.status is not None and resp.status >= 400:
+        raise MilpaError(
+            FETCH_DOWNLOAD_FAILED,
+            f"fetching bundle from {url!r} failed: HTTP {resp.status}",
+            url=url,
+        )
+    return sink.getvalue()
 
 
 # ---------------------------------------------------------------------------

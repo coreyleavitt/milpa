@@ -398,12 +398,24 @@ working-tree checkout instead violates all three predicates simultaneously.
 > post-admission stat bounds disk usage, but a 4 GiB buffered response already
 > exhausts memory before the stat runs.
 
-> NORMATIVE: `OciFetcher` downloads artifacts via `oras pull`, which does not
-> route through milpa's HTTP layer. The streaming compressed-byte cap does not
-> apply to `OciFetcher`. Its bounded guarantee comes from (a) OCI
-> digest-pinning at the registry (the registry verifies the digest before
-> serving content), and (b) the admission-chokepoint stat and the
-> `extract_tar` `EXTRACT-SIZE-LIMIT` applied to the pulled artifact.
+> NORMATIVE: `OciFetcher`'s blob fetch routes through milpa's native HTTP
+> transport (§2.4.5) exactly like the tarball fetcher, and MUST enforce the
+> same **fixed** compressed-byte streaming cap this section defines —
+> `MAX_COMPRESSED_BYTES`, applied at the streaming boundary before the
+> response body is fully buffered. There is no OCI-specific exemption from
+> this cap: an oversized-blob DoS is exactly what the streaming cap closes
+> for tarball, and a native OCI blob GET is not structurally different from
+> a tarball GET. The token and manifest requests preceding the blob fetch
+> (§2.4.5's redirect-stripping clause covers all three) are additionally
+> bounded under a small, fixed cap of their own — these are always small
+> JSON documents, never an unbounded stream. The full token → manifest →
+> blob phase decomposition and the per-phase cap values are normatively
+> specified in `spec/registry-protocol.md` §7, not restated here; this
+> clause states only that OCI is not exempt from the cap this section
+> defines. (Historical note: an earlier draft of this section exempted
+> `OciFetcher` on the premise that it shelled out to `oras pull`, bypassing
+> milpa's HTTP layer entirely. That premise no longer holds — §2.4.5 records
+> the native-transport decision — and the exemption is struck accordingly.)
 
 ### 2.4.3  Archive-extracting fetchers
 
@@ -447,6 +459,48 @@ working-tree checkout instead violates all three predicates simultaneously.
 > treated as already-decompressed plain tar. An unrecognized stream MUST NOT be
 > handed to an autodetecting tar reader that would decompress it outside the
 > cap — in particular a `.tar.lzma` stream MUST NOT reach such a reader.
+
+### 2.4.5  Transport backend (native, no consumer-side shell-out)
+
+> NOTE: milpa's consumer-side network fetches — the tianguis index, index
+> bundles, dep-decl and entry-bundle metadata, tarball artifacts, and OCI
+> artifacts — are served by **one native in-process HTTP transport** per impl.
+> A conformant consumer MUST NOT shell out to an external process (`curl`,
+> `oras`, …) to perform these fetches; the transport is the same coupling milpa
+> otherwise refuses (nimscript evaluation, `config.nims` emission). Publish/push
+> tooling that runs in a controlled CI environment MAY still use `oras`
+> (non-consumer, out of scope for this contract). Decided in RFC
+> `docs/rfc-native-oci-fetch.md` F1 (broad). The reference impls back this with
+> Rust `ureq` + `rustls` and Python stdlib `urllib` (F2); the library is an impl
+> choice, the in-process property is the contract.
+
+> NOTE: the native transport MUST reach **parity** with the shell-outs it
+> replaces, not silently regress (RFC §0.1). It MUST honor the standard proxy
+> environment variables (`HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY`), trust the
+> host OS certificate store (so enterprise / MITM-proxy roots and OS cert updates
+> keep working), and apply conservative connect/read timeouts (an in-process call
+> with no timeout blocks a resolver worker forever — strictly worse than an
+> interruptible subprocess). There is no dual-transport rollback shim
+> (no-legacy-support pre-v1): once the shell-outs are removed the native path is
+> the only path.
+
+> NORMATIVE: On an HTTP redirect, an HTTP-backed fetcher's transport MUST strip
+> the `Authorization` header unless the redirect target's **origin — `(scheme,
+> host, port)`** — exactly matches the original request's origin. A host-only
+> check is insufficient: it would forward a bearer token across a same-host
+> scheme downgrade (`https` → `http`) in cleartext, or across a port change.
+> This protects the OCI bearer token, which ghcr 307-redirects a blob GET to a
+> CDN host that authenticates via a self-contained presigned URL and does not
+> need the token.
+
+> NOTE: the token/manifest/blob transport state machine is **not exercisable
+> through a black-box conformance fixture** — under `MILPA_MOCKED_FETCHES` the
+> OCI fetcher is replaced wholesale, so the corpus and the differential harness
+> cannot observe transport phases. This is a known, accepted limitation (RFC
+> §3.7). Cross-impl parity for the transport is provided at the **unit tier** by
+> a shared canned-transport contract at `conformance/oci-transport/` (a sibling
+> of, and deliberately outside, `conformance/spec-v<N>/`) that both impls'
+> OCI-client unit tests replay through their injected transport.
 
 ---
 

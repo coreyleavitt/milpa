@@ -73,6 +73,11 @@ from milpa.errors import (
 )
 from milpa.fetchers.git import enumerate_git_entries, parse_ls_tree_z
 from milpa.fetchers.oci import OciProvenance, validate_oci_field
+from milpa.fetchers.oci_client import (
+    EMPTY_CONFIG_MEDIA_TYPE,
+    SOURCE_ARTIFACT_TYPE,
+    SOURCE_LAYER_MEDIA_TYPE,
+)
 from milpa.fetchers.safe_extract import _normalize_lexical
 from milpa.manifest import parse_manifest
 from milpa.registry import _RE_SHA256_DIGEST
@@ -706,7 +711,9 @@ def pack_source(entries: list[MaterializedEntry]) -> bytes:
 
 
 # ---------------------------------------------------------------------------
-# parse_oras_digest_json + make_oras_push (S3b) — producer dual of make_oras_pull
+# parse_oras_digest_json + make_oras_push (S3b) — producer dual of the
+# consumer-side OCI pull (``milpa.fetchers.oci.OciFetcher``, native client
+# as of S6)
 # ---------------------------------------------------------------------------
 
 
@@ -778,17 +785,19 @@ def parse_oras_digest_json(stdout: str) -> str:
 #: ``registry/repository:tag`` (or ``@digest``) reference, an OCI
 #: artifact-type media type, and a layer media type, pushes the artifact and
 #: returns the resulting manifest digest (``sha256:<64-hex>``), or raises
-#: ``MilpaError(PUBLISH_OCI_PUSH_FAILED, …)``. Producer dual of ``OciPull``
-#: (``milpa.fetchers.oci``).
+#: ``MilpaError(PUBLISH_OCI_PUSH_FAILED, …)``. Producer dual of the consumer
+#: pull path (``milpa.fetchers.oci.OciFetcher`` / ``OciRegistryClient``).
 OrasPush = Callable[[Path, str, str, str], str]
 
 
 def make_oras_push() -> OrasPush:
     """Return a production ``OrasPush`` backed by ``oras push``.
 
-    Mirrors ``make_oras_pull``'s (``milpa.fetchers.oci``) subprocess/error-
-    wrapping style exactly, as the producer dual: this pushes rather than
+    The producer dual of the consumer pull path: this pushes rather than
     pulls, and raises the ``PUBLISH-*`` domain rather than ``FETCH-OCI-*``.
+    (The consumer side no longer shells out to ``oras`` as of the native
+    ``OciRegistryClient`` — S6 — but the push side is out of scope for that
+    migration; see docs/rfc-native-oci-fetch.md §3.5.)
 
     Validation precedes the subprocess (registry-protocol.md §4 discipline):
     every user-supplied token (``registry_ref``, ``artifact_type``,
@@ -797,10 +806,11 @@ def make_oras_push() -> OrasPush:
     ``-``) never reaches ``oras`` argv and fails deterministically without
     needing the ``oras`` binary on ``PATH`` at all.
 
-    **Accepted test gap** (mirrors ``make_oras_pull``, which has no argv
-    test either): the production subprocess invocation itself is not
-    unit-tested under milpa's no-mock house style — real coverage of the
-    real ``oras`` binary is the N1/T1 E2E, not a unit test.
+    **Accepted test gap** (mirrors ``make_oras_push``'s sibling subprocess
+    seams, none of which have an argv test): the production subprocess
+    invocation itself is not unit-tested under milpa's no-mock house
+    style — real coverage of the real ``oras`` binary is the N1/T1 E2E,
+    not a unit test.
     """
 
     def _push(
@@ -879,10 +889,10 @@ def make_cosign_sign() -> CosignSign:
     comes from the ambient CI OIDC token at E2E time (the same mechanism
     tianguis's cosign steps use).
 
-    **Accepted test gap** (mirrors ``make_oras_pull``/``make_oras_push``,
-    neither of which has an argv test): the production subprocess invocation
-    itself is not unit-tested under milpa's no-mock house style — real
-    coverage of the real ``cosign`` binary is the N1/T1 E2E, not a unit test.
+    **Accepted test gap** (mirrors ``make_oras_push``, which has no argv
+    test either): the production subprocess invocation itself is not
+    unit-tested under milpa's no-mock house style — real coverage of the
+    real ``cosign`` binary is the N1/T1 E2E, not a unit test.
     """
 
     def _sign(oci_ref: str) -> None:
@@ -972,14 +982,55 @@ def make_oras_manifest_fetch() -> OrasManifestFetch:
 
 
 def _extract_layer_digest(manifest: dict, oci_ref: str) -> str:
-    """Extract the single layer's ``digest`` field from a fetched manifest.
+    """Extract the single milpa source-layer's ``digest`` field from a fetched
+    manifest.
 
-    Guards defensively against a malformed/unexpected manifest shape (missing
-    or empty ``"layers"``, a first layer with no usable ``"digest"``) — every
-    failure mode raises ``PUBLISH-MANIFEST-FETCH-FAILED`` rather than a bare
-    ``KeyError``/``IndexError``/``TypeError``.
+    Mirrors the pull-side gate (``select_source_layer`` in
+    ``milpa.fetchers.oci_client``) — defense in depth on both ends of a format
+    milpa fully owns: the publisher's own tool must not emit an artifact shape
+    the puller would reject as ``FETCH-OCI-NO-TARBALL`` /
+    ``FETCH-OCI-AMBIGUOUS-TARBALL``. Requires (RFC ``rfc-native-oci-fetch.md``
+    §3.2 step 3):
+
+      - ``artifactType`` is either absent or exactly ``SOURCE_ARTIFACT_TYPE``;
+      - the config descriptor's ``mediaType`` is either absent or exactly the
+        empty-config media type;
+      - exactly one layer of ``SOURCE_LAYER_MEDIA_TYPE``.
+
+    Guards defensively against every malformed/unexpected manifest shape
+    (non-object manifest, missing/empty ``"layers"``, wrong artifact/config/
+    layer media types, more than one matching layer, a matching layer with no
+    usable ``"digest"``) — every failure mode raises
+    ``PUBLISH-MANIFEST-FETCH-FAILED`` rather than a bare
+    ``KeyError``/``IndexError``/``TypeError`` or a silently-wrong layer.
     """
-    layers = manifest.get("layers") if isinstance(manifest, dict) else None
+    if not isinstance(manifest, dict):
+        raise MilpaError(
+            PUBLISH_MANIFEST_FETCH_FAILED,
+            f"manifest for {oci_ref!r} is not a JSON object",
+            reference=oci_ref,
+        )
+
+    artifact_type = manifest.get("artifactType")
+    if artifact_type is not None and artifact_type != SOURCE_ARTIFACT_TYPE:
+        raise MilpaError(
+            PUBLISH_MANIFEST_FETCH_FAILED,
+            f"manifest for {oci_ref!r} has unexpected artifactType "
+            f"{artifact_type!r} (expected {SOURCE_ARTIFACT_TYPE!r})",
+            reference=oci_ref,
+        )
+
+    config = manifest.get("config")
+    config_media_type = config.get("mediaType") if isinstance(config, dict) else None
+    if config_media_type is not None and config_media_type != EMPTY_CONFIG_MEDIA_TYPE:
+        raise MilpaError(
+            PUBLISH_MANIFEST_FETCH_FAILED,
+            f"manifest for {oci_ref!r} has unexpected config mediaType "
+            f"{config_media_type!r} (expected {EMPTY_CONFIG_MEDIA_TYPE!r})",
+            reference=oci_ref,
+        )
+
+    layers = manifest.get("layers")
     if not isinstance(layers, list) or not layers:
         raise MilpaError(
             PUBLISH_MANIFEST_FETCH_FAILED,
@@ -988,12 +1039,25 @@ def _extract_layer_digest(manifest: dict, oci_ref: str) -> str:
             reference=oci_ref,
         )
 
-    first_layer = layers[0]
-    digest = first_layer.get("digest") if isinstance(first_layer, dict) else None
+    source_layers = [
+        layer
+        for layer in layers
+        if isinstance(layer, dict) and layer.get("mediaType") == SOURCE_LAYER_MEDIA_TYPE
+    ]
+    if len(source_layers) != 1:
+        raise MilpaError(
+            PUBLISH_MANIFEST_FETCH_FAILED,
+            f"manifest for {oci_ref!r} does not have exactly one "
+            f"{SOURCE_LAYER_MEDIA_TYPE!r} layer (found {len(source_layers)} "
+            f"of {len(layers)} total)",
+            reference=oci_ref,
+        )
+
+    digest = source_layers[0].get("digest")
     if not isinstance(digest, str) or not digest:
         raise MilpaError(
             PUBLISH_MANIFEST_FETCH_FAILED,
-            f"manifest for {oci_ref!r}'s first layer has no usable 'digest' field",
+            f"manifest for {oci_ref!r}'s source layer has no usable 'digest' field",
             reference=oci_ref,
         )
     return digest

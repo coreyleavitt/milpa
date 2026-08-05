@@ -20,7 +20,25 @@
 //! Path-escape checks are **lexical** (the target doesn't exist yet, so
 //! `canonicalize` can't be used) — `..` is resolved by popping, then a prefix
 //! check against the canonicalized `dest`.
+//!
+//! [`extract_tar`] reads its archive from a generic `R: Read` (#202,
+//! `docs/rfc-native-oci-fetch.md` §3.3) rather than a fully-materialized
+//! `&[u8]`: the fetcher call sites (`fetchers::fetch_tarball_with_decomp_cap`,
+//! `fetchers::pull_and_extract_oci`) feed a decompressing reader straight off
+//! the downloaded scratch file, so the whole (de)compressed archive is never
+//! held in memory at once — peak memory is bounded by the largest tar member,
+//! not the archive size. The USTAR reader ([`TarEntries`]) pulls one 512-byte
+//! header block at a time and materializes only the CURRENT entry's data
+//! (pre-checked against a per-entry byte cap before allocating, so a
+//! maliciously/corruptly huge declared size can't itself trigger an
+//! allocation-DoS); non-data-bearing entries (dirs/symlinks/hardlinks) are
+//! skipped via a fixed-size scratch buffer, never allocated at all. Callers
+//! that already hold the whole archive as `&[u8]` (e.g.
+//! [`tar_materialize_entries`], which needs every entry simultaneously to
+//! build the epoch-2 DAG) simply wrap it in a [`std::io::Cursor`] — one reader
+//! implementation, not two parallel parsers.
 
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 use crate::error::MilpaError;
@@ -83,11 +101,104 @@ fn extract_err(code: &'static str, message: impl Into<String>) -> MilpaError {
     MilpaError::Fetch(FetchError::Extract(code, message.into()))
 }
 
-/// Extract the (already-decompressed) tar bytes `tar` into `dest`. See the module
-/// docs for the guards. Partial extraction state on error is the caller's to
-/// clean up (typically: remove `dest`).
-pub fn extract_tar(
-    tar: &[u8],
+/// Marker wrapped in an `io::Error` by a streaming decompressor's cap-
+/// enforcing `Read` wrapper (`fetchers::CappedReader`, the SA-1 decompression-
+/// bomb guard's pull-based sibling to `fetchers::LimitedWriter`) once the
+/// decompression-bomb cap is exceeded mid-stream. `TarEntries`'s read helpers
+/// (below) recognize this via [`is_decomp_cap_exceeded`] and raise
+/// `EXTRACT-SIZE-LIMIT` — a deliberate cap trip is "the archive is bigger than
+/// policy allows", not "the archive is corrupt" (`FETCH-EXTRACT-FAILED`), and
+/// the two must stay distinguishable even though decompression and extraction
+/// are now interleaved in a single streaming pass (#202) instead of two
+/// separate phases with their own independent error returns.
+#[derive(Debug)]
+pub(crate) struct DecompCapExceeded;
+
+impl std::fmt::Display for DecompCapExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "decompression cap exceeded")
+    }
+}
+
+impl std::error::Error for DecompCapExceeded {}
+
+/// `true` if `e` was raised by a `CappedReader` hitting its decompression-bomb
+/// cap (as opposed to a genuine I/O failure or archive corruption).
+fn is_decomp_cap_exceeded(e: &std::io::Error) -> bool {
+    e.get_ref()
+        .map(|inner| inner.is::<DecompCapExceeded>())
+        .unwrap_or(false)
+}
+
+/// Classify a genuine stream-read error into the two-way split shared by
+/// every raw `Read` call site in this module: a `CappedReader`
+/// decompression-bomb trip is `EXTRACT-SIZE-LIMIT` (a deliberate policy cap,
+/// not corruption); anything else is a real I/O failure → `FETCH-EXTRACT-
+/// FAILED`. `read_entry_data`'s `read_exact` additionally distinguishes a
+/// true short-read (`UnexpectedEof`, a declared-size entry running past the
+/// end of the archive) with its own message — that one extra case lives at
+/// its call site, but its final "genuine I/O error" arm, plus `read_header`'s
+/// and `skip_exact`'s, and the post-loop trailing-data drain (below), all
+/// share this single two-way classification rather than repeating the same
+/// `if is_decomp_cap_exceeded(&e) { .. } else { .. }` match a fourth/fifth
+/// time.
+fn classify_stream_read_error(e: std::io::Error, context: impl std::fmt::Display) -> MilpaError {
+    if is_decomp_cap_exceeded(&e) {
+        extract_err(
+            "EXTRACT-SIZE-LIMIT",
+            "decompressed archive exceeds cap; possible decompression bomb",
+        )
+    } else {
+        extract_err("FETCH-EXTRACT-FAILED", format!("{context}: {e}"))
+    }
+}
+
+/// Drain `reader` to EOF, discarding bytes.
+///
+/// Security fix (decompression-bomb cap bypass via trailing data after the
+/// tar terminator, `docs/rfc-native-oci-fetch.md` §3.3): `TarEntries::next()`
+/// returns `None` the instant `read_header` sees a clean end-of-archive —
+/// either the all-zero marker block or a short final read — and nothing
+/// afterward reads any further from the underlying stream. When that stream
+/// is a `CappedReader`-wrapped decompressor (`fetchers::open_streaming_tar` /
+/// `pull_and_extract_oci`), any compressed data appended AFTER a well-formed
+/// tar is therefore never read, hence never decompressed, hence never
+/// counted by the decompression-bomb cap — silently narrowing the cap's
+/// guarantee to "the bytes inside tar entries" instead of "the whole
+/// decompressed stream".
+///
+/// Called by `extract_tar` immediately after its entry-reading loop finishes
+/// normally, so every caller (streaming OCI/tarball pulls AND the buffered
+/// `Cursor`-backed callers, for which this is simply reading the rest of an
+/// already-in-memory buffer) gets the same "cap covers everything" guarantee
+/// uniformly, in the one place the archive is read. Reads through a
+/// fixed-size scratch buffer — never an allocation proportional to the
+/// trailing data's size — so a legitimate archive's ordinary end-of-archive
+/// padding (a few hundred bytes) drains cheaply, while a hostile trailer
+/// decompresses (and is counted) only up to the cap before `CappedReader`
+/// trips it.
+fn drain_to_eof<R: Read>(mut reader: R) -> Result<(), MilpaError> {
+    let mut scratch = [0u8; 8192];
+    loop {
+        match reader.read(&mut scratch) {
+            Ok(0) => return Ok(()),
+            Ok(_) => continue,
+            Err(e) => return Err(classify_stream_read_error(e, "draining trailing archive data")),
+        }
+    }
+}
+
+/// Extract a (decompressed) tar stream `tar` into `dest`. See the module docs
+/// for the guards. Partial extraction state on error is the caller's to clean
+/// up (typically: remove `dest`).
+///
+/// `tar` is a generic `R: Read` (#202) rather than `&[u8]` — callers that
+/// already have the whole archive buffered can pass `&buf[..]` (or wrap it in
+/// [`std::io::Cursor`]); streaming callers feed a decompressing reader
+/// directly so the archive is never fully materialized in memory (see the
+/// module docs).
+pub fn extract_tar<R: Read>(
+    tar: R,
     dest: &Path,
     strip_components: u32,
     limits: Limits,
@@ -131,7 +242,14 @@ pub fn extract_tar(
     };
 
     // Pass 1: dirs, regular files, symlinks — everything except hardlinks.
-    for entry in TarEntries::new(tar) {
+    // Bound to a local so the underlying reader (`tar_entries.src`) is still
+    // reachable after the loop, to drain any trailing data past the tar
+    // terminator (see `drain_to_eof`'s doc comment) — `&mut tar_entries`
+    // borrows for iteration instead of `TarEntries::new(..)` being consumed
+    // as a bare temporary that drops (taking the reader with it) the moment
+    // the loop ends.
+    let mut tar_entries = TarEntries::new(tar, limits.max_file_size);
+    for entry in &mut tar_entries {
         let entry = entry?;
 
         let stripped = match strip_name(&entry.name) {
@@ -236,6 +354,18 @@ pub fn extract_tar(
             EntryKind::Other => {} // char/block/fifo — never legitimate in source.
         }
     }
+
+    // Security fix (decompression-bomb cap bypass via trailing data after
+    // the tar terminator): `TarEntries::next()` above stopped reading `tar`
+    // the instant it saw the end-of-archive marker. Drain whatever remains
+    // so a `CappedReader`-wrapped decompressor (the streaming OCI/tarball
+    // callers) decompresses — and counts against the cap — the ENTIRE
+    // stream, not just the bytes inside tar entries. See `drain_to_eof`'s
+    // doc comment. For buffered `Cursor`/`&[u8]` callers (no cap, e.g. the
+    // unit tests and `tar_materialize_entries`'s own independent reader) this
+    // is just reading the remaining in-memory bytes to EOF — cheap and
+    // side-effect-free.
+    drain_to_eof(tar_entries.src)?;
 
     // Pass 2: hardlinks — copy bytes from now-guaranteed-existing targets.
     // (spec/plugin-contract.md §2.2: copy-bytes materialisation; linkname is
@@ -382,7 +512,7 @@ enum EntryKind {
     Other,
 }
 
-struct TarEntry<'a> {
+struct TarEntry {
     name: String,
     linkname: String,
     size: u64,
@@ -390,14 +520,30 @@ struct TarEntry<'a> {
     /// POSIX mode bits (header bytes 100..108, octal). Only the execute bits
     /// (`& 0o111`) are load-bearing for epoch-2 identity (§1.8.2.1).
     mode: u32,
-    data: &'a [u8],
+    /// Populated for `File` entries and the GNU-LongLink/PAX control types
+    /// (`L`/`K`/`x`/`X`, whose payload is a filename, consumed internally by
+    /// `TarEntries` and never surfaced as a real entry); empty for
+    /// `Dir`/`Symlink`/`HardLink`/`Other`, whose content (if any — normally
+    /// `size == 0`) is skipped rather than buffered (#202).
+    data: Vec<u8>,
 }
 
-/// Iterate the entries of an uncompressed tar byte stream. Yields a coded
-/// `EXTRACT-*` error on a truncated/garbled header.
-struct TarEntries<'a> {
-    buf: &'a [u8],
-    pos: usize,
+/// Iterate the entries of an uncompressed tar stream, reading from a generic
+/// `R: Read` one 512-byte header block at a time (#202 — no longer requires
+/// the whole archive materialized as `&[u8]`; see the module docs). Yields a
+/// coded `EXTRACT-*` error on a truncated/garbled header.
+struct TarEntries<R: Read> {
+    src: R,
+    /// Per-entry byte cap enforced BEFORE allocating a buffer for an entry's
+    /// data (`read_entry_data`) — guards against a maliciously/corruptly huge
+    /// declared `size` field triggering an allocation-DoS via
+    /// `Vec::with_capacity`/`vec![0u8; n]` before the read even starts.
+    /// `extract_tar` passes `limits.max_file_size` (a single entry can never
+    /// legitimately exceed the whole-archive per-file cap);
+    /// `tar_materialize_entries` passes the length of its already-in-memory
+    /// input buffer (a single entry can never legitimately exceed the buffer
+    /// it's sliced from).
+    max_entry_bytes: u64,
     /// Pending GNU LongLink name override (next real entry uses this as name).
     pending_name: Option<String>,
     /// Pending GNU LongLink linkname override.
@@ -408,16 +554,123 @@ struct TarEntries<'a> {
     pending_pax_linkname: Option<String>,
 }
 
-impl<'a> TarEntries<'a> {
-    fn new(buf: &'a [u8]) -> Self {
+impl<R: Read> TarEntries<R> {
+    fn new(src: R, max_entry_bytes: u64) -> Self {
         TarEntries {
-            buf,
-            pos: 0,
+            src,
+            max_entry_bytes,
             pending_name: None,
             pending_linkname: None,
             pending_pax_name: None,
             pending_pax_linkname: None,
         }
+    }
+
+    /// Read the next 512-byte header block. `Ok(Some(_))` on a full block
+    /// that isn't the all-zero end-of-archive marker; `Ok(None)` on a clean
+    /// end — EITHER an all-zero block OR fewer than 512 bytes available
+    /// before EOF (a truncated trailer with no proper end marker), matching
+    /// the original slice-based reader's lenient "insufficient bytes remain"
+    /// semantics: real-world tar writers vary on trailer padding, so a short
+    /// final read is treated as "no more entries", not an error.
+    fn read_header(&mut self) -> Result<Option<[u8; 512]>, MilpaError> {
+        let mut header = [0u8; 512];
+        let mut filled = 0usize;
+        while filled < 512 {
+            match self.src.read(&mut header[filled..]) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(e) => return Err(classify_stream_read_error(e, "reading tar header")),
+            }
+        }
+        if filled < 512 {
+            return Ok(None);
+        }
+        if header.iter().all(|&b| b == 0) {
+            return Ok(None);
+        }
+        Ok(Some(header))
+    }
+
+    /// Read exactly `n` bytes of an entry's data into an owned buffer,
+    /// pre-checking `n` against `max_entry_bytes` BEFORE allocating (see the
+    /// field doc on `max_entry_bytes`). `raw_name` is the raw USTAR name
+    /// field, used only for error messages (matching the original reader's
+    /// convention of naming the entry from the not-yet-long-path-resolved
+    /// header field at this point in parsing).
+    fn read_entry_data(&mut self, n: u64, raw_name: &str) -> Result<Vec<u8>, MilpaError> {
+        if n > self.max_entry_bytes {
+            return Err(extract_err(
+                "EXTRACT-SIZE-LIMIT",
+                format!(
+                    "tar entry {raw_name:?} declared size ({n} bytes) exceeds the per-entry \
+                     cap ({} bytes); rejected before buffering",
+                    self.max_entry_bytes
+                ),
+            ));
+        }
+        // R1-19: checked convert so a 32-bit target (or an `n` that slipped
+        // past the cap check above because `max_entry_bytes` itself is huge)
+        // does not silently truncate.
+        let n_usize: usize = match n.try_into() {
+            Ok(v) => v,
+            Err(_) => {
+                return Err(extract_err(
+                    "EXTRACT-SIZE-LIMIT",
+                    format!(
+                        "tar entry {raw_name:?} size {n} overflows platform usize \
+                         (archive is malformed or targets a larger address space)"
+                    ),
+                ));
+            }
+        };
+        let mut buf = vec![0u8; n_usize];
+        self.src.read_exact(&mut buf).map_err(|e| {
+            if !is_decomp_cap_exceeded(&e) && e.kind() == std::io::ErrorKind::UnexpectedEof {
+                // `read_exact` reports a true short-read (the underlying
+                // reader hit clean EOF before filling the buffer) as
+                // `UnexpectedEof` — matches `skip_exact`'s `Ok(0)` case: the
+                // archive is simply truncated, not corrupt mid-stream. This
+                // is the one case `classify_stream_read_error`'s generic
+                // two-way split doesn't cover, so it stays inline here.
+                extract_err(
+                    "EXTRACT-SIZE-LIMIT",
+                    format!("tar entry {raw_name:?} data ({n} bytes) runs past end of archive: {e}"),
+                )
+            } else {
+                classify_stream_read_error(e, format!("reading tar entry {raw_name:?} data ({n} bytes)"))
+            }
+        })?;
+        Ok(buf)
+    }
+
+    /// Discard `n` bytes from the stream without materializing them — used
+    /// for the tar padding after every entry, and for the full data segment
+    /// of non-data-bearing kinds (Dir/Symlink/HardLink/Other), whose content
+    /// (if any) the extractor never reads. Memory-safe regardless of `n`'s
+    /// magnitude: a fixed-size scratch buffer, never an allocation
+    /// proportional to `n`.
+    fn skip_exact(&mut self, mut n: u64, raw_name: &str) -> Result<(), MilpaError> {
+        let mut scratch = [0u8; 8192];
+        while n > 0 {
+            let chunk = if n >= scratch.len() as u64 { scratch.len() } else { n as usize };
+            match self.src.read(&mut scratch[..chunk]) {
+                Ok(0) => {
+                    return Err(extract_err(
+                        "EXTRACT-SIZE-LIMIT",
+                        format!("tar entry {raw_name:?} data runs past end of archive"),
+                    ));
+                }
+                Ok(read) => n -= read as u64,
+                Err(e) => {
+                    return Err(classify_stream_read_error(
+                        e,
+                        format!("skipping tar entry {raw_name:?} data"),
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -457,30 +710,24 @@ fn header_checksum_valid(header: &[u8]) -> bool {
     stored == signed_sum.unsigned_abs()
 }
 
-impl<'a> Iterator for TarEntries<'a> {
-    type Item = Result<TarEntry<'a>, MilpaError>;
+impl<R: Read> Iterator for TarEntries<R> {
+    type Item = Result<TarEntry, MilpaError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            // Need a full 512-byte header block.
-            if self.pos + 512 > self.buf.len() {
-                return None;
-            }
-            let header = &self.buf[self.pos..self.pos + 512];
-            // Two consecutive zero blocks (or one, leniently) end the archive.
-            if header.iter().all(|&b| b == 0) {
-                return None;
-            }
+            let header = match self.read_header() {
+                Ok(Some(h)) => h,
+                Ok(None) => return None,
+                Err(e) => return Some(Err(e)),
+            };
 
             // R6: validate USTAR header checksum BEFORE trusting any other field.
             // A corrupt-but-structurally-plausible header with a wrong checksum
             // must be rejected here rather than interpreted as file data and written
             // to disk.  Python's stdlib tarfile validates the checksum and raises
             // TarError → FETCH-EXTRACT-FAILED; this makes Rust match that behavior.
-            let header_arr: &[u8; 512] = header.try_into().unwrap();
-            if !header_checksum_valid(header_arr) {
+            if !header_checksum_valid(&header) {
                 let name = cstr(&header[0..100]).unwrap_or_default();
-                self.pos += 512; // consume the bad header block so we don't spin
                 return Some(Err(extract_err(
                     "FETCH-EXTRACT-FAILED",
                     format!(
@@ -501,45 +748,24 @@ impl<'a> Iterator for TarEntries<'a> {
                 }
             };
             let typeflag = header[156];
+            let raw_name = cstr(&header[0..100]).unwrap_or_default();
 
-            let data_start = self.pos + 512;
-            // R1-19: `size` is u64; convert to usize via checked try_into() so a
-            // 32-bit target or a maliciously crafted enormous size field does not
-            // silently truncate and bypass the subsequent bounds check.
-            let size_usize: usize = match size.try_into() {
-                Ok(n) => n,
-                Err(_) => {
-                    let name = cstr(&header[0..100]).unwrap_or_default();
-                    return Some(Err(extract_err(
-                        "EXTRACT-SIZE-LIMIT",
-                        format!(
-                            "tar entry {name:?} size {size} overflows platform usize \
-                             (archive is malformed or targets a larger address space)"
-                        ),
-                    )));
-                }
-            };
-            let data_end = data_start + size_usize;
-            if data_end > self.buf.len() {
-                let name = cstr(&header[0..100]).unwrap_or_default();
-                return Some(Err(extract_err(
-                    "EXTRACT-SIZE-LIMIT",
-                    format!("tar entry {name:?} data ({size} bytes) runs past end of archive"),
-                )));
-            }
-            let data = &self.buf[data_start..data_end];
-            // Advance past the data, padded up to the next 512 boundary.
+            // Padding to the next 512-byte boundary, per POSIX tar framing.
             let padded = size.div_ceil(512) * 512;
-            // R1-19: padded is derived from size (u64); checked convert for same reason.
-            let padded_usize: usize = padded.try_into().unwrap_or(usize::MAX);
-            self.pos = data_start + padded_usize;
+            let padding = padded - size;
 
             // --- GNU @LongLink (typeflag b'L' = long name, b'K' = long linkname) ---
             // The entry DATA is the NUL-terminated long name/linkname string.
             // Store it and loop to read the following header entry which is the
             // actual content entry (its own name field may be truncated; we override).
             if typeflag == b'L' {
-                // data bytes are the long name (NUL-terminated).
+                let data = match self.read_entry_data(size, &raw_name) {
+                    Ok(d) => d,
+                    Err(e) => return Some(Err(e)),
+                };
+                if let Err(e) = self.skip_exact(padding, &raw_name) {
+                    return Some(Err(e));
+                }
                 let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
                 if let Ok(s) = std::str::from_utf8(&data[..end]) {
                     self.pending_name = Some(s.to_string());
@@ -547,7 +773,13 @@ impl<'a> Iterator for TarEntries<'a> {
                 continue; // skip — consume the real next entry
             }
             if typeflag == b'K' {
-                // data bytes are the long linkname (NUL-terminated).
+                let data = match self.read_entry_data(size, &raw_name) {
+                    Ok(d) => d,
+                    Err(e) => return Some(Err(e)),
+                };
+                if let Err(e) = self.skip_exact(padding, &raw_name) {
+                    return Some(Err(e));
+                }
                 let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
                 if let Ok(s) = std::str::from_utf8(&data[..end]) {
                     self.pending_linkname = Some(s.to_string());
@@ -559,7 +791,14 @@ impl<'a> Iterator for TarEntries<'a> {
             // Format: NUL-terminated records of "<len> <key>=<value>\n".
             // We extract `path` and `linkpath` keys.
             if typeflag == b'x' || typeflag == b'X' {
-                parse_pax_headers(data, &mut self.pending_pax_name, &mut self.pending_pax_linkname);
+                let data = match self.read_entry_data(size, &raw_name) {
+                    Ok(d) => d,
+                    Err(e) => return Some(Err(e)),
+                };
+                if let Err(e) = self.skip_exact(padding, &raw_name) {
+                    return Some(Err(e));
+                }
+                parse_pax_headers(&data, &mut self.pending_pax_name, &mut self.pending_pax_linkname);
                 continue;
             }
 
@@ -610,6 +849,28 @@ impl<'a> Iterator for TarEntries<'a> {
             // POSIX mode bits (bytes 100..108, octal). Used only for the epoch-2
             // execute bit (§1.8.2.1); an unparseable field defaults to 0 (regular).
             let mode = octal(&header[100..108]).unwrap_or(0) as u32;
+
+            // Only File entries' content is needed downstream (written to disk
+            // by `extract_tar`, or hashed into `MaterializedEntry` by
+            // `tar_materialize_entries`) — buffer it (cap-checked). Every other
+            // kind's data segment (normally `size == 0`; symlink/hardlink
+            // targets live in the header `linkname` field, not here) is
+            // discarded via a fixed-size scratch buffer, never allocated
+            // proportional to `size` (#202).
+            let data = if kind == EntryKind::File {
+                match self.read_entry_data(size, &raw_name) {
+                    Ok(d) => d,
+                    Err(e) => return Some(Err(e)),
+                }
+            } else {
+                if let Err(e) = self.skip_exact(size, &raw_name) {
+                    return Some(Err(e));
+                }
+                Vec::new()
+            };
+            if let Err(e) = self.skip_exact(padding, &raw_name) {
+                return Some(Err(e));
+            }
 
             return Some(Ok(TarEntry {
                 name,
@@ -748,7 +1009,16 @@ pub fn tar_materialize_entries(
     // are collected (hardlink may forward-reference its target).
     let mut hardlinks: Vec<(String, String, u8)> = Vec::new();
 
-    for entry in TarEntries::new(tar) {
+    // The whole archive is already in memory (`tar: &[u8]`, every entry is
+    // needed simultaneously to build the DAG) — wrap it in a `Cursor` so
+    // `TarEntries` (generic over `Read`, #202) is the ONE USTAR-parsing
+    // implementation shared with the streaming `extract_tar`, not a second
+    // parallel parser. `tar.len()` is a correct, already-available per-entry
+    // cap: no single entry can legitimately exceed the buffer it's sliced
+    // from, so this never rejects a previously-valid archive — it only stops
+    // a corrupt/malicious declared size from driving an allocation before the
+    // (cheap, bounded) read itself would fail anyway.
+    for entry in TarEntries::new(std::io::Cursor::new(tar), tar.len() as u64) {
         let entry = entry?;
         let relpath = match strip_name(&entry.name) {
             Some(s) => s,
@@ -768,7 +1038,7 @@ pub fn tar_materialize_entries(
                 entries.push(MaterializedEntry {
                     relpath,
                     mode_byte: mode_byte(entry.mode),
-                    content: entry.data.to_vec(),
+                    content: entry.data,
                 });
             }
             EntryKind::HardLink => {

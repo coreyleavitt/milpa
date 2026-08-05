@@ -1905,8 +1905,11 @@ any conformant implementation.
 > at a fixture's local `index.kdl` (`MILPA_INDEX_URL=file:///abs/path/index.kdl`)
 > without standing up an HTTP server — the index analog of the
 > `MILPA_MOCKED_FETCHES` local fetch transport (§8.4). Both reference impls
-> handle the `file://` scheme natively (Python `urllib.request.urlopen`;
-> Rust `curl`).
+> handle the `file://` scheme as a direct filesystem read, independent of
+> the HTTP transport used for `http(s)://` (Python `urllib.request.urlopen`
+> handles `file://` itself; Rust reads the path directly via `std::fs::read`
+> rather than routing it through the native `ureq`-based transport, which is
+> HTTP-only — see `spec/plugin-contract.md` §2.4.5).
 
 > NOTE: See `spec/conformance-fixtures.md §2.2` for the harness-side contract:
 > the harness ALWAYS sets `MILPA_INDEX_URL`, either to a `file://` path (when

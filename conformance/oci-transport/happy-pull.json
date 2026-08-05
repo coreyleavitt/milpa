@@ -1,0 +1,55 @@
+{
+  "description": "Happy token -> manifest -> blob pull. Real sha256 digests: the blob body hashes to the manifest's layer digest, and the manifest bytes hash to the pinned manifest digest requested in the URL.",
+  "exchanges": [
+    {
+      "method": "GET",
+      "url": "https://ghcr.io/v2/",
+      "response": {
+        "status": 401,
+        "headers": {
+          "WWW-Authenticate": "Bearer realm=\"https://ghcr.io/token\",service=\"ghcr.io\"",
+          "Content-Length": "0"
+        }
+      }
+    },
+    {
+      "method": "GET",
+      "url": "https://ghcr.io/token?scope=repository%3Acoreyleavitt%2Ftest-pkg%3Apull&service=ghcr.io",
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": "{\"token\": \"test-token-abc\"}"
+      }
+    },
+    {
+      "method": "GET",
+      "url": "https://ghcr.io/v2/coreyleavitt/test-pkg/manifests/sha256:6c7eff827736f9e8cd7599ab2f401b651df5fac8a7a40078ad9761f616cd8f6a",
+      "expect_request_headers": {
+        "Authorization": "Bearer test-token-abc"
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/vnd.oci.image.manifest.v1+json"
+        },
+        "body": "{\n  \"schemaVersion\": 2,\n  \"mediaType\": \"application/vnd.oci.image.manifest.v1+json\",\n  \"layers\": [\n    {\n      \"mediaType\": \"application/vnd.milpa.source.v1.tar+gzip\",\n      \"digest\": \"sha256:0136074d159d69d15e33d557d57da884d81644d327ee060bfa6ecb0ffc72431b\",\n      \"size\": 152\n    }\n  ],\n  \"artifactType\": \"application/vnd.milpa.source.v1\",\n  \"config\": {\n    \"mediaType\": \"application/vnd.oci.empty.v1+json\",\n    \"digest\": \"sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a\",\n    \"size\": 2\n  }\n}"
+      }
+    },
+    {
+      "method": "GET",
+      "url": "https://ghcr.io/v2/coreyleavitt/test-pkg/blobs/sha256:0136074d159d69d15e33d557d57da884d81644d327ee060bfa6ecb0ffc72431b",
+      "expect_request_headers": {
+        "Authorization": "Bearer test-token-abc"
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/octet-stream"
+        },
+        "body_base64": "bWlscGEtb2NpLXRyYW5zcG9ydC1maXh0dXJlLWJsb2ItYm9keQptaWxwYS1vY2ktdHJhbnNwb3J0LWZpeHR1cmUtYmxvYi1ib2R5Cm1pbHBhLW9jaS10cmFuc3BvcnQtZml4dHVyZS1ibG9iLWJvZHkKbWlscGEtb2NpLXRyYW5zcG9ydC1maXh0dXJlLWJsb2ItYm9keQo="
+      }
+    }
+  ]
+}

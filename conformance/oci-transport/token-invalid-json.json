@@ -1,0 +1,27 @@
+{
+  "description": "Token endpoint returns 200 with a body that is not valid JSON -> FETCH-OCI-PULL-FAILED, phase=token (M4b).",
+  "exchanges": [
+    {
+      "method": "GET",
+      "url": "https://ghcr.io/v2/",
+      "response": {
+        "status": 401,
+        "headers": {
+          "WWW-Authenticate": "Bearer realm=\"https://ghcr.io/token\",service=\"ghcr.io\"",
+          "Content-Length": "0"
+        }
+      }
+    },
+    {
+      "method": "GET",
+      "url": "https://ghcr.io/token?scope=repository%3Acoreyleavitt%2Ftest-pkg%3Apull&service=ghcr.io",
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": "not valid json{"
+      }
+    }
+  ]
+}

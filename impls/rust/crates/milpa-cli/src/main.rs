@@ -1253,7 +1253,7 @@ fn cmd_hash(tokens: &[String], base_dir: &Path) -> Result<i32, MilpaError> {
     // but without the CasAdmittingFetcher wrapper — no CAS admission here).
     let receipt = match mocked_fetches_dir() {
         Some(mocked_dir) => MockedFetcher::new(mocked_dir).fetch("hash", &prov, tmp.path()),
-        None => DefaultRegistry::with_curl().fetch("hash", &prov, tmp.path()),
+        None => DefaultRegistry::production().fetch("hash", &prov, tmp.path()),
     }
     .map_err(MilpaError::Fetch)?;
     // tmp is dropped here (auto-cleanup) after the fetch result is obtained.
@@ -1408,7 +1408,7 @@ fn build_registry() -> Box<dyn FetcherRegistry> {
             store,
         )),
         None => Box::new(CasAdmittingFetcher::new(
-            DefaultRegistry::with_curl(),
+            DefaultRegistry::production(),
             store,
         )),
     }
@@ -3216,9 +3216,81 @@ fn cmd_remove(dir: &Path, strategy_cli: Option<Strategy>, rest: &[String], no_in
     Ok(0)
 }
 
+// --- native HTTP transport (RFC docs/rfc-native-oci-fetch.md §3.3/S4) ------
+//
+// Every consumer-side network fetch in this binary goes through
+// `milpa_core::bounded_http::request` — the single production HTTP backend
+// (also consumed by `milpa-core` itself, e.g. `dep_decl_store`/
+// `entry_bundle_store`). The five closures below (index / index-candidate /
+// epoch-commitment / bundle) are thin typed adapters over it; the `curl`
+// subprocess they used to shell out to is deleted, not kept as a fallback.
+
+/// Maximum bytes accepted for the tianguis package index document itself.
+/// The index is KDL text listing every published package; today's real
+/// index is comfortably under 1 MiB, but the registry is expected to grow
+/// over the project's lifetime. 32 MiB is a generous ceiling — orders of
+/// magnitude beyond any plausible near-term index size — that still bounds
+/// the resource-exhaustion surface of a compromised or misconfigured
+/// `MILPA_INDEX_URL`. Mirrors Python's `index_cache._INDEX_MAX_BYTES`.
+const INDEX_MAX_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Maximum bytes accepted for the index's Sigstore attestation bundle sidecar
+/// (cert chain + inclusion proof + SET). 4 MiB is a conservative ceiling
+/// pending real-corpus measurement, meaningfully larger than the KDL index
+/// text itself would need but still bounded. Mirrors Python's
+/// `index_cache._INDEX_BUNDLE_MAX_BYTES`. The epoch-commitment sidecar
+/// (below) is the same kind of artifact and reuses this cap — Python's
+/// production `load_epoch_commitment_status` defaults to the same bundle
+/// transport for exactly this reason.
+const BUNDLE_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
+/// A fetch transport for `String`-error callers (index / index-candidate /
+/// epoch-commitment): GET `url` under `cap`, collapsing any transport
+/// failure OR non-2xx HTTP status to a plain message string — mirrors the
+/// shape curl's stderr-on-failure output gave these callers before the
+/// migration (they never distinguished status codes; only the bundle
+/// transport below does, via `BundleError`).
+///
+/// `file://` stays a direct filesystem read (mirrors
+/// `dep_decl_store`/`entry_bundle_store`'s split): `bounded_http` is an
+/// HTTP-only transport (native TLS via `ureq`, RFC §3.3), and cli-contract
+/// §8.1 requires `MILPA_INDEX_URL`/its sidecar derivations to keep
+/// supporting `file://` for air-gapped / harness deployments — `curl`
+/// handled both schemes uniformly, so this split is the one place the
+/// migration must branch on scheme. The cap is applied to the `file://`
+/// read too (consistent policy — these callers were wholly uncapped before
+/// this migration, same gap the RFC closes for the Python urllib callers).
+fn native_http_get_string_err(url: &str, cap: u64) -> Result<Vec<u8>, String> {
+    if let Some(path_str) = url.strip_prefix("file://") {
+        let bytes = std::fs::read(path_str).map_err(|e| format!("reading {path_str:?}: {e}"))?;
+        if bytes.len() as u64 > cap {
+            return Err(format!(
+                "{path_str:?} exceeds the {cap}-byte cap ({} bytes)",
+                bytes.len()
+            ));
+        }
+        return Ok(bytes);
+    }
+
+    let mut buf = Vec::new();
+    let resp = milpa_core::bounded_http::request(
+        "GET",
+        url,
+        &[],
+        cap,
+        milpa_core::bounded_http::Sink::Bytes(&mut buf),
+    )
+    .map_err(|e| e.message().to_string())?;
+    if resp.status >= 400 {
+        return Err(format!("HTTP {} fetching {url}", resp.status));
+    }
+    Ok(buf)
+}
+
 // --- helpers ---------------------------------------------------------------
 
-/// Load the tianguis index from the cache (real network via `curl`).
+/// Load the tianguis index from the cache (real network via the native
+/// `bounded_http` transport).
 ///
 /// Three-way `MILPA_INDEX_URL` semantics (cli-contract.md §8.1 NORMATIVE):
 /// - **absent** from env → load from `DEFAULT_INDEX_URL` (live tianguis).
@@ -3378,17 +3450,7 @@ fn maybe_index(
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    let http = |url: &str| -> Result<Vec<u8>, String> {
-        let out = std::process::Command::new("curl")
-            .args(["-fsSL", url])
-            .output()
-            .map_err(|e| format!("curl: {e}"))?;
-        if out.status.success() {
-            Ok(out.stdout)
-        } else {
-            Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
-        }
-    };
+    let http = |url: &str| native_http_get_string_err(url, INDEX_MAX_BYTES);
 
     // Item 5 (M8): dispatch through the extracted trust-gate helper.
     // build_index_trust_gate owns: env reads, effective_trust_policy,
@@ -3555,24 +3617,15 @@ fn epoch_commitment_cache_dir() -> PathBuf {
     cache_home().join("milpa").join("epoch-commitment")
 }
 
-/// Build the curl-based epoch-commitment sidecar HTTP fetcher closure.
-/// Mirrors [`build_bundle_http_fn`], but this artifact class has no
-/// degraded "missing sidecar" mode (registry-protocol §3.4.9 — the on-index
-/// pointer being present is itself the unconditional trigger) so failures
-/// collapse to a single generic error string rather than distinguishing 404
-/// from other network failures.
+/// Build the epoch-commitment sidecar HTTP fetcher closure, over the native
+/// `bounded_http` transport. Mirrors [`build_bundle_http_fn`], but this
+/// artifact class has no degraded "missing sidecar" mode (registry-protocol
+/// §3.4.9 — the on-index pointer being present is itself the unconditional
+/// trigger) so failures collapse to a single generic error string rather
+/// than distinguishing 404 from other network failures — same cap as the
+/// bundle sidecar (`BUNDLE_MAX_BYTES`; mirrors Python's production default).
 fn build_commitment_http_fn() -> Box<dyn Fn(&str) -> Result<Vec<u8>, String>> {
-    Box::new(|url: &str| -> Result<Vec<u8>, String> {
-        let out = std::process::Command::new("curl")
-            .args(["-fsSL", url])
-            .output()
-            .map_err(|e| format!("curl: {e}"))?;
-        if out.status.success() {
-            Ok(out.stdout)
-        } else {
-            Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
-        }
-    })
+    Box::new(|url: &str| native_http_get_string_err(url, BUNDLE_MAX_BYTES))
 }
 
 /// An active trust gate: config + verifier + bundle transport, assembled for one index load.
@@ -3734,30 +3787,60 @@ fn build_index_trust_gate(
     }))
 }
 
-/// Build the curl-based bundle HTTP fetcher closure.
+/// Build the bundle HTTP fetcher closure, over the native `bounded_http`
+/// transport.
+///
+/// RFC docs/rfc-native-oci-fetch.md §3.3 (behavior-preservation checklist):
+/// the pre-migration `curl` version issued a **second** request
+/// (`curl -w "%{http_code}"`) purely to disambiguate a 404 from other
+/// failures, because `curl -fsSL`'s failure path throws away the status
+/// code. `bounded_http::request` reports `status` on the FIRST response, so
+/// that second request is deliberately dropped — 404 is read directly off
+/// `resp.status` below. This is the one sanctioned observable behavior
+/// change in the S4 migration (one fewer network round-trip on a bundle
+/// fetch that turns out to be 404; the caller-visible `BundleError` outcome
+/// is unchanged).
 fn build_bundle_http_fn() -> Box<dyn Fn(&str) -> Result<Vec<u8>, milpa_core::BundleError>> {
     use milpa_core::BundleError;
     Box::new(|bundle_url: &str| -> Result<Vec<u8>, BundleError> {
-        let out = std::process::Command::new("curl")
-            .args(["-fsSL", bundle_url])
-            .output()
-            .map_err(|e| BundleError::Other(format!("curl: {e}")))?;
-        if out.status.success() {
-            Ok(out.stdout)
+        // `file://` stays a direct filesystem read (see
+        // `native_http_get_string_err`'s doc comment) — the bundle URL is
+        // derived from the index URL, so a `file://` index means a
+        // `file://` bundle sidecar too (harness / air-gapped deployments).
+        // Behavior-preservation: the pre-migration curl transport could
+        // never observe a real "404" for a `file://` URL (curl's
+        // `%{http_code}` is never `404` for that scheme), so a missing
+        // sidecar file always fell through to `BundleError::Other` — this
+        // branch reproduces that exactly rather than newly mapping
+        // not-found to `BundleError::NotFound` (that mapping is reserved
+        // for the HTTP branch's native `status == 404`, the one sanctioned
+        // behavior change named on `build_bundle_http_fn`'s doc comment).
+        if let Some(path_str) = bundle_url.strip_prefix("file://") {
+            return match std::fs::read(path_str) {
+                Ok(bytes) if bytes.len() as u64 > BUNDLE_MAX_BYTES => Err(BundleError::Other(format!(
+                    "{path_str:?} exceeds the {BUNDLE_MAX_BYTES}-byte cap ({} bytes)",
+                    bytes.len()
+                ))),
+                Ok(bytes) => Ok(bytes),
+                Err(e) => Err(BundleError::Other(format!("reading {path_str:?}: {e}"))),
+            };
+        }
+
+        let mut buf = Vec::new();
+        let resp = milpa_core::bounded_http::request(
+            "GET",
+            bundle_url,
+            &[],
+            BUNDLE_MAX_BYTES,
+            milpa_core::bounded_http::Sink::Bytes(&mut buf),
+        )
+        .map_err(|e| BundleError::Other(e.message().to_string()))?;
+        if resp.status == 404 {
+            Err(BundleError::NotFound)
+        } else if resp.status >= 400 {
+            Err(BundleError::Other(format!("HTTP {} fetching {bundle_url}", resp.status)))
         } else {
-            // Distinguish 404 from other errors: re-run with -w for status.
-            let status_out = std::process::Command::new("curl")
-                .args(["-o", "/dev/null", "-s", "-w", "%{http_code}", bundle_url])
-                .output()
-                .map_err(|e| BundleError::Other(format!("curl status check: {e}")))?;
-            let code = String::from_utf8_lossy(&status_out.stdout);
-            if code.trim() == "404" {
-                Err(BundleError::NotFound)
-            } else {
-                Err(BundleError::Other(
-                    String::from_utf8_lossy(&out.stderr).trim().to_string(),
-                ))
-            }
+            Ok(buf)
         }
     })
 }
@@ -4395,17 +4478,7 @@ fn fetch_index_candidate(
     let gate = build_index_trust_gate(&manifest_policy, manifest_signer, manifest_bundle, require_attested_index, url)?;
     let is_off = gate.is_none();
 
-    let http = |u: &str| -> Result<Vec<u8>, String> {
-        let out = std::process::Command::new("curl")
-            .args(["-fsSL", u])
-            .output()
-            .map_err(|e| format!("curl: {e}"))?;
-        if out.status.success() {
-            Ok(out.stdout)
-        } else {
-            Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
-        }
-    };
+    let http = |u: &str| native_http_get_string_err(u, INDEX_MAX_BYTES);
 
     use milpa_core::BundleHttpGet;
     let text = match &gate {

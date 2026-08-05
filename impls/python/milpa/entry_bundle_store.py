@@ -26,21 +26,18 @@ This file defines:
 ``HttpEntryBundleStore(base_url: str, cache_dir: Path)``
     Production.  Artifact URL = ``<base_url>/attestation/<sha256_hex>.bundle``
     (same §3.3 URL-derivation convention as ``dep-decl/``).  Caches immutably
-    by hash (no TTL).  Uses the existing ``urllib`` transport (same as
-    ``index_cache.py`` / ``dep_decl_store.py``) — no new network machinery.
+    by hash (no TTL).  Uses ``bounded_http.request`` (same native transport
+    as ``index_cache.py`` / ``dep_decl_store.py``) — no bespoke network
+    machinery.
 
-Extract-or-decline (RFC §7 "an extraction owed under the §6 extract-or-decline
-discipline"): this module intentionally DUPLICATES ``dep_decl_store.py``'s
-shape (fetch-or-cache + hash-verify Protocol pair) rather than generalizing it
-into one parametrized artifact store.  Decision recorded here because the RFC
-names the generalization as owed: refactoring the already-battle-tested
-``dep_decl_store.py`` now would risk that module for no test-coverage gain in
-P3a (bundle HTTP-production correctness is untestable before P4 ships real
-bundles — see RFC §5, prerequisite 1's "honest tail"). The mock-gated
+Extraction (RFC §7 "an extraction owed under the §6 extract-or-decline
+discipline", issue #201): ``HttpEntryBundleStore`` is a thin instantiation
+of ``dep_decl_store.ContentAddressedHttpArtifactStore`` — the fetch-or-cache
++ hash-verify shape it shares with ``HttpDepDeclStore`` lives there once now
+(CLAUDE.md: "Duplicate code paths are bugs ... unify them"). The mock-gated
 ``FileEntryBundleStore`` variant is P3a's actual deliverable per RFC §7
-("P3a's mockable acquisition surface IS this store's file-backed variant").
-Revisit the generalized extraction once both HTTP stores have real-world
-mileage (P4).
+("P3a's mockable acquisition surface IS this store's file-backed variant")
+and is untouched by the extraction — it never duplicated HTTP-store logic.
 
 Bundle bytes' size cap (4 MiB): a placeholder, not a measured-corpus figure —
 no real per-entry Sigstore bundle exists yet (P4-gated).  A Sigstore bundle
@@ -59,12 +56,11 @@ SECURITY INVARIANT (NORMATIVE):
 
 from __future__ import annotations
 
-import contextlib
 import os
 from pathlib import Path
 from typing import Protocol
 
-from milpa.atomic_cache import atomic_write_bytes, read_verified_or_self_heal
+from milpa.dep_decl_store import ContentAddressedHttpArtifactStore
 from milpa.errors import (
     TNG_ENTRY_BUNDLE_MISSING,
     TNG_ENTRY_BUNDLE_PIN_MISMATCH,
@@ -194,6 +190,17 @@ _ENTRY_BUNDLE_CACHE_SUBDIR = "attestation"
 
 #: Maximum size of a per-entry attestation bundle fetched over HTTP.
 #: Placeholder pending P4 real-corpus measurement — see module docstring.
+#:
+#: Enforcement: the transport (``bounded_http.request``, RFC docs/rfc-native-
+#: oci-fetch.md §3.3) streams the body and rejects as soon as the cumulative
+#: byte count exceeds the cap.  A pre-flight Content-Length-header early
+#: reject was possible under the old direct ``urllib.request.urlopen`` call;
+#: ``bounded_http.request`` is a single atomic ``(cap, sink)`` call with no
+#: header-peek hook, so that optimization is gone (NAMED behavior change,
+#: mirrors dep_decl_store.py's identical change — see
+#: test_http_store_lying_content_length_no_longer_pre_rejected).  The
+#: actual-bytes-cap enforcement, and therefore the security property, is
+#: unchanged.
 _ENTRY_BUNDLE_MAX_ARTIFACT_BYTES: int = 4 * 1024 * 1024  # 4 MiB
 
 
@@ -211,6 +218,24 @@ def _default_entry_bundle_cache_dir() -> Path:
     return base / "milpa" / _ENTRY_BUNDLE_CACHE_SUBDIR
 
 
+def _entry_bundle_fetch_failed_error(bundle_pin: str, artifact_url: str, detail: str) -> MilpaError:
+    """Build the ``TNG-ENTRY-BUNDLE-MISSING`` error for a fetch failure.
+
+    Passed to ``ContentAddressedHttpArtifactStore`` as
+    ``make_fetch_failed_error`` (mirrors ``dep_decl_store._dep_decl_fetch_
+    failed_error``) — this is the ONE place that builds this error,
+    regardless of whether the failure was a transport exception, a cap
+    breach, or an HTTP error status (``detail`` carries the specifics).
+    """
+    return MilpaError(
+        TNG_ENTRY_BUNDLE_MISSING,
+        f"failed to fetch attestation bundle from {artifact_url!r}: {detail}",
+        pin=bundle_pin,
+        url=artifact_url,
+        cause="unfetchable",
+    )
+
+
 class HttpEntryBundleStore:
     """Production entry-bundle store: fetch from HTTP + immutable cache.
 
@@ -220,7 +245,9 @@ class HttpEntryBundleStore:
     Cache writes are atomic (tmp-sibling + ``os.replace``), mirroring
     ``HttpDepDeclStore``.  Concurrent readers never observe a partial write.
 
-    Transport: ``urllib.request.urlopen`` (same as ``index_cache.py`` /
+    Transport: ``bounded_http.request`` (RFC docs/rfc-native-oci-fetch.md
+    §3.3 — the single native in-process transport every consumer HTTP call
+    site converges on; same primitive as ``index_cache.py`` /
     ``dep_decl_store.py``).  Supports ``http://``, ``https://``, and
     ``file://`` schemes.
     """
@@ -230,12 +257,15 @@ class HttpEntryBundleStore:
         self._cache_dir = (
             cache_dir if cache_dir is not None else _default_entry_bundle_cache_dir()
         )
-
-    def _artifact_url(self, bundle_pin: str) -> str:
-        return f"{self._base_url}/attestation/{bundle_pin}.bundle"
-
-    def _cache_path(self, bundle_pin: str) -> Path:
-        return self._cache_dir / f"{bundle_pin}.bundle"
+        self._core = ContentAddressedHttpArtifactStore(
+            self._base_url,
+            self._cache_dir,
+            subpath="attestation",
+            extension=".bundle",
+            max_bytes=_ENTRY_BUNDLE_MAX_ARTIFACT_BYTES,
+            verify=_verify,
+            make_fetch_failed_error=_entry_bundle_fetch_failed_error,
+        )
 
     def get(self, bundle_pin: str) -> bytes:
         """Fetch bundle bytes (cache-first), verify hash, return bytes.
@@ -244,82 +274,11 @@ class HttpEntryBundleStore:
             MilpaError(TNG-ENTRY-BUNDLE-MISSING): Network / file error (cause=unfetchable).
             MilpaError(TNG-ENTRY-BUNDLE-PIN-MISMATCH): Hash mismatch.
         """
-        # Cache-first (immutable: a hit is always valid; no staleness check).
-        # Self-heal on a locally-corrupt cache entry (CR16 — shared with
-        # HttpDepDeclStore via atomic_cache.read_verified_or_self_heal): a
-        # mismatch on FRESHLY FETCHED bytes below (the server genuinely
-        # served the wrong content) stays a hard error — that path calls
-        # ``_verify`` directly and never reaches the self-heal primitive.
-        cache_path = self._cache_path(bundle_pin)
-        cached_bytes = read_verified_or_self_heal(
-            cache_path, lambda b: _verify(b, bundle_pin)
-        )
-        if cached_bytes is not None:
-            return cached_bytes
-
-        # Cache miss: fetch from network.
-        artifact_url = self._artifact_url(bundle_pin)
-        fetched_bytes: bytes
-        try:
-            import urllib.request
-
-            with urllib.request.urlopen(artifact_url) as resp:  # noqa: S310
-                raw_cl = resp.getheader("Content-Length") if hasattr(resp, "getheader") else None
-                if raw_cl is not None:
-                    try:
-                        cl = int(raw_cl)
-                    except ValueError:
-                        cl = 0
-                    if cl > _ENTRY_BUNDLE_MAX_ARTIFACT_BYTES:
-                        raise MilpaError(
-                            TNG_ENTRY_BUNDLE_MISSING,
-                            f"attestation bundle at {artifact_url!r} advertises "
-                            f"Content-Length {cl} which exceeds the "
-                            f"{_ENTRY_BUNDLE_MAX_ARTIFACT_BYTES}-byte cap — "
-                            f"rejecting to prevent resource exhaustion",
-                            pin=bundle_pin,
-                            url=artifact_url,
-                            cause="unfetchable",
-                        )
-                buf = resp.read(_ENTRY_BUNDLE_MAX_ARTIFACT_BYTES + 1)
-                if len(buf) > _ENTRY_BUNDLE_MAX_ARTIFACT_BYTES:
-                    raise MilpaError(
-                        TNG_ENTRY_BUNDLE_MISSING,
-                        f"attestation bundle at {artifact_url!r} exceeds the "
-                        f"{_ENTRY_BUNDLE_MAX_ARTIFACT_BYTES}-byte cap "
-                        f"(read {len(buf)} bytes) — rejecting to prevent "
-                        f"resource exhaustion",
-                        pin=bundle_pin,
-                        url=artifact_url,
-                        cause="unfetchable",
-                    )
-                fetched_bytes = buf
-        except MilpaError:
-            raise
-        except Exception as exc:
-            raise MilpaError(
-                TNG_ENTRY_BUNDLE_MISSING,
-                f"failed to fetch attestation bundle from {artifact_url!r}: {exc}",
-                pin=bundle_pin,
-                url=artifact_url,
-                cause="unfetchable",
-            ) from exc
-
-        # Verify before caching — don't persist a corrupt/tampered bundle.
-        _verify(fetched_bytes, bundle_pin)
-
-        # Atomic write to cache (unique-per-write temp sibling + os.replace —
-        # registry-protocol §3.5.2 NORMATIVE (concurrency); see atomic_cache.py).
-        self._cache_dir.mkdir(parents=True, exist_ok=True)
-        with contextlib.suppress(OSError):
-            atomic_write_bytes(cache_path, fetched_bytes)
-            # Cache write failure is non-fatal; the bytes were already verified.
-
-        return fetched_bytes
+        return self._core.get(bundle_pin)
 
     def is_cached(self, bundle_pin: str) -> bool:
         """Return True iff the bundle is in the local cache (no network)."""
-        return self._cache_path(bundle_pin).is_file()
+        return self._core.is_cached(bundle_pin)
 
 
 # ---------------------------------------------------------------------------

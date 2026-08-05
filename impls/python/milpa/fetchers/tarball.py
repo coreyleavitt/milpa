@@ -8,7 +8,9 @@ Public surface:
   - ``TarballProvenance``  — ``Provenance`` subclass for tarball deps.
   - ``TarballReceipt``     — ``ProvenanceReceipt`` carrying ``archive_sha256``.
   - ``TarballFetcher``     — ``Fetcher`` ABC implementation.
-  - ``make_http_get``      — production seam: ``curl -fsSL`` backed transport.
+  - ``make_http_get``      — production seam: ``bounded_http.request`` backed
+                             transport (RFC docs/rfc-native-oci-fetch.md §3.3;
+                             the ``curl`` shell-out this replaced is deleted).
 
 TOFU precedence (mirrors Rust + RFC S9c):
     The receipt always carries the SHA-256 of the raw (compressed) archive
@@ -22,24 +24,18 @@ from __future__ import annotations
 
 import hashlib
 import io
-import subprocess
 import tarfile
+import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import ClassVar
 
-#: Chunk size for streaming reads in `make_http_get`.  64 KiB balances
-#: syscall overhead against bounded-memory granularity: the process never
-#: buffers more than compressed_cap + _CHUNK_SIZE bytes from a response that
-#: exceeds the cap.
-_CHUNK_SIZE: int = 65_536  # 64 KiB
-
 #: ZIP local-file-header magic bytes (PK\x03\x04).  Used to detect and reject
-#: ZIP archives early with a clear error (H0 §zip-guard).  Promoted to module
-#: level alongside _CHUNK_SIZE for consistency with other format-magic constants.
+#: ZIP archives early with a clear error (H0 §zip-guard).
 _MAGIC_ZIP: bytes = b"\x50\x4b\x03\x04"
 
+from milpa import bounded_http
 from milpa.dag_identity import (
     MODE_EXECUTABLE,
     MODE_REGULAR,
@@ -143,88 +139,85 @@ class TarballReceipt(ProvenanceReceipt):
 # HttpGet seam type
 # ---------------------------------------------------------------------------
 
-#: Injected HTTP transport: maps a URL to its raw bytes or raises.
-#: The callable raises ``MilpaError(FETCH_DOWNLOAD_FAILED, …)`` on failure
-#: (or any exception that the fetcher re-wraps with that slug).
-HttpGet = Callable[[str], bytes]
+#: Injected HTTP transport: streams the response body for ``url`` into the
+#: file at ``dest``, or raises.  The callable raises
+#: ``MilpaError(FETCH_DOWNLOAD_FAILED, …)`` on failure (or any exception that
+#: the fetcher re-wraps with that slug).
+#:
+#: H3 (finding — memory-safety per RFC docs/rfc-native-oci-fetch.md §3.3):
+#: the seam is Path-based, not bytes-returning.  A caller that returned the
+#: whole compressed archive as ``bytes`` would force every concurrent
+#: tarball worker to hold up to ``MAX_COMPRESSED_BYTES`` (4 GiB) in process
+#: memory at once — the RFC's own stated rationale for routing the tarball
+#: body (like the OCI blob) through a file ``Path`` sink instead.
+HttpGet = Callable[[str, Path], None]
 
 
 def make_http_get(compressed_cap: int = MAX_COMPRESSED_BYTES) -> HttpGet:
-    """Return a production ``HttpGet`` backed by ``curl -fsSL``.
+    """Return a production ``HttpGet`` backed by ``bounded_http.request``
+    (RFC docs/rfc-native-oci-fetch.md §3.3) — the in-process transport that
+    replaced the ``curl -fsSL`` shell-out.
 
-    H1 — streaming bounded read: uses ``subprocess.Popen`` to read curl's
-    stdout in ``_CHUNK_SIZE`` chunks and aborts (kills curl) as soon as the
-    cumulative byte count exceeds ``compressed_cap``.  This bounds the process
-    memory to at most ``compressed_cap + _CHUNK_SIZE`` bytes regardless of how
-    large the server's response is — the full response is never buffered before
-    the cap check fires.
+    H1 — streaming bounded read: ``bounded_http.request`` streams the body
+    under ``compressed_cap``, raising ``FETCH_DOWNLOAD_SIZE_EXCEEDED``
+    mid-stream as soon as the cumulative byte count exceeds the cap.  This
+    bounds process memory to at most ``compressed_cap + chunk_size`` bytes
+    regardless of how large the server's response is — the full response is
+    never buffered before the cap check fires (see
+    ``bounded_http._stream_capped``, the single streaming-cap implementation
+    every native HTTP caller now shares).
+
+    H3 — the body streams directly to ``dest`` (a file ``Path``), never
+    through an in-memory ``BytesIO`` sink: ``bounded_http.request`` opens
+    ``dest`` and writes each chunk straight to disk, so the compressed
+    archive is never held as a Python ``bytes`` object in this process —
+    mirroring the OCI blob path (``OciRegistryClient.blob``), which streams
+    to a ``Path`` for the identical reason (an N-worker concurrent resolve
+    would otherwise hold N x ``MAX_COMPRESSED_BYTES`` at once).
 
     Raises:
         MilpaError(FETCH_DOWNLOAD_SIZE_EXCEEDED): compressed body exceeded cap.
-        MilpaError(FETCH_DOWNLOAD_FAILED): curl exited non-zero (network error).
+        MilpaError(FETCH_DOWNLOAD_FAILED): transport failure (DNS, connection
+            refused, timeout) or a non-2xx HTTP status.  ``curl -f`` failed
+            the request on any HTTP error status; ``bounded_http`` treats
+            status as data (RFC §3.4), so this adapter reproduces curl's
+            behavior with an explicit status check.
     """
 
-    def _curl(url: str) -> bytes:
-        # R1-13: wrap Popen in `with proc:` so stdout and stderr are always
-        # closed and the process is always reaped across every exit path
-        # (cap-exceeded, read exception, curl failure, success).
-        # R2-05: single coherent cleanup discipline — use communicate() once on
-        # the non-streaming paths; on kill paths, kill then raise and let
-        # __exit__ do the final reap via communicate().  No manual close/wait
-        # before or after communicate(); double-drain confuses Popen.__exit__.
-        with subprocess.Popen(
-            ["curl", "-fsSL", url],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        ) as proc:
-            assert proc.stdout is not None
-            chunks: list[bytes] = []
-            total = 0
-            try:
-                while True:
-                    chunk = proc.stdout.read(_CHUNK_SIZE)
-                    if not chunk:
-                        break
-                    total += len(chunk)
-                    if total > compressed_cap:
-                        # Abort: kill curl and raise.  Popen.__exit__ handles
-                        # the final reap via communicate() — do NOT manually
-                        # close stdout or call wait() here (that would cause a
-                        # double-drain in __exit__).
-                        proc.kill()
-                        raise MilpaError(
-                            FETCH_DOWNLOAD_SIZE_EXCEEDED,
-                            f"curl response for {url!r} exceeded download cap "
-                            f"({compressed_cap} bytes); request aborted",
-                            url=url,
-                            cap=compressed_cap,
-                        )
-                    chunks.append(chunk)
-            except MilpaError:
-                raise
-            except Exception as exc:
-                proc.kill()
-                raise MilpaError(
-                    FETCH_DOWNLOAD_FAILED,
-                    f"curl read error for {url!r}: {exc}",
-                    url=url,
-                ) from exc
+    def _get(url: str, dest: Path) -> None:
+        resp = bounded_http.request("GET", url, cap=compressed_cap, sink=dest)
+        # file:// responses carry no HTTP status (bounded_http leaves it
+        # None) — only a genuine HTTP error status is a failure here.
+        if resp.status is not None and resp.status >= 400:
+            raise MilpaError(
+                FETCH_DOWNLOAD_FAILED,
+                f"fetching {url!r} failed: HTTP {resp.status}",
+                url=url,
+            )
 
-            # Stdout is now fully drained (the read loop exited cleanly).
-            # Use communicate() to drain stderr and reap the process in one call.
-            # communicate() will also close both pipes.
-            _, stderr_bytes = proc.communicate()
-            returncode = proc.returncode
-            if returncode != 0:
-                stderr = stderr_bytes.decode(errors="replace").strip() if stderr_bytes else ""
-                raise MilpaError(
-                    FETCH_DOWNLOAD_FAILED,
-                    f"curl failed for {url!r}: {stderr}",
-                    url=url,
-                )
-            return b"".join(chunks)
+    return _get
 
-    return _curl
+
+def sha256_of_file(path: Path, *, chunk_size: int = 65_536) -> str:
+    """Streaming sha256 of a file's contents — never loads the whole archive
+    into memory (H3).
+
+    N1 (finding — duplicated streaming-hash-of-file helper): this is the
+    single source of truth for both the tarball archive-digest (this
+    module) and the OCI blob-digest (``fetchers/oci_client.py::blob``)
+    verification paths. ``oci_client.py`` already imports
+    ``MAX_COMPRESSED_BYTES`` from this module, so this hoists the hash loop
+    to match that established cross-boundary precedent instead of leaving
+    a byte-for-byte duplicate in each module.
+    """
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -395,94 +388,126 @@ class TarballFetcher(Fetcher):
             # Programmer-invariant: only called after can_handle → True.
             raise TypeError(f"TarballFetcher.fetch called with {type(p).__name__!r}")
 
-        # 1. Download (R4: compressed-download cap).
-        try:
-            raw_bytes = self._http_get(p.url)
-        except MilpaError:
-            raise
-        except Exception as exc:
-            raise MilpaError(
-                FETCH_DOWNLOAD_FAILED,
-                f"fetching {name!r} from {p.url!r}: {exc}",
-                dep=name,
-                url=p.url,
-            ) from exc
+        # H3: stream the compressed archive to a scratch temp file rather
+        # than buffering it in a Python ``bytes`` object for the duration of
+        # the (network-bound, adversary-timed) download — mirrors the OCI
+        # blob path (``OciRegistryClient.blob``, RFC
+        # docs/rfc-native-oci-fetch.md §3.3), which already streams to a
+        # ``Path`` and hashes it via a streaming sha256-of-file helper.  A
+        # resolver running N tarball workers concurrently no longer holds N
+        # full compressed archives (up to ``MAX_COMPRESSED_BYTES`` each) in
+        # process memory at once.
+        with tempfile.TemporaryDirectory(prefix="milpa-tarball-") as tmp_dir:
+            archive_path = Path(tmp_dir) / "archive"
 
-        # H1: enforce the compressed-body cap.  The production transport streams
-        # and aborts early, raising FETCH_DOWNLOAD_SIZE_EXCEEDED itself.
-        # This safety-net check catches injected transports (tests, mocks) that
-        # return bytes directly without streaming — they return a full blob and
-        # the fetcher must still raise the security slug (not FETCH-DOWNLOAD-FAILED)
-        # so the distinction between "network error" and "size cap exceeded" is
-        # preserved regardless of which transport path is in use.
-        if len(raw_bytes) > self._compressed_cap:
-            raise MilpaError(
-                FETCH_DOWNLOAD_SIZE_EXCEEDED,
-                f"fetching {name!r} from {p.url!r}: compressed body "
-                f"({len(raw_bytes)} bytes) exceeds download cap "
-                f"({self._compressed_cap} bytes); possible oversized mirror",
-                dep=name,
-                url=p.url,
-                cap=self._compressed_cap,
-            )
-
-        # 1b. Unsupported-format guard: ZIP archives are not supported by
-        #     TarballFetcher.  A .zip URL with Python's tarfile produces an
-        #     obscure multi-method ReadError; detect the ZIP magic bytes early
-        #     and raise FETCH-EXTRACT-FAILED with an actionable message (H0
-        #     §zip-guard).  Uses the module-level _MAGIC_ZIP constant.
-        if raw_bytes[:4] == _MAGIC_ZIP:
-            raise MilpaError(
-                FETCH_EXTRACT_FAILED,
-                f"fetching {name!r}: unsupported archive format: .zip "
-                f"(TarballFetcher accepts .tar.gz / .tar.bz2 / .tar.xz / .tar only; "
-                f"use a tarball URL or a git= dep)",
-                dep=name,
-                url=p.url,
-            )
-
-        # 2. Compute archive SHA-256 (always — needed for TOFU recording even on
-        #    first-use when expected_sha256 is None).
-        actual_sha = hashlib.sha256(raw_bytes).hexdigest()
-
-        # 3. Verify against expected (refetch + prior lock path).
-        if p.expected_sha256 is not None:
-            want = p.expected_sha256.removeprefix("sha256:").lower()
-            if actual_sha != want:
+            # 1. Download (R4: compressed-download cap).
+            try:
+                self._http_get(p.url, archive_path)
+            except MilpaError:
+                raise
+            except Exception as exc:
                 raise MilpaError(
-                    FETCH_SHA256_MISMATCH,
-                    f"fetching {name!r}: archive sha256 mismatch — "
-                    f"expected {p.expected_sha256!r}, got {actual_sha!r} "
-                    f"(URL {p.url!r}); rejected before extraction",
+                    FETCH_DOWNLOAD_FAILED,
+                    f"fetching {name!r} from {p.url!r}: {exc}",
                     dep=name,
                     url=p.url,
-                    expected=p.expected_sha256,
-                    actual=actual_sha,
+                ) from exc
+
+            if not archive_path.is_file():
+                # Transport contract violation: a well-behaved HttpGet always
+                # creates ``dest`` (even for an empty body) on success.
+                raise MilpaError(
+                    FETCH_DOWNLOAD_FAILED,
+                    f"fetching {name!r} from {p.url!r}: transport did not "
+                    f"produce a downloaded archive",
+                    dep=name,
+                    url=p.url,
                 )
 
-        # 4. Extract.
-        dest.mkdir(parents=True, exist_ok=True)
-        try:
-            extract_tar(
-                io.BytesIO(raw_bytes),
-                dest,
-                strip_components=p.strip_components,
-                limits=self._limits,
-            )
-        except MilpaError as exc:
-            raise MilpaError(
-                FETCH_EXTRACT_FAILED,
-                f"fetching {name!r}: safe extraction failed ({exc.slug}): {exc.message}",
-                dep=name,
-                url=p.url,
-                inner_slug=exc.slug,
-            ) from exc
-        except Exception as exc:
-            raise MilpaError(
-                FETCH_EXTRACT_FAILED,
-                f"fetching {name!r}: extraction error: {exc}",
-                dep=name,
-                url=p.url,
-            ) from exc
+            # H1: enforce the compressed-body cap.  The production transport
+            # streams and aborts early, raising FETCH_DOWNLOAD_SIZE_EXCEEDED
+            # itself.  This stat-based safety-net check catches injected
+            # transports (tests, mocks) that write the full archive directly
+            # without streaming/capping themselves — the fetcher must still
+            # raise the security slug (not FETCH-DOWNLOAD-FAILED) so the
+            # distinction between "network error" and "size cap exceeded" is
+            # preserved regardless of which transport path is in use.
+            archive_size = archive_path.stat().st_size
+            if archive_size > self._compressed_cap:
+                raise MilpaError(
+                    FETCH_DOWNLOAD_SIZE_EXCEEDED,
+                    f"fetching {name!r} from {p.url!r}: compressed body "
+                    f"({archive_size} bytes) exceeds download cap "
+                    f"({self._compressed_cap} bytes); possible oversized mirror",
+                    dep=name,
+                    url=p.url,
+                    cap=self._compressed_cap,
+                )
+
+            # 1b. Unsupported-format guard: ZIP archives are not supported by
+            #     TarballFetcher.  A .zip URL with Python's tarfile produces an
+            #     obscure multi-method ReadError; detect the ZIP magic bytes early
+            #     and raise FETCH-EXTRACT-FAILED with an actionable message (H0
+            #     §zip-guard).  Uses the module-level _MAGIC_ZIP constant.
+            with open(archive_path, "rb") as f:
+                magic = f.read(4)
+            if magic == _MAGIC_ZIP:
+                raise MilpaError(
+                    FETCH_EXTRACT_FAILED,
+                    f"fetching {name!r}: unsupported archive format: .zip "
+                    f"(TarballFetcher accepts .tar.gz / .tar.bz2 / .tar.xz / .tar only; "
+                    f"use a tarball URL or a git= dep)",
+                    dep=name,
+                    url=p.url,
+                )
+
+            # 2. Compute archive SHA-256 (always — needed for TOFU recording
+            #    even on first-use when expected_sha256 is None).  Streamed
+            #    off disk — never materializes the archive as a Python bytes
+            #    object (H3).
+            actual_sha = sha256_of_file(archive_path)
+
+            # 3. Verify against expected (refetch + prior lock path).
+            if p.expected_sha256 is not None:
+                want = p.expected_sha256.removeprefix("sha256:").lower()
+                if actual_sha != want:
+                    raise MilpaError(
+                        FETCH_SHA256_MISMATCH,
+                        f"fetching {name!r}: archive sha256 mismatch — "
+                        f"expected {p.expected_sha256!r}, got {actual_sha!r} "
+                        f"(URL {p.url!r}); rejected before extraction",
+                        dep=name,
+                        url=p.url,
+                        expected=p.expected_sha256,
+                        actual=actual_sha,
+                    )
+
+            # 4. Extract.  ``extract_tar`` accepts a Path directly (it reads
+            #    the file itself), so the archive is handed to it without an
+            #    extra in-memory ``BytesIO`` wrap — the second buffering copy
+            #    the finding called out is eliminated.
+            dest.mkdir(parents=True, exist_ok=True)
+            try:
+                extract_tar(
+                    archive_path,
+                    dest,
+                    strip_components=p.strip_components,
+                    limits=self._limits,
+                )
+            except MilpaError as exc:
+                raise MilpaError(
+                    FETCH_EXTRACT_FAILED,
+                    f"fetching {name!r}: safe extraction failed ({exc.slug}): {exc.message}",
+                    dep=name,
+                    url=p.url,
+                    inner_slug=exc.slug,
+                ) from exc
+            except Exception as exc:
+                raise MilpaError(
+                    FETCH_EXTRACT_FAILED,
+                    f"fetching {name!r}: extraction error: {exc}",
+                    dep=name,
+                    url=p.url,
+                ) from exc
 
         return TarballReceipt(archive_sha256=actual_sha)

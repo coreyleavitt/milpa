@@ -4,7 +4,12 @@ Normative spec for how milpa **reads** the tianguis registry `index.kdl`
 to resolve named deps. This is the **read contract only** — how a
 `(name, constraint)` pair maps to candidate `(version, provenance)` records.
 Index-deps resolution policy (the solver's strategy over those candidates) is
-deferred to #98/#86 and is explicitly out of scope here.
+deferred to #98/#86 and is explicitly out of scope here. §7 is a narrow,
+deliberate extension beyond the read contract: once an `oci` provenance
+record is selected, §7 specifies the wire-level contract for pulling the
+artifact it names — the natural place for it, since §3.3 already owns the
+`oci` provenance's field shapes and this document already owns the `TNG-*`
+parse-time validators that gate those fields before the pull begins.
 
 Every parser that claims milpa conformance MUST implement the rules marked
 `> NORMATIVE:`. Items marked `> NOTE:` describe the reference Python
@@ -12,13 +17,21 @@ implementation; conformant alternatives MAY differ in those details.
 
 Related specs:
 
-- `spec/errors.md` — every `TNG-*` error code this protocol can produce
+- `spec/errors.md` — every `TNG-*` error code this protocol can produce, and
+  the `FETCH-OCI-*` / `FETCH-SHA256-MISMATCH`-family codes §7's pull contract
+  raises
 - `spec/manifest-grammar.md` — P3 provenance-descriptor model (§4), which
   this spec cross-references normatively
 - `spec/lockfile-schema.md` (S5) — lockfile representation of provenance
 - `spec/resolver-semantics.md` (S6) — how candidate lists feed the solver
 - `spec/cli-contract.md` (S15) — environment variables including
-  `MILPA_INDEX_URL`
+  `MILPA_INDEX_URL`; §10's publish-side OCI media types and `oras`/`cosign`
+  pipeline, which §7 consumes on the pull side
+- `spec/plugin-contract.md` (S10) §2.4.2/§2.4.5 — the native, no-shell-out
+  transport backend and the streaming-cap mechanics §7 cross-references
+  rather than restating
+- `spec/identity.md` — the post-extract `content_hash` check §7.5
+  distinguishes from the pull-side blob-digest check
 
 ---
 
@@ -68,6 +81,9 @@ A conformant implementation of this spec MUST:
 11. Verify the whole-index Sigstore attestation bundle before trusting any
     claim in the index; honour the `index-trust` trust-policy from the
     manifest and `MILPA_INDEX_TRUST` env var (§3.4).
+12. Implement the OCI artifact pull contract over a selected `oci` provenance:
+    the token → manifest → blob phase decomposition, the single-milpa-layer
+    manifest-shape gate, and blob digest verification before extraction (§7).
 
 ---
 
@@ -660,11 +676,24 @@ Fields: `registry` (required), `repository` (required), `digest` (required),
 `source` (optional).
 
 > NORMATIVE: `digest` MUST be in `sha256:<64 lowercase hex>` form. Any other
-> format MUST raise `TNG-BAD-OCI-DIGEST` at parse time.
+> format MUST raise `TNG-BAD-OCI-DIGEST` at parse time — before a malformed
+> digest string can reach the native OCI pull client's manifest-fetch request
+> URL (§7.4).
 
 > NORMATIVE: `registry` and `repository` MUST NOT begin with `-`. A leading
-> dash on either field MUST raise `TNG-UNSAFE-OCI-FIELD` at parse time
-> (flag-injection prevention; these values flow into `oras` argv).
+> dash on either field MUST raise `TNG-UNSAFE-OCI-FIELD` at parse time. The
+> threat this gate closes on the consumer path is a malformed value reaching
+> the native OCI client's request URL and headers (§7) — not subprocess
+> argv, since the native client has no subprocess/argv surface at all. The
+> gate is retained as a parse-time defense-in-depth shape check regardless: a
+> leading dash is never a legitimate registry hostname or repository path
+> segment, so rejecting it early keeps the field uniform before it reaches
+> URL construction. (The historical flag-injection rationale still applies
+> unchanged on the separate, CI-only `milpa publish` path, which continues to
+> shell out to `oras` — `spec/cli-contract.md` §10 — but that is not the path
+> this validator's field-level gate exists to protect; the same slug is
+> independently re-checked there via `validate_oci_field` before any `oras`
+> subprocess runs.)
 
 > NORMATIVE: `source`, when present, is the canonical git repository this
 > artifact was packed and published from (e.g. the URL `milpa publish`
@@ -695,8 +724,10 @@ Fields: `registry` (required), `repository` (required), `digest` (required),
 > comparison (§3.5.1) — a record whose `source` alone changes is compared
 > by full-field value equality exactly like any other field change,
 > without a spec amendment. Its independent leading-dash check is
-> deliberately NOT required — unlike `registry`/`repository`, `source` never
-> flows into `oras`/`cosign` subprocess argv.
+> deliberately NOT required — unlike `registry`/`repository`, `source` is
+> purely informational metadata: it never flows into the native OCI client's
+> request construction (§7) or, on the publish path, into `oras`/`cosign`
+> subprocess argv.
 
 #### Unknown kinds
 
@@ -2289,8 +2320,8 @@ strings passing these validators are safe.
 | `TNG-BAD-COMMIT-SHA` | `commit_sha` in a `git` provenance | Any value not matching `^[0-9a-f]{40}$` — removes flag-injection vector and abbreviated-SHA ambiguity |
 | `TNG-UNSAFE-URL` | `url` in a `git` provenance | Any value beginning with `-` — prevents flag injection into git subprocess argv |
 | `TNG-UNSAFE-REF` | `ref` in a `git` provenance | Any value beginning with `-` — prevents flag injection into git subprocess argv |
-| `TNG-BAD-OCI-DIGEST` | `digest` in an `oci` provenance | Any value not matching `^sha256:[0-9a-f]{64}$` — enforces OCI digest format, prevents malformed reference string in oras argv |
-| `TNG-UNSAFE-OCI-FIELD` | `registry` and `repository` in an `oci` provenance | Any value beginning with `-` — prevents flag injection into oras subprocess argv |
+| `TNG-BAD-OCI-DIGEST` | `digest` in an `oci` provenance | Any value not matching `^sha256:[0-9a-f]{64}$` — enforces OCI digest format, prevents a malformed digest from reaching the native OCI client's manifest-fetch request (§7.4) |
+| `TNG-UNSAFE-OCI-FIELD` | `registry` and `repository` in an `oci` provenance | Any value beginning with `-` — parse-time defense-in-depth on the native OCI client's request URL/headers (§7); also re-checked before the separate CI-only `oras` publish path, where it retains its original flag-injection rationale |
 | `TNG-BAD-DEP-DECL` | `dep_decl` in a version node | Any value not matching `^sha256:[0-9a-f]{64}$` — prevents path-traversal (e.g. `sha256:../../etc/passwd`) reaching `FileDepDeclStore` (filesystem path) or `HttpDepDeclStore` (URL path segment) |
 | `TNG-SCHEMA-UNKNOWN` | Top-level `schema_version` integer | Any value strictly greater than `TIANGUIS_INDEX_SCHEMA_VERSION` |
 
@@ -2499,6 +2530,216 @@ single highest-semver satisfying `IndexVersion`. Equivalent to
 > garbage-collect them (above) — absolute sizes are trivial and URL churn
 > is rare. A future store-gc mini-RFC (Tier 3 roadmap) is the right home
 > for an index-cache GC clause, not this section or `clean`.
+
+---
+
+## 7  OCI artifact pull (consumer)
+
+This section specifies the wire-level contract for pulling a milpa-published
+OCI artifact — the resolution of an `oci` provenance record (§3.3 of this
+document; `manifest-grammar.md` §4.2's `oci=` dependency declaration uses the
+same field shapes) into a verified `source.tar.gz` ready for extraction. It is
+the **normative pull-side counterpart** to `spec/plugin-contract.md` §2.4.5
+(transport backend) and §2.4.2 (streaming cap): those sections state that the
+fetch is native and bounded; this section states the **phase decomposition**,
+**manifest shape**, and **verification sequence** that make the pull
+observably the same across implementations. `spec/plugin-contract.md` §2.4.5
+and §2.4.2 are not restated here — this section cross-references them rather
+than duplicating their text.
+
+> NOTE: `FETCH-OCI-*` and `FETCH-SHA256-MISMATCH`-family errors this section
+> raises are defined in `spec/errors.md`, not in this document's `TNG-*`
+> Appendix A — they are a different error domain (fetch/transport, not
+> registry-index parsing). The `TNG-BAD-OCI-DIGEST` / `TNG-UNSAFE-OCI-FIELD`
+> validators (§3.3, §4) remain the parse-time shape gate over the
+> index-declared `oci` provenance fields that feed the pull request this
+> section describes; they fire before any network request is made and are
+> orthogonal to the runtime checks below.
+
+### 7.1  Media types and reference form
+
+A milpa-published OCI artifact uses three fixed, milpa-owned media types
+(`spec/cli-contract.md` §10.3 is the publish-side statement of the same
+values; this is the pull-side consumer of them):
+
+- **Artifact type:** `application/vnd.milpa.source.v1`
+- **Config media type:** `application/vnd.oci.empty.v1+json` (the empty-config
+  descriptor — milpa artifacts carry no meaningful config blob)
+- **Layer media type:** `application/vnd.milpa.source.v1.tar+gzip`
+
+> NORMATIVE: A conformant pull implementation MUST address both the manifest
+> and its layer by **digest**, never by mutable tag. The `oci` provenance's
+> `digest` field (§3.3) is the sole pin; there is no tag-to-digest resolution
+> step on the consumer path (this is the same digest-pinning non-goal already
+> stated for this document's §2 scope).
+
+### 7.2  Phase decomposition: token → manifest → blob
+
+> NORMATIVE: A conformant pull implementation MUST decompose an OCI artifact
+> pull into exactly three phases, in this order: **token** acquisition (§7.3),
+> **manifest** fetch and shape validation (§7.4), and **blob** fetch and
+> verification (§7.5). This decomposition is a cross-impl conformance point,
+> not merely a wire-bytes formality: every transport-level failure MUST be
+> raised as `FETCH-OCI-PULL-FAILED` carrying a structured `phase` field whose
+> value is exactly `"token"`, `"manifest"`, or `"blob"` — identifying which
+> phase failed — plus the HTTP status when one was received. Implementations
+> MUST NOT collapse the three phases into a single undifferentiated failure,
+> and MUST NOT introduce additional phase values; a diagnostic tool or test
+> harness asserting on `phase=` MUST see the same value from every conformant
+> implementation for the same failure.
+
+> NOTE: `FETCH-OCI-PULL-FAILED` is the one slug covering every transport-phase
+> failure (token/manifest/blob), mirroring the tarball fetcher's single
+> `FETCH-DOWNLOAD-FAILED` economy. Digest-verification failure (§7.4, §7.5) is
+> a distinct slug, `FETCH-OCI-DIGEST-MISMATCH` — a content-integrity signal,
+> not a transport outage — and is never folded into `FETCH-OCI-PULL-FAILED`.
+
+### 7.3  Token acquisition (`phase="token"`)
+
+> NORMATIVE: A conformant pull implementation MUST acquire a bearer token
+> before the manifest request, **even for an anonymous/public artifact** —
+> ghcr and equivalent registries require a token exchange unconditionally. The
+> sequence is: (1) an unauthenticated request against the registry's base API
+> endpoint; (2) parse the `WWW-Authenticate` response header as an RFC-7235
+> challenge list; (3) select the `Bearer` challenge; (4) request a token from
+> the challenge's `realm` with `service` and `scope=repository:<repository>:pull`
+> query parameters; (5) read the token from the response body, accepting
+> **either** a `token` or an `access_token` JSON field (the OCI distribution
+> spec permits both).
+
+> NORMATIVE (challenge parsing is fail-closed): the `WWW-Authenticate` header
+> is an RFC-7235 list that MAY carry multiple challenges (e.g. a `Basic`
+> challenge alongside a `Bearer` one), with unordered, quoted parameters that
+> may contain escaped quotes or embedded commas. A conformant parser MUST: (a)
+> distinguish a bare scheme token from a continuing `key=value` parameter to
+> correctly segment multiple challenges; (b) select the `Bearer` challenge
+> specifically, never applying Bearer-shaped logic to a different scheme's
+> parameters; (c) when no `Bearer` challenge is present, raise
+> `FETCH-OCI-PULL-FAILED phase="token"` with a distinguishable
+> "unsupported auth scheme" message (a `Basic`-only self-hosted registry is
+> out of scope for v1) rather than silently misinterpreting the header; (d)
+> when the selected challenge's `realm` or `service` is missing or malformed,
+> fail closed with `phase="token"` rather than forwarding an absent/empty
+> value into the token-request URL.
+
+> NORMATIVE: The token and manifest HTTP responses MUST be read under a
+> small, fixed byte cap distinct from the blob cap (§7.5) — these are always
+> small JSON documents, never an unbounded stream. This is the "small fixed
+> cap to the token/manifest responses" `spec/plugin-contract.md` §2.4.2
+> requires; the two documents are not in tension, this section names the
+> phases that cap applies to.
+
+> NOTE: The reference implementations cache the acquired token per
+> `(registry, scope)` for the lifetime of one resolve, so that N deps pulled
+> from the same registry in one invocation issue one token challenge rather
+> than N concurrent ones (avoiding anonymous rate-limit pressure). Token
+> caching, its concurrency granularity, and expiry handling are
+> implementation-performance concerns, not required for pull correctness —
+> a conformant implementation MAY re-acquire a token per dep; it MUST NOT
+> reuse an **expired** token past the lifetime the token response declared.
+
+### 7.4  Manifest fetch and shape validation (`phase="manifest"`)
+
+> NORMATIVE: A conformant pull implementation MUST fetch the manifest by
+> digest (`GET .../manifests/<digest>`) with the acquired bearer token and an
+> `Accept` header naming both the OCI and Docker v2 manifest media types.
+> Before parsing the response body as JSON, the implementation MUST verify
+> `sha256(response_bytes) == <digest>` — the manifest fetch is digest-pinned
+> exactly like the blob fetch (§7.5). A mismatch MUST raise
+> `FETCH-OCI-DIGEST-MISMATCH` and MUST NOT be silently retried against another
+> candidate; a registry or CDN serving different bytes than the pinned digest
+> is an active supply-chain signal. (This is distinct from `TNG-BAD-OCI-DIGEST`,
+> the parse-time *shape* gate on the index-declared digest string, §3.3/§4 — a
+> shape gate over a string is not a content check over transported bytes.)
+
+> NORMATIVE (positive shape check — manifest list rejection): a manifest
+> response whose top-level shape is a manifest **list/index** (a `manifests[]`
+> array rather than a single manifest's `layers[]`) MUST be rejected as
+> `FETCH-OCI-PULL-FAILED phase="manifest"`, generically, before any
+> milpa-specific artifact policy is evaluated. A conformant implementation
+> MUST NOT let an unexpected top-level shape reach an unchecked array index —
+> failure MUST be a structured, deterministic error, never an implementation
+> exception leaking the underlying JSON shape.
+
+> NORMATIVE (the single-milpa-layer artifact-policy gate): once the manifest
+> is confirmed to be a single manifest (not a list), a conformant
+> implementation MUST apply milpa's own artifact-shape policy — the **one**
+> gate governing whether a manifest carries a valid milpa source artifact:
+>
+> 1. The manifest's `artifactType`, when present, MUST equal
+>    `application/vnd.milpa.source.v1` (§7.1). Its absence is tolerated
+>    (older or minimally-shaped manifests); a present-but-different value is
+>    treated identically to "no matching layer" (rule 3) — there is no
+>    separate error code for an artifactType mismatch, because semantically
+>    it collapses to the same "no valid milpa tarball present" outcome.
+> 2. The config descriptor's `mediaType`, when present, MUST equal
+>    `application/vnd.oci.empty.v1+json` (§7.1). Absence is tolerated for the
+>    same reason as rule 1; a present-but-different value collapses into rule
+>    3's outcome the same way.
+> 3. Among the manifest's `layers`, MUST select the layers whose `mediaType`
+>    equals `application/vnd.milpa.source.v1.tar+gzip` (§7.1). **Zero**
+>    matching layers (including the case where rule 1 or rule 2 already
+>    failed) MUST raise `FETCH-OCI-NO-TARBALL`. **More than one** matching
+>    layer MUST raise `FETCH-OCI-AMBIGUOUS-TARBALL`. Exactly one matching
+>    layer is the only success outcome; its `digest` and `size` descriptor
+>    fields are carried into the blob fetch (§7.5).
+>
+> This is the single artifact-policy predicate a conformant implementation
+> applies — there is no second, parallel shape check elsewhere in the pull
+> path. `spec/publishing`-side tooling (`spec/cli-contract.md` §10) SHOULD
+> emit manifests that satisfy this predicate by construction, and the
+> reference implementation additionally re-validates it before signing
+> (defense in depth on a format milpa fully owns).
+
+### 7.5  Blob fetch and verification (`phase="blob"`)
+
+> NORMATIVE: A conformant pull implementation MUST fetch the selected layer's
+> blob (`GET .../blobs/<layer-digest>`) with the bearer token, following any
+> redirect under `spec/plugin-contract.md` §2.4.5's origin-scoped
+> `Authorization`-stripping rule (cross-referenced, not restated here — that
+> rule is transport-generic, not OCI-specific). The response body MUST be
+> streamed to the fetch destination under the same **fixed**
+> `MAX_COMPRESSED_BYTES` cap tarball fetch enforces (`spec/plugin-contract.md`
+> §2.4.2/§2.4.5) — never the manifest's self-declared `size`. The manifest's
+> `size` field, when present and positive, MAY be used only to fail fast
+> (effectively `min(size, MAX_COMPRESSED_BYTES)`); when `size` is absent,
+> zero, or negative, the fixed cap alone governs — a publish-side bug that
+> emits `size: 0` MUST NOT cause a legitimate pull to be fail-fast-rejected.
+
+> NORMATIVE: The implementation MUST verify `sha256(blob_bytes) ==
+> <layer-digest>` as an unconditional, non-bypassable step of the blob-fetch
+> operation — there MUST NOT be a code path by which fetched blob bytes reach
+> extraction without this check having been performed. A mismatch MUST raise
+> `FETCH-OCI-DIGEST-MISMATCH` immediately and MUST NOT be silently retried.
+> This is the **compressed-transport-byte** integrity check; it is distinct
+> from, and does not substitute for, the post-extract `content_hash` check
+> over the extracted source tree (`spec/identity.md`) — the two checks cover
+> different hash domains (transported bytes vs. canonicalized extracted
+> tree) and catch different threats (a tampering registry/CDN vs. a
+> compromised publisher whose upload is internally consistent but drifts
+> from the lockfile's recorded identity). Neither check makes the other
+> optional.
+
+> NORMATIVE: Only after the digest verification above succeeds MAY the blob
+> be handed to the archive extractor (`spec/plugin-contract.md` §2.4.3's
+> `extract_tar`/`SafeExtractor` path, unchanged by this section). Extraction's
+> zip-slip / symlink-escape / decompression-bomb guards then apply to a
+> digest-verified archive exactly as they do for a tarball fetch.
+
+### 7.6  Relationship to the transport-backend contract
+
+> NOTE: `spec/plugin-contract.md` §2.4.5 states the native, no-shell-out
+> transport requirement and its cross-cutting behaviors (proxy env vars, OS
+> certificate trust, timeouts, redirect `Authorization` stripping) that apply
+> to every consumer-side fetch, OCI included. It also records a known,
+> accepted conformance gap: because `MILPA_MOCKED_FETCHES` replaces the OCI
+> fetcher wholesale, the token/manifest/blob state machine specified in this
+> section is **not observable through the black-box conformance corpus** —
+> cross-impl parity for it is instead provided at the unit tier by a shared
+> canned-transport contract (`conformance/oci-transport/`, deliberately
+> outside `conformance/spec-v<N>/`) that both implementations' OCI-client unit
+> tests replay. This section is the normative prose that contract's fixtures
+> exist to exercise.
 
 ---
 

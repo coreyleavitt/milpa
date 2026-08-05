@@ -16,6 +16,19 @@ flate2 = "1.1.9"
 bzip2-rs = "0.1"
 lzma-rs = "0.3"
 tar = "0.4"
+# deps-rationale: M7 (docs/rfc-native-oci-fetch.md security review) — the OCI
+# blob pull (`fetchers.rs::fetch_oci_with_client`) and the tarball download
+# (`fetch_tarball_with_decomp_cap`) both need a scratch directory for the raw
+# archive before it is verified/extracted. The prior PREDICTABLE sibling path
+# (`.{name}.oci-pull` / `.{name}.tarball-pull`, cleared via
+# remove_dir_all→create_dir_all) is a local-attacker TOCTOU window: a
+# symlink re-planted in the unlink/create gap makes the blob write follow it,
+# with no `O_NOFOLLOW`. `tempfile::TempDir` creates a securely-random-named
+# directory and removes it on drop, closing that window — mirrors the Python
+# twin's `tempfile.TemporaryDirectory`. Was previously a dev-dependency only
+# (used by tests); promoted here because both scratch-dir call sites are
+# production code, not test code.
+tempfile = "3"
 # deps-rationale: used in index_trust.rs for Sigstore bundle JSON parsing (integratedTime
 # extraction, bundle structure validation) without hand-rolling a parser. Also used by the
 # SigstoreVerifier inclusion adapter (rekor_adapter.rs) to reshape already-parsed protocol
@@ -85,5 +98,39 @@ x509-cert = { version = "0.2", default-features = false }
 # are the SAME crate version, not merely compatible ones.
 base64 = { version = "=0.22.1", default-features = false, features = ["alloc"] }
 
-[dev-dependencies]
-tempfile = "3"
+# deps-rationale: docs/rfc-native-oci-fetch.md §3.3/§0.1 — `bounded_http.rs`,
+# the native in-process HTTP transport primitive that replaces the `curl`/
+# `oras` consumer-side shell-outs (S2; callers migrate in S4). `ureq` is
+# pinned to the `rustls-no-provider` feature — deliberately NOT the `rustls`
+# umbrella feature, which pulls in `ring` via its own `_ring` convenience
+# feature — so the ONLY crypto backend in the graph is `aws-lc-rs`, the same
+# backend the vendored-sigstore graph already resolves (`rustls-webpki`'s
+# `aws-lc-rs` feature). `gzip` is deliberately NOT enabled: milpa's tarball/
+# OCI bodies are already-compressed archives at the application layer, not an
+# HTTP `Content-Encoding` — transport-level decompression would complicate
+# `MAX_COMPRESSED_BYTES`, which must bound wire bytes, not a post-decompress
+# count. Verify with `cargo tree -i aws-lc-sys` / `-i ring` after any bump.
+ureq = { version = "3", default-features = false, features = ["rustls-no-provider"] }
+# `rustls` is depended on directly (not just pulled in transitively through
+# ureq) so `bounded_http.rs` can build its own crypto provider via
+# `rustls::crypto::aws_lc_rs::default_provider()` and hand it to ureq's
+# `TlsConfig::unversioned_rustls_crypto_provider` — the upstream-documented
+# way to pin the provider without compiling in `ring`. Left at rustls's own
+# default feature set (`aws_lc_rs`, `std`, `tls12`, `logging`,
+# `prefer-post-quantum`) rather than hand-trimmed, since that is the
+# configuration upstream actually exercises.
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+# OS trust store (curl parity + enterprise/MITM roots, RFC §0.1), read at
+# runtime — NOT ureq's compiled-in `webpki-roots` feature, which would
+# silently stop honoring OS cert-store updates and drop MITM-proxy roots.
+rustls-native-certs = "0.8"
+# Already a transitive dependency of the sigstore graph (oauth2/openidconnect/
+# reqwest/tower-http/webbrowser all resolve `url` 2.5.8) — depended on
+# directly here only to parse `(scheme, host, port)` origins for the
+# Authorization-stripping redirect predicate (RFC §3.8) and to resolve
+# relative `Location` headers. No new crate enters the dependency graph.
+url = "2.5"
+# NOTE: `tempfile` was a [dev-dependencies]-only entry until M7 promoted it to
+# a production [dependencies] entry (above) — a crate's own [dependencies]
+# are already available to its tests, so no separate [dev-dependencies]
+# section is needed here.

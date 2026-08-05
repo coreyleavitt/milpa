@@ -4,8 +4,21 @@
 
 use super::*;
 
+use crate::bounded_http::{HttpResponse, Sink};
+
 fn tmp() -> tempfile::TempDir {
     tempfile::tempdir().unwrap()
+}
+
+/// Build an `HttpGet`-shaped closure that writes `bytes` straight to
+/// whatever `dest` path `fetch_tarball` supplies (H3: the seam is
+/// Path-based, not bytes-returning — this is the standard test-fixture
+/// shape shared by every tarball test below that just wants to hand a
+/// pre-built archive to the real fetch/extract path).
+fn http_from_bytes(bytes: Vec<u8>) -> impl Fn(&str, &Path) -> Result<(), HttpGetError> {
+    move |_url: &str, dest: &Path| {
+        std::fs::write(dest, &bytes).map_err(|e| HttpGetError::Other(format!("test write: {e}")))
+    }
 }
 
 // --- Local -----------------------------------------------------------------
@@ -1255,7 +1268,7 @@ fn registry_dispatches_local_produces_symlink() {
     };
     let dest = d.path().join("_deps/x");
     std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
-    let r = DefaultRegistry::with_curl()
+    let r = DefaultRegistry::production()
         .fetch("x", &prov, &dest)
         .unwrap();
     assert_eq!(r.resolved_ref, None);
@@ -1375,7 +1388,7 @@ fn tarball_extracts_bzip2() {
     let tbz = FIXTURE_BZ2_FOO.to_vec();
     // Sanity-check magic bytes: 42 5a 68 = "BZh"
     assert_eq!(&tbz[..3], b"BZh", "bzip2 magic bytes must be 42 5a 68");
-    let http = move |_: &str| Ok(tbz.clone());
+    let http = http_from_bytes(tbz);
     let dest = d.path().join("_deps/foo");
     fetch_tarball("foo", "https://e/foo.tar.bz2", None, 0, &dest, &http).unwrap();
     assert_eq!(std::fs::read(dest.join("foo.nim")).unwrap(), b"bz2");
@@ -1395,7 +1408,7 @@ fn tarball_extracts_xz() {
         &[0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00],
         "xz magic bytes must be fd 37 7a 58 5a 00"
     );
-    let http = move |_: &str| Ok(txz.clone());
+    let http = http_from_bytes(txz);
     let dest = d.path().join("_deps/foo");
     fetch_tarball("foo", "https://e/foo.tar.xz", None, 0, &dest, &http).unwrap();
     assert_eq!(std::fs::read(dest.join("foo.nim")).unwrap(), b"xz");
@@ -1417,21 +1430,9 @@ fn tarball_bzip2_xz_gz_same_tree_same_identity() {
     let tbz = FIXTURE_BZ2_IDENT.to_vec();
     let txz = FIXTURE_XZ_IDENT.to_vec();
 
-    fetch_tarball("gz", "https://e/id.tar.gz", None, 0, &dest_gz, &{
-        let b = tgz.clone();
-        move |_| Ok(b.clone())
-    })
-    .unwrap();
-    fetch_tarball("bz", "https://e/id.tar.bz2", None, 0, &dest_bz, &{
-        let b = tbz.clone();
-        move |_| Ok(b.clone())
-    })
-    .unwrap();
-    fetch_tarball("xz", "https://e/id.tar.xz", None, 0, &dest_xz, &{
-        let b = txz.clone();
-        move |_| Ok(b.clone())
-    })
-    .unwrap();
+    fetch_tarball("gz", "https://e/id.tar.gz", None, 0, &dest_gz, &http_from_bytes(tgz)).unwrap();
+    fetch_tarball("bz", "https://e/id.tar.bz2", None, 0, &dest_bz, &http_from_bytes(tbz)).unwrap();
+    fetch_tarball("xz", "https://e/id.tar.xz", None, 0, &dest_xz, &http_from_bytes(txz)).unwrap();
 
     let content_gz = std::fs::read(dest_gz.join("id.nim")).unwrap();
     let content_bz = std::fs::read(dest_bz.join("id.nim")).unwrap();
@@ -1450,7 +1451,7 @@ fn tarball_bzip2_xz_gz_same_tree_same_identity() {
 fn tarball_extracts_raw_tar() {
     let d = tmp();
     let tar = single_file_tar("foo.nim", b"echo 1");
-    let http = move |_: &str| Ok(tar.clone());
+    let http = http_from_bytes(tar);
     let dest = d.path().join("_deps/foo");
     fetch_tarball("foo", "https://e/foo.tar", None, 0, &dest, &http).unwrap();
     assert_eq!(std::fs::read(dest.join("foo.nim")).unwrap(), b"echo 1");
@@ -1460,17 +1461,54 @@ fn tarball_extracts_raw_tar() {
 fn tarball_extracts_gzip() {
     let d = tmp();
     let tgz = gzip(&single_file_tar("foo.nim", b"gz"));
-    let http = move |_: &str| Ok(tgz.clone());
+    let http = http_from_bytes(tgz);
     let dest = d.path().join("_deps/foo");
     fetch_tarball("foo", "https://e/foo.tar.gz", None, 0, &dest, &http).unwrap();
     assert_eq!(std::fs::read(dest.join("foo.nim")).unwrap(), b"gz");
 }
 
 #[test]
+fn tarball_scratch_dir_is_not_predictable_sibling_path() {
+    // M7 (TOCTOU finding): the download scratch dir must NOT be the
+    // predictable `.{name}.tarball-pull` sibling of `dest` — a local
+    // attacker could pre-plant a symlink at that exact, guessable path
+    // between the old code's `remove_dir_all` and `create_dir_all` calls.
+    // Prove it by inspecting the filesystem from INSIDE the injected
+    // `http_get` closure (called mid-fetch, after any scratch dir the
+    // production code would have created up front, before it is cleaned
+    // up on return) — a post-hoc "does it exist now" check would pass
+    // trivially either way, since both the old and new code clean up on
+    // every exit path.
+    let d = tmp();
+    let tgz = gzip(&single_file_tar("foo.nim", b"gz"));
+    let dest = d.path().join("_deps/foo");
+    std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+    let predictable_scratch = dest.parent().unwrap().join(".foo.tarball-pull");
+
+    let saw_predictable_scratch = std::sync::Arc::new(std::sync::Mutex::new(false));
+    let saw_predictable_scratch_c = std::sync::Arc::clone(&saw_predictable_scratch);
+    let predictable_scratch_c = predictable_scratch.clone();
+    let http = move |_url: &str, out: &Path| {
+        if predictable_scratch_c.exists() {
+            *saw_predictable_scratch_c.lock().unwrap() = true;
+        }
+        std::fs::write(out, &tgz).map_err(|e| HttpGetError::Other(format!("test write: {e}")))
+    };
+
+    fetch_tarball("foo", "https://e/foo.tar.gz", None, 0, &dest, &http).unwrap();
+
+    assert!(
+        !*saw_predictable_scratch.lock().unwrap(),
+        "M7: tarball scratch dir must never use the predictable .{{name}}.tarball-pull path"
+    );
+    assert!(!predictable_scratch.exists(), "predictable scratch path must never be created");
+}
+
+#[test]
 fn tarball_sha256_mismatch_rejects_before_extraction() {
     let d = tmp();
     let tar = single_file_tar("foo.nim", b"x");
-    let http = move |_: &str| Ok(tar.clone());
+    let http = http_from_bytes(tar);
     let dest = d.path().join("_deps/foo");
     let err = fetch_tarball(
         "foo",
@@ -1490,7 +1528,7 @@ fn tarball_sha256_match_accepts() {
     let d = tmp();
     let tar = single_file_tar("foo.nim", b"x");
     let want = super::sha256_hex(&tar);
-    let http = move |_: &str| Ok(tar.clone());
+    let http = http_from_bytes(tar);
     let dest = d.path().join("_deps/foo");
     fetch_tarball("foo", "https://e/foo.tar", Some(&want), 0, &dest, &http).unwrap();
     assert!(dest.join("foo.nim").is_file());
@@ -1499,7 +1537,7 @@ fn tarball_sha256_match_accepts() {
 #[test]
 fn tarball_download_failure_is_download_failed() {
     let d = tmp();
-    let http = |_: &str| Err(super::HttpGetError::Other("connection refused".to_string()));
+    let http = |_: &str, _dest: &Path| Err(super::HttpGetError::Other("connection refused".to_string()));
     let err = fetch_tarball(
         "foo",
         "https://e/foo.tar",
@@ -1535,7 +1573,7 @@ fn tarball_decompression_bomb_exceeding_cap_raises_size_limit() {
     // which is intentional for production.
     let d = tmp();
     let bomb = gzip_bomb_tar(8 * 1024);
-    let http = move |_: &str| Ok(bomb.clone());
+    let http = http_from_bytes(bomb);
     let dest = d.path().join("_deps/bomb");
 
     // Temporarily override Limits for this test.  We use the real gunzip
@@ -1583,7 +1621,7 @@ fn tarball_decompression_bomb_exceeding_cap_raises_size_limit() {
         out
     };
     let err = crate::safe_extract::extract_tar(
-        &raw_tar,
+        &raw_tar[..],
         &d.path().join("extract_dest"),
         0,
         small_limits,
@@ -1621,7 +1659,7 @@ fn tarball_gzip_bomb_detected_by_decomp_cap() {
     // the error path.  Together they confirm the guard is wired end-to-end.
     let d = tmp();
     let small_gz = gzip(&single_file_tar("ok.nim", b"hello"));
-    let http = move |_: &str| Ok(small_gz.clone());
+    let http = http_from_bytes(small_gz);
     let dest = d.path().join("_deps/ok");
     fetch_tarball("ok", "https://e/ok.tar.gz", None, 0, &dest, &http).unwrap();
     assert_eq!(std::fs::read(dest.join("ok.nim")).unwrap(), b"hello");
@@ -1694,7 +1732,7 @@ fn tarball_bz2_decompression_bomb_exceeding_cap_raises_size_limit() {
         out
     };
     let err = crate::safe_extract::extract_tar(
-        &raw_tar,
+        &raw_tar[..],
         &d.path().join("bz2_extract_dest"),
         0,
         small_limits,
@@ -1741,7 +1779,7 @@ fn tarball_xz_decompression_bomb_exceeding_cap_raises_size_limit() {
         out
     };
     let err = crate::safe_extract::extract_tar(
-        &raw_tar,
+        &raw_tar[..],
         &d.path().join("xz_extract_dest"),
         0,
         small_limits,
@@ -2023,7 +2061,7 @@ fn tarball_extracts_lzma_alone() {
     assert!(!lzma.starts_with(b"BZh"), "lzma-alone must not start with bz2 magic");
     assert!(!lzma.starts_with(&[0xfd, 0x37, 0x7a]), "lzma-alone must not start with xz magic");
 
-    let http = move |_: &str| Ok(lzma.clone());
+    let http = http_from_bytes(lzma);
     let dest = d.path().join("_deps/lzma");
     fetch_tarball("lzma", "https://e/foo.tar.lzma", None, 0, &dest, &http).unwrap();
     assert_eq!(
@@ -2077,7 +2115,7 @@ fn tarball_lzma_alone_bomb_exceeding_cap_raises_size_limit() {
     // extract_tar with a small limit.  This exercises the tar-entry-level guard
     // inside safe_extract — NOT the lzma decompressor level.
     let err_layer2 = crate::safe_extract::extract_tar(
-        &raw_tar,
+        &raw_tar[..],
         &d.path().join("lzma_bomb_layer2"),
         0,
         small_limits,
@@ -2102,8 +2140,7 @@ fn tarball_lzma_alone_bomb_exceeding_cap_raises_size_limit() {
     // guard fires inside the full public codepath.  The lzma-alone arm in
     // fetch_tarball_with_decomp_cap calls decompress_capped_lzma and propagates
     // EXTRACT-SIZE-LIMIT directly (line: `Err(e) if e.code() == "EXTRACT-SIZE-LIMIT" => return Err(e)`).
-    let lzma_bomb_clone = lzma_bomb.clone();
-    let http = move |_: &str| Ok(lzma_bomb_clone.clone());
+    let http = http_from_bytes(lzma_bomb.clone());
     let err_e2e = super::fetch_tarball_with_decomp_cap(
         "lzma-bomb",
         "https://e/bomb.tar.lzma",
@@ -2121,21 +2158,678 @@ fn tarball_lzma_alone_bomb_exceeding_cap_raises_size_limit() {
     );
 }
 
-// --- OCI (oras almost certainly absent in the container → pull-failed) ------
+// --- OCI (native client — token -> manifest -> blob; no oras) --------------
+//
+// `fetch_oci` composes `OciRegistryClient` directly (S8, RFC
+// docs/rfc-native-oci-fetch.md §3.2); these tests drive the injectable
+// `fetch_oci_with_client` seam over a small ordered fake transport rather
+// than a real registry, keeping the suite hermetic.
+//
+// `SeqOciTransport` is deliberately simpler than `oci_client_tests.rs`'s
+// `FixtureTransport`: it matches exchanges strictly in call order with no
+// redirect/cross-origin-strip handling, because that transport-hygiene
+// contract is already exhaustively covered at the client's own unit-test
+// level. This is a coarser composition smoke test — did `fetch_oci_with_client`
+// wire token -> manifest -> select_source_layer -> blob -> extract correctly.
+//
+// The happy-path exchanges are authored in-line (not read from
+// `conformance/oci-transport/happy-pull.json`, which is read-only): the
+// end-to-end extraction assertion needs a blob body that is an actual valid
+// gzip tarball, and the shared fixture's blob body is deliberately inert
+// bytes (it exists to test digest verification in `oci_client_tests.rs`
+// alone, which never decompresses it). The token/manifest exchange shape
+// mirrors that fixture exactly (same registry/repository, same challenge and
+// token-endpoint response shape) so the two suites stay structurally aligned.
+
+struct SeqExchange {
+    method: &'static str,
+    url: String,
+    status: u16,
+    headers: Vec<(&'static str, String)>,
+    body: Vec<u8>,
+}
+
+struct SeqOciTransport {
+    exchanges: Vec<SeqExchange>,
+    index: std::sync::Mutex<usize>,
+}
+
+impl SeqOciTransport {
+    /// M6: an inherent method — `OciTransport` is a bare closure alias now
+    /// (mirrors `HttpGet`'s precedent), so this fake is wrapped in a closure
+    /// at each `OciRegistryClient::new` call site instead of implementing a
+    /// trait.
+    fn request(
+        &self,
+        method: &str,
+        url: &str,
+        _headers: &[(&str, &str)],
+        cap: u64,
+        sink: Sink<'_>,
+    ) -> Result<HttpResponse, FetchError> {
+        let mut idx_guard = self.index.lock().unwrap();
+        let idx = *idx_guard;
+        let exch = self
+            .exchanges
+            .get(idx)
+            .unwrap_or_else(|| panic!("SeqOciTransport exhausted; unexpected {method} {url}"));
+        assert_eq!(method, exch.method, "exchange {}: method mismatch", idx + 1);
+        assert_eq!(url, exch.url, "exchange {}: url mismatch", idx + 1);
+        if exch.body.len() as u64 > cap {
+            return Err(FetchError::Transport(
+                "FETCH-DOWNLOAD-SIZE-EXCEEDED",
+                format!("response body exceeded download cap ({cap} bytes)"),
+            ));
+        }
+        match sink {
+            Sink::Bytes(buf) => buf.extend_from_slice(&exch.body),
+            Sink::File(path) => std::fs::write(path, &exch.body).unwrap(),
+        }
+        let mut hmap = ureq::http::HeaderMap::new();
+        for (k, v) in &exch.headers {
+            hmap.insert(
+                ureq::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                ureq::http::HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        let status = exch.status;
+        *idx_guard += 1;
+        Ok(HttpResponse { status, headers: hmap })
+    }
+}
+
+const OCI_TEST_REGISTRY: &str = "ghcr.io";
+const OCI_TEST_REPOSITORY: &str = "coreyleavitt/test-pkg";
 
 #[test]
-fn oci_pull_failure_is_pull_failed() {
+fn fetch_oci_with_client_native_pull_extracts_and_returns_receipt() {
     let d = tmp();
-    let err = fetch_oci(
+    let dest = d.path().join("_deps/x");
+    std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+
+    let tar_gz = gzip(&single_file_tar("hello.txt", b"hi\n"));
+    let blob_digest = format!("sha256:{}", sha256_hex(&tar_gz));
+    let manifest_body = format!(
+        "{{\"schemaVersion\":2,\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\
+         \"artifactType\":\"application/vnd.milpa.source.v1\",\
+         \"config\":{{\"mediaType\":\"application/vnd.oci.empty.v1+json\",\
+         \"digest\":\"sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a\",\"size\":2}},\
+         \"layers\":[{{\"mediaType\":\"application/vnd.milpa.source.v1.tar+gzip\",\
+         \"digest\":\"{blob_digest}\",\"size\":{}}}]}}",
+        tar_gz.len(),
+    );
+    let manifest_digest = format!("sha256:{}", sha256_hex(manifest_body.as_bytes()));
+
+    let exchanges = vec![
+        SeqExchange {
+            method: "GET",
+            url: format!("https://{OCI_TEST_REGISTRY}/v2/"),
+            status: 401,
+            headers: vec![(
+                "WWW-Authenticate",
+                "Bearer realm=\"https://ghcr.io/token\",service=\"ghcr.io\"".to_string(),
+            )],
+            body: Vec::new(),
+        },
+        SeqExchange {
+            method: "GET",
+            url: "https://ghcr.io/token?scope=repository%3Acoreyleavitt%2Ftest-pkg%3Apull&service=ghcr.io"
+                .to_string(),
+            status: 200,
+            headers: vec![],
+            body: br#"{"token": "test-token-abc"}"#.to_vec(),
+        },
+        SeqExchange {
+            method: "GET",
+            url: format!("https://{OCI_TEST_REGISTRY}/v2/{OCI_TEST_REPOSITORY}/manifests/{manifest_digest}"),
+            status: 200,
+            headers: vec![],
+            body: manifest_body.into_bytes(),
+        },
+        SeqExchange {
+            method: "GET",
+            url: format!("https://{OCI_TEST_REGISTRY}/v2/{OCI_TEST_REPOSITORY}/blobs/{blob_digest}"),
+            status: 200,
+            headers: vec![],
+            body: tar_gz,
+        },
+    ];
+    let transport = SeqOciTransport {
+        exchanges,
+        index: std::sync::Mutex::new(0),
+    };
+    let client = OciRegistryClient::new(
+        Box::new(move |m, u, h, c, s| transport.request(m, u, h, c, s)),
+        Arc::new(TokenCache::new()),
+    );
+
+    let receipt = fetch_oci_with_client(
+        &client,
         "x",
-        "ghcr.io",
-        "org/pkg",
-        "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-        &d.path().join("_deps/x"),
+        OCI_TEST_REGISTRY,
+        OCI_TEST_REPOSITORY,
+        &manifest_digest,
+        &dest,
+    )
+    .expect("native pull + extract");
+    assert_eq!(receipt.archive_sha256, None);
+    assert_eq!(std::fs::read(dest.join("hello.txt")).unwrap(), b"hi\n");
+}
+
+#[test]
+fn oci_scratch_dir_is_0700_secf1() {
+    // SecF1 (finding): same 0700 requirement as the tarball scratch dir
+    // (`tarball_scratch_dir_is_0700_secf1`) applies to the OCI blob scratch
+    // dir — it holds the in-flight UNVERIFIED compressed blob until the
+    // digest check passes.
+    use std::os::unix::fs::PermissionsExt;
+
+    let d = tmp();
+    let dest = d.path().join("_deps/permoci");
+    std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+
+    let tar_gz = gzip(&single_file_tar("hello.txt", b"hi\n"));
+    let blob_digest = format!("sha256:{}", sha256_hex(&tar_gz));
+    let manifest_body = format!(
+        "{{\"schemaVersion\":2,\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\
+         \"artifactType\":\"application/vnd.milpa.source.v1\",\
+         \"config\":{{\"mediaType\":\"application/vnd.oci.empty.v1+json\",\
+         \"digest\":\"sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a\",\"size\":2}},\
+         \"layers\":[{{\"mediaType\":\"application/vnd.milpa.source.v1.tar+gzip\",\
+         \"digest\":\"{blob_digest}\",\"size\":{}}}]}}",
+        tar_gz.len(),
+    );
+    let manifest_digest = format!("sha256:{}", sha256_hex(manifest_body.as_bytes()));
+
+    let exchanges = vec![
+        SeqExchange {
+            method: "GET",
+            url: format!("https://{OCI_TEST_REGISTRY}/v2/"),
+            status: 401,
+            headers: vec![(
+                "WWW-Authenticate",
+                "Bearer realm=\"https://ghcr.io/token\",service=\"ghcr.io\"".to_string(),
+            )],
+            body: Vec::new(),
+        },
+        SeqExchange {
+            method: "GET",
+            url: "https://ghcr.io/token?scope=repository%3Acoreyleavitt%2Ftest-pkg%3Apull&service=ghcr.io"
+                .to_string(),
+            status: 200,
+            headers: vec![],
+            body: br#"{"token": "test-token-abc"}"#.to_vec(),
+        },
+        SeqExchange {
+            method: "GET",
+            url: format!("https://{OCI_TEST_REGISTRY}/v2/{OCI_TEST_REPOSITORY}/manifests/{manifest_digest}"),
+            status: 200,
+            headers: vec![],
+            body: manifest_body.into_bytes(),
+        },
+        SeqExchange {
+            method: "GET",
+            url: format!("https://{OCI_TEST_REGISTRY}/v2/{OCI_TEST_REPOSITORY}/blobs/{blob_digest}"),
+            status: 200,
+            headers: vec![],
+            body: tar_gz,
+        },
+    ];
+    let transport = SeqOciTransport {
+        exchanges,
+        index: std::sync::Mutex::new(0),
+    };
+    let observed_mode: std::sync::Arc<std::sync::Mutex<Option<u32>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+    let observed_mode_for_closure = observed_mode.clone();
+    let client = OciRegistryClient::new(
+        Box::new(move |m, u, h, c, s| {
+            if let Sink::File(path) = &s {
+                if let Some(parent) = path.parent() {
+                    if let Ok(meta) = std::fs::metadata(parent) {
+                        *observed_mode_for_closure.lock().unwrap() =
+                            Some(meta.permissions().mode() & 0o777);
+                    }
+                }
+            }
+            transport.request(m, u, h, c, s)
+        }),
+        Arc::new(TokenCache::new()),
+    );
+
+    fetch_oci_with_client(
+        &client,
+        "x",
+        OCI_TEST_REGISTRY,
+        OCI_TEST_REPOSITORY,
+        &manifest_digest,
+        &dest,
+    )
+    .expect("native pull + extract");
+
+    assert_eq!(
+        observed_mode.lock().unwrap().expect("blob sink observed the scratch dir"),
+        0o700,
+        "OCI scratch dir must be created 0700, not umask-dependent"
+    );
+}
+
+#[test]
+fn fetch_oci_with_client_manifest_not_found_surfaces_pull_failed_phase_manifest() {
+    // 404 on the manifest GET (no blob exchange reached) → FETCH-OCI-PULL-FAILED,
+    // phase=manifest — mirrors `conformance/oci-transport/manifest-not-found.json`.
+    let d = tmp();
+    let dest = d.path().join("_deps/x");
+    std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+    let manifest_digest = "sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
+
+    let exchanges = vec![
+        SeqExchange {
+            method: "GET",
+            url: format!("https://{OCI_TEST_REGISTRY}/v2/"),
+            status: 401,
+            headers: vec![(
+                "WWW-Authenticate",
+                "Bearer realm=\"https://ghcr.io/token\",service=\"ghcr.io\"".to_string(),
+            )],
+            body: Vec::new(),
+        },
+        SeqExchange {
+            method: "GET",
+            url: "https://ghcr.io/token?scope=repository%3Acoreyleavitt%2Ftest-pkg%3Apull&service=ghcr.io"
+                .to_string(),
+            status: 200,
+            headers: vec![],
+            body: br#"{"token": "test-token-abc"}"#.to_vec(),
+        },
+        SeqExchange {
+            method: "GET",
+            url: format!(
+                "https://{OCI_TEST_REGISTRY}/v2/{OCI_TEST_REPOSITORY}/manifests/{manifest_digest}"
+            ),
+            status: 404,
+            headers: vec![],
+            body: Vec::new(),
+        },
+    ];
+    let transport = SeqOciTransport {
+        exchanges,
+        index: std::sync::Mutex::new(0),
+    };
+    let client = OciRegistryClient::new(
+        Box::new(move |m, u, h, c, s| transport.request(m, u, h, c, s)),
+        Arc::new(TokenCache::new()),
+    );
+
+    let err = fetch_oci_with_client(
+        &client,
+        "x",
+        OCI_TEST_REGISTRY,
+        OCI_TEST_REPOSITORY,
+        manifest_digest,
+        &dest,
     )
     .unwrap_err();
-    // oras absent (or the digest unresolvable) → pull failure.
     assert_eq!(err.code(), "FETCH-OCI-PULL-FAILED");
+    assert_eq!(err.phase(), Some("manifest"));
+}
+
+/// A raw (uncompressed) two-entry USTAR archive: a regular file that
+/// extracts successfully, followed by a symlink whose target escapes
+/// `dest` — `extract_tar` writes the first entry to disk, THEN aborts on
+/// the second (EXTRACT-SYMLINK-ESCAPE), leaving a partial tree unless the
+/// caller cleans up. Mirrors `safe_extract_tests.rs`'s `entry`/`finish`
+/// helpers (a different compilation unit with no shared scope, hence the
+/// duplication — same convention as `write_tar_checksum`'s doc comment).
+fn tar_with_file_then_symlink_escape(file_name: &str, file_data: &[u8], link_name: &str, link_target: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    {
+        let mut h = [0u8; 512];
+        let nb = file_name.as_bytes();
+        h[..nb.len().min(100)].copy_from_slice(&nb[..nb.len().min(100)]);
+        h[124..136].copy_from_slice(format!("{:011o}\0", file_data.len()).as_bytes());
+        h[156] = b'0';
+        write_tar_checksum(&mut h);
+        out.extend_from_slice(&h);
+        out.extend_from_slice(file_data);
+        let pad = (512 - file_data.len() % 512) % 512;
+        out.extend(std::iter::repeat_n(0u8, pad));
+    }
+    {
+        let mut h = [0u8; 512];
+        let nb = link_name.as_bytes();
+        h[..nb.len().min(100)].copy_from_slice(&nb[..nb.len().min(100)]);
+        h[124..136].copy_from_slice(format!("{:011o}\0", 0).as_bytes());
+        h[156] = b'2'; // symlink typeflag
+        let lb = link_target.as_bytes();
+        h[157..157 + lb.len().min(100)].copy_from_slice(&lb[..lb.len().min(100)]);
+        write_tar_checksum(&mut h);
+        out.extend_from_slice(&h);
+    }
+    out.extend(std::iter::repeat_n(0u8, 1024)); // end-of-archive marker
+    out
+}
+
+#[test]
+fn fetch_oci_with_client_extract_failure_leaves_no_partial_tree_at_dest() {
+    // L1: a digest-verified but STRUCTURALLY HOSTILE tar (a symlink whose
+    // target escapes `dest`, arriving as the SECOND entry so the first
+    // entry's file is genuinely written to disk before extraction aborts)
+    // must not leave a partial tree at `dest` — mirrors `fetch_tarball`'s
+    // analogous `remove_dir_all(dest)` cleanup on an `extract_tar` failure.
+    let d = tmp();
+    let dest = d.path().join("_deps/x");
+    std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+
+    let hostile_tar = tar_with_file_then_symlink_escape("ok.txt", b"ok\n", "escape", "../../etc/passwd");
+    let tar_gz = gzip(&hostile_tar);
+    let blob_digest = format!("sha256:{}", sha256_hex(&tar_gz));
+    let manifest_body = format!(
+        "{{\"schemaVersion\":2,\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\
+         \"artifactType\":\"application/vnd.milpa.source.v1\",\
+         \"config\":{{\"mediaType\":\"application/vnd.oci.empty.v1+json\",\
+         \"digest\":\"sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a\",\"size\":2}},\
+         \"layers\":[{{\"mediaType\":\"application/vnd.milpa.source.v1.tar+gzip\",\
+         \"digest\":\"{blob_digest}\",\"size\":{}}}]}}",
+        tar_gz.len(),
+    );
+    let manifest_digest = format!("sha256:{}", sha256_hex(manifest_body.as_bytes()));
+
+    let exchanges = vec![
+        SeqExchange {
+            method: "GET",
+            url: format!("https://{OCI_TEST_REGISTRY}/v2/"),
+            status: 401,
+            headers: vec![(
+                "WWW-Authenticate",
+                "Bearer realm=\"https://ghcr.io/token\",service=\"ghcr.io\"".to_string(),
+            )],
+            body: Vec::new(),
+        },
+        SeqExchange {
+            method: "GET",
+            url: "https://ghcr.io/token?scope=repository%3Acoreyleavitt%2Ftest-pkg%3Apull&service=ghcr.io"
+                .to_string(),
+            status: 200,
+            headers: vec![],
+            body: br#"{"token": "test-token-abc"}"#.to_vec(),
+        },
+        SeqExchange {
+            method: "GET",
+            url: format!("https://{OCI_TEST_REGISTRY}/v2/{OCI_TEST_REPOSITORY}/manifests/{manifest_digest}"),
+            status: 200,
+            headers: vec![],
+            body: manifest_body.into_bytes(),
+        },
+        SeqExchange {
+            method: "GET",
+            url: format!("https://{OCI_TEST_REGISTRY}/v2/{OCI_TEST_REPOSITORY}/blobs/{blob_digest}"),
+            status: 200,
+            headers: vec![],
+            body: tar_gz,
+        },
+    ];
+    let transport = SeqOciTransport {
+        exchanges,
+        index: std::sync::Mutex::new(0),
+    };
+    let client = OciRegistryClient::new(
+        Box::new(move |m, u, h, c, s| transport.request(m, u, h, c, s)),
+        Arc::new(TokenCache::new()),
+    );
+
+    let err = fetch_oci_with_client(
+        &client,
+        "x",
+        OCI_TEST_REGISTRY,
+        OCI_TEST_REPOSITORY,
+        &manifest_digest,
+        &dest,
+    )
+    .unwrap_err();
+    assert_eq!(err.code(), "FETCH-EXTRACT-FAILED");
+    assert!(
+        !dest.exists(),
+        "L1: a symlink-escape tar that aborts extraction partway through must not leave \
+         a partial tree at dest (the first entry's ok.txt was genuinely written before \
+         the second entry's escape aborted the loop)"
+    );
+}
+
+#[test]
+fn fetch_oci_scratch_dir_is_not_predictable_sibling_path() {
+    // M7 (TOCTOU finding): the OCI blob-pull scratch dir must NOT be the
+    // predictable `.{name}.oci-pull` sibling of `dest`. Checked from INSIDE
+    // the injected transport closure (invoked on the very first request —
+    // the token challenge — which the OLD code issued only AFTER already
+    // having called `create_dir_all` on the predictable path), the same
+    // "observe mid-flight, not post-hoc" technique as the tarball twin
+    // above — a check after `fetch_oci_with_client` returns would pass
+    // trivially either way, since both old and new code clean up on every
+    // exit path.
+    let d = tmp();
+    let dest = d.path().join("_deps/x");
+    std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+    let predictable_scratch = dest.parent().unwrap().join(".x.oci-pull");
+
+    let tar_gz = gzip(&single_file_tar("hello.txt", b"hi\n"));
+    let blob_digest = format!("sha256:{}", sha256_hex(&tar_gz));
+    let manifest_body = format!(
+        "{{\"schemaVersion\":2,\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\
+         \"artifactType\":\"application/vnd.milpa.source.v1\",\
+         \"config\":{{\"mediaType\":\"application/vnd.oci.empty.v1+json\",\
+         \"digest\":\"sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a\",\"size\":2}},\
+         \"layers\":[{{\"mediaType\":\"application/vnd.milpa.source.v1.tar+gzip\",\
+         \"digest\":\"{blob_digest}\",\"size\":{}}}]}}",
+        tar_gz.len(),
+    );
+    let manifest_digest = format!("sha256:{}", sha256_hex(manifest_body.as_bytes()));
+
+    let exchanges = vec![
+        SeqExchange {
+            method: "GET",
+            url: format!("https://{OCI_TEST_REGISTRY}/v2/"),
+            status: 401,
+            headers: vec![(
+                "WWW-Authenticate",
+                "Bearer realm=\"https://ghcr.io/token\",service=\"ghcr.io\"".to_string(),
+            )],
+            body: Vec::new(),
+        },
+        SeqExchange {
+            method: "GET",
+            url: "https://ghcr.io/token?scope=repository%3Acoreyleavitt%2Ftest-pkg%3Apull&service=ghcr.io"
+                .to_string(),
+            status: 200,
+            headers: vec![],
+            body: br#"{"token": "test-token-abc"}"#.to_vec(),
+        },
+        SeqExchange {
+            method: "GET",
+            url: format!("https://{OCI_TEST_REGISTRY}/v2/{OCI_TEST_REPOSITORY}/manifests/{manifest_digest}"),
+            status: 200,
+            headers: vec![],
+            body: manifest_body.into_bytes(),
+        },
+        SeqExchange {
+            method: "GET",
+            url: format!("https://{OCI_TEST_REGISTRY}/v2/{OCI_TEST_REPOSITORY}/blobs/{blob_digest}"),
+            status: 200,
+            headers: vec![],
+            body: tar_gz,
+        },
+    ];
+    let transport = SeqOciTransport {
+        exchanges,
+        index: std::sync::Mutex::new(0),
+    };
+    let saw_predictable_scratch = std::sync::Arc::new(std::sync::Mutex::new(false));
+    let saw_predictable_scratch_c = std::sync::Arc::clone(&saw_predictable_scratch);
+    let predictable_scratch_c = predictable_scratch.clone();
+    let client = OciRegistryClient::new(
+        Box::new(move |m, u, h, c, s| {
+            if predictable_scratch_c.exists() {
+                *saw_predictable_scratch_c.lock().unwrap() = true;
+            }
+            transport.request(m, u, h, c, s)
+        }),
+        Arc::new(TokenCache::new()),
+    );
+
+    fetch_oci_with_client(
+        &client,
+        "x",
+        OCI_TEST_REGISTRY,
+        OCI_TEST_REPOSITORY,
+        &manifest_digest,
+        &dest,
+    )
+    .expect("native pull + extract");
+
+    assert!(
+        !*saw_predictable_scratch.lock().unwrap(),
+        "M7: OCI scratch dir must never use the predictable .{{name}}.oci-pull path"
+    );
+    assert!(!predictable_scratch.exists(), "predictable scratch path must never be created");
+}
+
+#[test]
+fn fetch_oci_with_client_shared_cache_across_two_deps_issues_one_token_challenge() {
+    // #203: `fetch_oci` (the production entry `DefaultRegistry::fetch`
+    // calls) constructs a FRESH `OciRegistryClient` PER DEP but hands each
+    // one `Arc::clone(&DefaultRegistry::oci_token_cache)` — one shared cache
+    // for the life of a resolve. This test drives that exact composition —
+    // two independently constructed `OciRegistryClient`s, sharing one
+    // `Arc<TokenCache>`, each carried all the way through
+    // `fetch_oci_with_client`'s token -> manifest -> select_source_layer ->
+    // blob -> extract pipeline for a DIFFERENT digest — over the same
+    // ordered fake transport `SeqOciTransport` uses everywhere else in this
+    // suite. Only ONE token-challenge/token-endpoint exchange pair may be
+    // consumed across BOTH dep fetches; a second challenge would desync the
+    // fixture (wrong method/url at that index) and fail the test.
+    let d = tmp();
+    let dest1 = d.path().join("_deps/dep-one");
+    let dest2 = d.path().join("_deps/dep-two");
+    std::fs::create_dir_all(dest1.parent().unwrap()).unwrap();
+
+    let tar_gz_1 = gzip(&single_file_tar("one.txt", b"one\n"));
+    let blob_digest_1 = format!("sha256:{}", sha256_hex(&tar_gz_1));
+    let manifest_body_1 = format!(
+        "{{\"schemaVersion\":2,\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\
+         \"artifactType\":\"application/vnd.milpa.source.v1\",\
+         \"config\":{{\"mediaType\":\"application/vnd.oci.empty.v1+json\",\
+         \"digest\":\"sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a\",\"size\":2}},\
+         \"layers\":[{{\"mediaType\":\"application/vnd.milpa.source.v1.tar+gzip\",\
+         \"digest\":\"{blob_digest_1}\",\"size\":{}}}]}}",
+        tar_gz_1.len(),
+    );
+    let manifest_digest_1 = format!("sha256:{}", sha256_hex(manifest_body_1.as_bytes()));
+
+    let tar_gz_2 = gzip(&single_file_tar("two.txt", b"two\n"));
+    let blob_digest_2 = format!("sha256:{}", sha256_hex(&tar_gz_2));
+    let manifest_body_2 = format!(
+        "{{\"schemaVersion\":2,\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\
+         \"artifactType\":\"application/vnd.milpa.source.v1\",\
+         \"config\":{{\"mediaType\":\"application/vnd.oci.empty.v1+json\",\
+         \"digest\":\"sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a\",\"size\":2}},\
+         \"layers\":[{{\"mediaType\":\"application/vnd.milpa.source.v1.tar+gzip\",\
+         \"digest\":\"{blob_digest_2}\",\"size\":{}}}]}}",
+        tar_gz_2.len(),
+    );
+    let manifest_digest_2 = format!("sha256:{}", sha256_hex(manifest_body_2.as_bytes()));
+
+    // Exactly ONE token challenge + ONE token-endpoint exchange, followed by
+    // manifest+blob for dep 1, then DIRECTLY manifest+blob for dep 2 (no
+    // second challenge/token pair) — the fixture itself is the assertion:
+    // reusing the cached token for dep 2 is the only way these six
+    // exchanges satisfy `SeqOciTransport`'s strict in-order method/url match.
+    let exchanges = vec![
+        SeqExchange {
+            method: "GET",
+            url: format!("https://{OCI_TEST_REGISTRY}/v2/"),
+            status: 401,
+            headers: vec![(
+                "WWW-Authenticate",
+                "Bearer realm=\"https://ghcr.io/token\",service=\"ghcr.io\"".to_string(),
+            )],
+            body: Vec::new(),
+        },
+        SeqExchange {
+            method: "GET",
+            url: "https://ghcr.io/token?scope=repository%3Acoreyleavitt%2Ftest-pkg%3Apull&service=ghcr.io"
+                .to_string(),
+            status: 200,
+            headers: vec![],
+            body: br#"{"token": "shared-token-abc"}"#.to_vec(),
+        },
+        SeqExchange {
+            method: "GET",
+            url: format!("https://{OCI_TEST_REGISTRY}/v2/{OCI_TEST_REPOSITORY}/manifests/{manifest_digest_1}"),
+            status: 200,
+            headers: vec![],
+            body: manifest_body_1.into_bytes(),
+        },
+        SeqExchange {
+            method: "GET",
+            url: format!("https://{OCI_TEST_REGISTRY}/v2/{OCI_TEST_REPOSITORY}/blobs/{blob_digest_1}"),
+            status: 200,
+            headers: vec![],
+            body: tar_gz_1,
+        },
+        SeqExchange {
+            method: "GET",
+            url: format!("https://{OCI_TEST_REGISTRY}/v2/{OCI_TEST_REPOSITORY}/manifests/{manifest_digest_2}"),
+            status: 200,
+            headers: vec![],
+            body: manifest_body_2.into_bytes(),
+        },
+        SeqExchange {
+            method: "GET",
+            url: format!("https://{OCI_TEST_REGISTRY}/v2/{OCI_TEST_REPOSITORY}/blobs/{blob_digest_2}"),
+            status: 200,
+            headers: vec![],
+            body: tar_gz_2,
+        },
+    ];
+    // Wrapped in `Arc` (not moved whole into one closure) so BOTH clients'
+    // transport closures share the identical `index` counter — this is what
+    // lets the six exchanges above be consumed in one continuous sequence
+    // across the two separately-constructed `OciRegistryClient`s below,
+    // exactly as `DefaultRegistry::production()`'s real `bounded_http`
+    // transport is one shared backend across every `fetch_oci` call in a
+    // resolve.
+    let transport = std::sync::Arc::new(SeqOciTransport {
+        exchanges,
+        index: std::sync::Mutex::new(0),
+    });
+
+    let shared_cache = std::sync::Arc::new(TokenCache::new());
+
+    // Dep 1: a FRESH OciRegistryClient (mirrors `fetch_oci`'s per-fetch
+    // construction), sharing the cache.
+    let transport_for_client1 = std::sync::Arc::clone(&transport);
+    let client1 = OciRegistryClient::new(
+        Box::new(move |m, u, h, c, s| transport_for_client1.request(m, u, h, c, s)),
+        std::sync::Arc::clone(&shared_cache),
+    );
+    let receipt1 =
+        fetch_oci_with_client(&client1, "dep-one", OCI_TEST_REGISTRY, OCI_TEST_REPOSITORY, &manifest_digest_1, &dest1)
+            .expect("dep 1 native pull + extract");
+    assert_eq!(receipt1.archive_sha256, None);
+    assert_eq!(std::fs::read(dest1.join("one.txt")).unwrap(), b"one\n");
+
+    // Dep 2: ANOTHER fresh OciRegistryClient over the SAME transport,
+    // sharing the SAME Arc<TokenCache> — must NOT re-challenge for a token.
+    let transport_for_client2 = std::sync::Arc::clone(&transport);
+    let client2 = OciRegistryClient::new(
+        Box::new(move |m, u, h, c, s| transport_for_client2.request(m, u, h, c, s)),
+        std::sync::Arc::clone(&shared_cache),
+    );
+    let receipt2 =
+        fetch_oci_with_client(&client2, "dep-two", OCI_TEST_REGISTRY, OCI_TEST_REPOSITORY, &manifest_digest_2, &dest2)
+            .expect("dep 2 native pull + extract (reusing dep 1's cached token)");
+    assert_eq!(receipt2.archive_sha256, None);
+    assert_eq!(std::fs::read(dest2.join("two.txt")).unwrap(), b"two\n");
 }
 
 // --- CasAdmittingFetcher ---------------------------------------------------
@@ -2211,7 +2905,7 @@ fn cas_admitting_fetcher_local_provenance_is_live_symlink_not_cas_admitted() {
 
     let cas_root = d.path().join(".cas");
     let store = crate::store::CaStore::new(&cas_root);
-    let inner = super::DefaultRegistry::with_curl();
+    let inner = super::DefaultRegistry::production();
     // C-stage: no staging_root parameter — staging owned by CaStore::scratch().
     let fetcher = super::CasAdmittingFetcher::new(inner, store);
 
@@ -2605,7 +3299,7 @@ fn tarball_sha256_uppercase_bare_hex_matches() {
     let tar = single_file_tar("case.nim", b"case-content");
     let want_lower = super::sha256_hex(&tar);
     let want_upper = want_lower.to_uppercase();
-    let http = move |_: &str| Ok(tar.clone());
+    let http = http_from_bytes(tar);
     let dest = d.path().join("_deps/case");
     fetch_tarball("case", "https://e/case.tar", Some(&want_upper), 0, &dest, &http).unwrap();
     assert!(dest.join("case.nim").is_file());
@@ -2618,7 +3312,7 @@ fn tarball_sha256_uppercase_prefixed_matches() {
     let tar = single_file_tar("prefixcase.nim", b"prefixcase-content");
     let want_lower = super::sha256_hex(&tar);
     let want_upper_prefixed = format!("sha256:{}", want_lower.to_uppercase());
-    let http = move |_: &str| Ok(tar.clone());
+    let http = http_from_bytes(tar);
     let dest = d.path().join("_deps/prefixcase");
     fetch_tarball(
         "prefixcase",
@@ -2829,7 +3523,7 @@ fn h1_oversized_compressed_body_raises_download_size_exceeded() {
     let d = tmp();
     let tiny_cap: u64 = 16;
     let oversized: Vec<u8> = vec![0u8; tiny_cap as usize + 1];
-    let http = move |_: &str| Ok(oversized.clone());
+    let http = http_from_bytes(oversized);
     let err = super::fetch_tarball_with_cap(
         "bomb",
         "https://e/bomb.tar.gz",
@@ -2852,7 +3546,7 @@ fn h1_size_exceeded_distinct_from_network_failure() {
     let tiny_cap: u64 = 16;
 
     // Network failure path — transport returns Err.
-    let http_fail = |_: &str| Err::<Vec<u8>, _>(super::HttpGetError::Other("connection refused".to_string()));
+    let http_fail = |_: &str, _dest: &Path| Err(super::HttpGetError::Other("connection refused".to_string()));
     let err_fail = super::fetch_tarball_with_cap(
         "pkg",
         "https://e/pkg.tar.gz",
@@ -2867,7 +3561,7 @@ fn h1_size_exceeded_distinct_from_network_failure() {
 
     // Size-cap path — transport returns oversized bytes.
     let oversized: Vec<u8> = vec![0u8; tiny_cap as usize + 1];
-    let http_big = move |_: &str| Ok(oversized.clone());
+    let http_big = http_from_bytes(oversized);
     let err_big = super::fetch_tarball_with_cap(
         "pkg",
         "https://e/pkg.tar.gz",
@@ -2892,7 +3586,7 @@ fn h1_body_at_cap_minus_one_is_not_rejected_by_cap() {
     let tiny_cap: u64 = 1024;
     // cap-1 bytes of garbage (not a valid archive, but must not hit the cap).
     let under_cap: Vec<u8> = vec![0xffu8; (tiny_cap - 1) as usize];
-    let http = move |_: &str| Ok(under_cap.clone());
+    let http = http_from_bytes(under_cap);
     let result = super::fetch_tarball_with_cap(
         "under",
         "https://e/under.tar",
@@ -2924,8 +3618,8 @@ fn h1_streaming_transport_signals_size_exceeded_via_typed_error() {
     // must produce FETCH-DOWNLOAD-SIZE-EXCEEDED at the fetch layer.
     let d = tmp();
     let tiny_cap: u64 = 16;
-    let http_size_exceeded = |_: &str| {
-        Err::<Vec<u8>, _>(super::HttpGetError::SizeExceeded(
+    let http_size_exceeded = |_: &str, _dest: &Path| {
+        Err(super::HttpGetError::SizeExceeded(
             "compressed body exceeds cap".to_string(),
         ))
     };
@@ -2941,10 +3635,11 @@ fn h1_streaming_transport_signals_size_exceeded_via_typed_error() {
     .unwrap_err();
     assert_eq!(err.code(), "FETCH-DOWNLOAD-SIZE-EXCEEDED");
 
-    // Test B: a transport that returns more bytes than the cap triggers the
-    // post-read safety net in fetch_tarball_with_cap → FETCH-DOWNLOAD-SIZE-EXCEEDED.
+    // Test B: a transport that writes more bytes than the cap triggers the
+    // post-download stat-based safety net in fetch_tarball_with_cap →
+    // FETCH-DOWNLOAD-SIZE-EXCEEDED.
     let oversized: Vec<u8> = vec![0xffu8; tiny_cap as usize + 1];
-    let http_big = move |_: &str| Ok(oversized.clone());
+    let http_big = http_from_bytes(oversized);
     let err2 = super::fetch_tarball_with_cap(
         "bomb2",
         "https://e/bomb2.tar.gz",
@@ -2956,6 +3651,470 @@ fn h1_streaming_transport_signals_size_exceeded_via_typed_error() {
     )
     .unwrap_err();
     assert_eq!(err2.code(), "FETCH-DOWNLOAD-SIZE-EXCEEDED");
+}
+
+// --- H3: memory safety — the archive streams to a file, never a Vec<u8> ----
+// (docs/rfc-native-oci-fetch.md §3.3)
+
+#[test]
+fn fetch_tarball_cleans_up_scratch_archive_after_fetch() {
+    // H3: fetch_tarball_with_decomp_cap downloads into a scratch temp file
+    // (not an in-memory buffer) and must clean it up after a successful
+    // fetch — no leaked `.{name}.tarball-pull/` directory next to `dest`.
+    // The scratch dir's mere existence during the call (rather than a
+    // returned Vec<u8>) is the structural proof that a concurrent resolve
+    // with N tarball workers no longer holds N full compressed archives in
+    // process memory at once.
+    let d = tmp();
+    let tar = gzip(&single_file_tar("f.nim", b"x"));
+    let http = http_from_bytes(tar);
+    let dest = d.path().join("_deps/pkg");
+    fetch_tarball("pkg", "https://e/pkg.tar.gz", None, 0, &dest, &http).unwrap();
+
+    let scratch = d.path().join("_deps/.pkg.tarball-pull");
+    assert!(
+        !scratch.exists(),
+        "tarball download scratch dir must be cleaned up after fetch()"
+    );
+    assert_eq!(std::fs::read(dest.join("f.nim")).unwrap(), b"x");
+}
+
+#[test]
+fn fetch_tarball_cleans_up_scratch_archive_on_error_path() {
+    // H3: the scratch cleanup must also run on an error path — rejected
+    // before extraction (FETCH-SHA256-MISMATCH) — not just on success.
+    let d = tmp();
+    let tar = single_file_tar("f.nim", b"x");
+    let http = http_from_bytes(tar);
+    let dest = d.path().join("_deps/mismatch");
+    let err = fetch_tarball(
+        "mismatch",
+        "https://e/mismatch.tar",
+        Some("sha256:deadbeef"),
+        0,
+        &dest,
+        &http,
+    )
+    .unwrap_err();
+    assert_eq!(err.code(), "FETCH-SHA256-MISMATCH");
+
+    let scratch = d.path().join("_deps/.mismatch.tarball-pull");
+    assert!(
+        !scratch.exists(),
+        "tarball download scratch dir must be cleaned up even when the fetch is rejected"
+    );
+}
+
+// --- #202: extraction-side streaming (open_streaming_tar / CappedReader) ---
+// (docs/rfc-native-oci-fetch.md §3.3) — H3 above closed the DOWNLOAD-side
+// whole-archive buffer; these tests close the EXTRACTION-side one: the
+// gzip/bzip2 path no longer reads the archive into a `Vec<u8>` before
+// decompressing, nor decompresses into a second whole-archive `Vec<u8>`
+// before extracting — `File -> decoder -> CappedReader -> extract_tar`
+// streams throughout.
+
+/// Build a raw (uncompressed) tar archive containing several entries — the
+/// multi-entry sibling of `single_file_tar` (which only ever builds one file
+/// plus the end-of-archive marker per archive).
+fn multi_file_tar(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (name, data) in entries {
+        let mut h = [0u8; 512];
+        let nb = name.as_bytes();
+        h[..nb.len().min(100)].copy_from_slice(&nb[..nb.len().min(100)]);
+        h[124..136].copy_from_slice(format!("{:011o}\0", data.len()).as_bytes());
+        h[156] = b'0';
+        write_tar_checksum(&mut h);
+        out.extend_from_slice(&h);
+        out.extend_from_slice(data);
+        let pad = (512 - data.len() % 512) % 512;
+        out.extend(std::iter::repeat_n(0u8, pad));
+    }
+    out.extend(std::iter::repeat_n(0u8, 1024)); // end-of-archive marker
+    out
+}
+
+#[test]
+fn streaming_gzip_multi_member_archive_extracts_all_entries_correctly() {
+    // #202 (a): a valid MULTI-member archive must still extract byte-correct
+    // via the fully-streaming gzip pipeline (open_streaming_tar ->
+    // CappedReader -> extract_tar). A single-file archive (already covered by
+    // `tarball_extracts_gzip`) could accidentally pass even if the streaming
+    // rewrite mishandled inter-entry padding/framing across successive
+    // `TarEntries::next()` calls; three files across a subdirectory exercises
+    // that sequencing.
+    let d = tmp();
+    let raw = multi_file_tar(&[
+        ("a.nim", b"first file"),
+        ("sub/b.nim", b"second file, in a subdirectory"),
+        ("sub/c.nim", b"third file"),
+    ]);
+    let tgz = gzip(&raw);
+    let http = http_from_bytes(tgz);
+    let dest = d.path().join("_deps/multi");
+    fetch_tarball("multi", "https://e/multi.tar.gz", None, 0, &dest, &http).unwrap();
+    assert_eq!(std::fs::read(dest.join("a.nim")).unwrap(), b"first file");
+    assert_eq!(
+        std::fs::read(dest.join("sub/b.nim")).unwrap(),
+        b"second file, in a subdirectory"
+    );
+    assert_eq!(std::fs::read(dest.join("sub/c.nim")).unwrap(), b"third file");
+}
+
+#[test]
+fn capped_reader_streaming_gzip_bomb_fires_extract_size_limit() {
+    // #202 (b): the SA-1 decompression-bomb cap must still fire now that
+    // decompression is FUSED into extract_tar's streaming read via
+    // `CappedReader`, not enforced as a separate pre-extraction phase the way
+    // `decompress_capped` did for the old whole-buffer design. This exercises
+    // `CappedReader` + `extract_tar`'s `DecompCapExceeded` recognition
+    // directly (fast, no real gzip needed — `CappedReader` caps ANY `Read`).
+    let raw = single_file_tar("bomb.bin", &vec![0u8; 4096]);
+    let tiny_cap: u64 = 512;
+    let d = tmp();
+    let err = crate::safe_extract::extract_tar(
+        CappedReader::new(raw.as_slice(), tiny_cap),
+        &d.path().join("dest"),
+        0,
+        crate::safe_extract::Limits::default(),
+    )
+    .unwrap_err();
+    assert_eq!(
+        err.code(),
+        "EXTRACT-SIZE-LIMIT",
+        "CappedReader cap trip must surface as EXTRACT-SIZE-LIMIT from extract_tar \
+         (not a generic FETCH-EXTRACT-FAILED misreport of a deliberate cap trip as corruption)"
+    );
+    // `extract_tar` creates `dest` itself before reading any entry (existing,
+    // unrelated behavior — even a same-request `Limits` size-cap trip leaves
+    // an empty `dest`); what must NOT happen is any file landing inside it.
+    assert!(
+        !d.path().join("dest/bomb.bin").exists(),
+        "no partial extraction on a cap breach"
+    );
+}
+
+#[test]
+fn capped_reader_admits_exactly_cap_bytes_streaming() {
+    // #202 (b) / R1-08 boundary parity: a stream of EXACTLY `cap` bytes must
+    // be ADMITTED via the streaming CappedReader path too, same boundary
+    // semantics as `decompress_capped`'s whole-buffer cap.
+    let raw = single_file_tar("ok.bin", b"hello");
+    let cap = raw.len() as u64;
+    let d = tmp();
+    let res = crate::safe_extract::extract_tar(
+        CappedReader::new(raw.as_slice(), cap),
+        &d.path().join("dest"),
+        0,
+        crate::safe_extract::Limits::default(),
+    );
+    assert!(
+        res.is_ok(),
+        "stream of exactly cap={cap} bytes must be admitted, got {:?}",
+        res.err()
+    );
+    assert_eq!(std::fs::read(d.path().join("dest/ok.bin")).unwrap(), b"hello");
+}
+
+#[test]
+fn tarball_gzip_decompression_bomb_end_to_end_via_streaming_path() {
+    // #202 (b) end-to-end: a gzip archive whose decompressed size exceeds a
+    // tiny decomp_cap must still be rejected through the FULL public
+    // fetch_tarball_with_decomp_cap path (the fully-streaming gzip pipeline),
+    // not just at the direct extract_tar/CappedReader unit level above.
+    let d = tmp();
+    let raw = single_file_tar("bomb.bin", &vec![0u8; 4096]);
+    let tgz = gzip(&raw);
+    let http = http_from_bytes(tgz);
+    let tiny_decomp_cap: u64 = 512;
+    let err = super::fetch_tarball_with_decomp_cap(
+        "gzip-bomb",
+        "https://e/bomb.tar.gz",
+        None,
+        0,
+        &d.path().join("gzip_bomb_e2e"),
+        &http,
+        super::MAX_COMPRESSED_BYTES,
+        tiny_decomp_cap,
+    )
+    .unwrap_err();
+    // fetch_tarball_download_and_extract re-keys ANY extract_tar failure —
+    // including a decompression-cap trip, now that decompression is fused
+    // into extract_tar's streaming read — as FETCH-EXTRACT-FAILED (see the
+    // "Re-key any EXTRACT-* (or other) failure" comment there). The
+    // underlying EXTRACT-SIZE-LIMIT guard actually firing is proven directly
+    // by `capped_reader_streaming_gzip_bomb_fires_extract_size_limit` above;
+    // this test proves the guard is WIRED end-to-end through the public API.
+    assert_eq!(err.code(), "FETCH-EXTRACT-FAILED");
+    assert!(!d.path().join("gzip_bomb_e2e").exists());
+}
+
+#[test]
+fn extract_tar_drains_trailing_data_after_terminator_to_close_decomp_cap_bypass() {
+    // Security finding: `TarEntries::next()` stops reading its underlying
+    // stream the instant it sees the tar end-of-archive marker (the all-zero
+    // header block). Before the fix, nothing subsequently read the rest of
+    // the stream, so a `CappedReader`-wrapped decompressor never decompressed
+    // — and never counted against the SA-1 decompression-bomb cap — any data
+    // appended AFTER a well-formed tar's logical end. Build a REAL gzip
+    // stream (one member — flate2's `read::GzDecoder` only ever decodes the
+    // first member, so the vulnerability is exercised just as directly by
+    // oversizing a single member's trailing payload as it would be by a
+    // second concatenated member) whose decompressed content is a valid
+    // one-file tar plus its normal end-of-archive marker, followed by a huge
+    // block of extra bytes an attacker appended after the terminator.
+    let d = tmp();
+    let valid = single_file_tar("f.nim", b"hello");
+    let mut raw = valid.clone();
+    raw.extend(std::iter::repeat_n(0u8, 1 << 20)); // 1 MiB appended after the terminator
+    let tgz = gzip(&raw);
+
+    // Cap sized for the legitimate archive alone (header + padded data + the
+    // standard end-of-archive marker) — comfortably enough for any genuine
+    // tar, but far short of the 1 MiB trailer.
+    let tiny_cap: u64 = valid.len() as u64;
+
+    let err = crate::safe_extract::extract_tar(
+        CappedReader::new(flate2::read::GzDecoder::new(tgz.as_slice()), tiny_cap),
+        &d.path().join("dest"),
+        0,
+        crate::safe_extract::Limits::default(),
+    )
+    .unwrap_err();
+    assert_eq!(
+        err.code(),
+        "EXTRACT-SIZE-LIMIT",
+        "data appended after the tar terminator must still be decompressed and counted \
+         against the decompression-bomb cap (RED before the post-loop drain fix — the \
+         trailing megabyte was never read, so extraction used to succeed here)"
+    );
+    // NOTE: the cap trip is discovered during the post-loop drain, i.e.
+    // *after* pass 1 has already written `f.nim` to `dest` — so, per
+    // `extract_tar`'s documented contract ("partial extraction state on
+    // error is the caller's to clean up"), `dest/f.nim` legitimately still
+    // exists here. Real callers (`fetch_tarball_download_and_extract`,
+    // `pull_and_extract_oci`) both `remove_dir_all(dest)` on any `extract_tar`
+    // error — proven by `capped_reader_streaming_gzip_bomb_fires_extract_size_limit`
+    // and `tarball_gzip_decompression_bomb_end_to_end_via_streaming_path` above,
+    // which exercise that cleanup through the real caller wrappers.
+}
+
+#[test]
+fn extract_tar_drain_admits_ordinary_end_of_archive_padding() {
+    // Companion (no false positive): an ORDINARY archive — just the standard
+    // tar end-of-archive marker, no attacker payload appended — must still
+    // extract successfully even with the cap set to EXACTLY the archive's
+    // real decompressed length (R1-08 boundary: admits exactly `cap`,
+    // rejects `cap + 1`). The post-loop drain must not spuriously reject
+    // normal trailing padding.
+    let d = tmp();
+    let raw = single_file_tar("f.nim", b"hello");
+    let tgz = gzip(&raw);
+    let cap = raw.len() as u64;
+
+    let res = crate::safe_extract::extract_tar(
+        CappedReader::new(flate2::read::GzDecoder::new(tgz.as_slice()), cap),
+        &d.path().join("dest"),
+        0,
+        crate::safe_extract::Limits::default(),
+    );
+    assert!(
+        res.is_ok(),
+        "ordinary end-of-archive padding must not trip the cap during drain: {:?}",
+        res.err()
+    );
+    assert_eq!(std::fs::read(d.path().join("dest/f.nim")).unwrap(), b"hello");
+}
+
+#[test]
+fn tarball_scratch_dir_is_0700_secf1() {
+    // SecF1 (finding): under the default umask (022) `tempfile::Builder`
+    // without an explicit `.permissions(...)` creates the scratch dir 0755 —
+    // world-readable, exposing in-flight UNVERIFIED archive bytes to any
+    // local user before the digest check runs. Under umask 002 it is
+    // 0775 — group-writable, a TOCTOU window between the download write and
+    // the digest-verify read. The scratch dir must be 0700 regardless of the
+    // caller's umask, matching Python's `tempfile.TemporaryDirectory`
+    // (0o700 by default, umask-independent).
+    use std::os::unix::fs::PermissionsExt;
+
+    let d = tmp();
+    let observed_mode: std::sync::Arc<std::sync::Mutex<Option<u32>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+    let observed_mode_for_closure = observed_mode.clone();
+    let http = move |_url: &str, dest: &Path| -> Result<(), HttpGetError> {
+        let scratch_dir = dest.parent().expect("archive path has a parent scratch dir");
+        let mode = std::fs::metadata(scratch_dir).unwrap().permissions().mode() & 0o777;
+        *observed_mode_for_closure.lock().unwrap() = Some(mode);
+        std::fs::write(dest, gzip(&single_file_tar("f.nim", b"perm-check"))).unwrap();
+        Ok(())
+    };
+
+    let dest = d.path().join("_deps/permcheck");
+    fetch_tarball("permcheck", "https://e/x.tar.gz", None, 0, &dest, &http)
+        .expect("fetch succeeds");
+
+    assert_eq!(
+        observed_mode.lock().unwrap().expect("http_get observed the scratch dir"),
+        0o700,
+        "tarball scratch dir must be created 0700, not umask-dependent"
+    );
+}
+
+#[test]
+fn native_http_transport_streams_response_body_to_file_dest() {
+    // H3: native_http_transport (the production HttpGet) writes the response
+    // body directly to the caller-supplied file `dest` via
+    // `bounded_http::Sink::File` — never through an in-memory `Vec<u8>`
+    // buffer.  This is the production-seam proof (mirrors the injected-seam
+    // proof above): a concurrent resolve with N tarball workers no longer
+    // holds N full compressed archives in process memory at once.
+    use std::io::{BufRead, BufReader, Write as _};
+    use std::net::TcpListener;
+
+    let body = gzip(&single_file_tar("f.nim", b"streamed"));
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    let addr = listener.local_addr().unwrap();
+    let body_for_server = body.clone();
+    let handle = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap_or(0) == 0 || line.trim().is_empty() {
+                break;
+            }
+        }
+        let mut stream = stream;
+        let header = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body_for_server.len()
+        );
+        stream.write_all(header.as_bytes()).unwrap();
+        stream.write_all(&body_for_server).unwrap();
+    });
+
+    let d = tmp();
+    let dest = d.path().join("archive");
+    let transport = super::native_http_transport(super::MAX_COMPRESSED_BYTES);
+    transport(&format!("http://{addr}/pkg.tar.gz"), &dest).expect("request succeeds");
+    handle.join().unwrap();
+
+    assert_eq!(
+        std::fs::read(&dest).unwrap(),
+        body,
+        "native_http_transport must stream the response body into the dest file"
+    );
+}
+
+#[test]
+fn native_http_transport_non_2xx_status_maps_to_other_error() {
+    // RFC §3.4: bounded_http reports HTTP status as data; native_http_transport
+    // must translate a non-2xx status into HttpGetError::Other (not silently
+    // write the error body to dest and report success).
+    use std::io::{BufRead, BufReader, Write as _};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    let addr = listener.local_addr().unwrap();
+    let handle = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap_or(0) == 0 || line.trim().is_empty() {
+                break;
+            }
+        }
+        let mut stream = stream;
+        stream
+            .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .unwrap();
+    });
+
+    let d = tmp();
+    let dest = d.path().join("archive");
+    let transport = super::native_http_transport(super::MAX_COMPRESSED_BYTES);
+    let err = transport(&format!("http://{addr}/missing.tar.gz"), &dest).unwrap_err();
+    handle.join().unwrap();
+
+    match err {
+        super::HttpGetError::Other(msg) => assert!(msg.contains("404"), "message must mention the status: {msg}"),
+        other => panic!("expected HttpGetError::Other for a 404 status, got {other:?}"),
+    }
+}
+
+#[test]
+fn native_http_transport_file_scheme_reads_local_file() {
+    // RustF2 (finding — regression + cross-impl divergence): a `file://` URL
+    // cannot go through `bounded_http::request` (ureq is http-only, and its
+    // own scheme guard now rejects it), but the tarball transport lost this
+    // at the S4 curl→ureq swap. Mirrors `dep_decl_store.rs::http_get_bytes`'s
+    // identical `strip_prefix("file://")` direct-filesystem-read handling —
+    // and restores parity with Python's tarball.py (via bounded_http.py,
+    // which already special-cases `file://`'s status-less response).
+    let d = tmp();
+    let src = d.path().join("archive.tar.gz");
+    let body = gzip(&single_file_tar("f.nim", b"local-file-scheme"));
+    std::fs::write(&src, &body).unwrap();
+
+    let dest = d.path().join("downloaded");
+    let transport = super::native_http_transport(super::MAX_COMPRESSED_BYTES);
+    let url = format!("file://{}", src.display());
+    transport(&url, &dest).expect("file:// request succeeds");
+
+    assert_eq!(
+        std::fs::read(&dest).unwrap(),
+        body,
+        "native_http_transport must copy the local file's bytes into dest for a file:// URL"
+    );
+}
+
+#[test]
+fn native_http_transport_file_scheme_oversized_rejected() {
+    // RustF2: the compressed-cap semantics apply to file:// too — a giant
+    // local file must not bypass the cap that guards the network path.
+    let d = tmp();
+    let src = d.path().join("big.tar.gz");
+    std::fs::write(&src, vec![0u8; 100]).unwrap();
+
+    let dest = d.path().join("downloaded");
+    let transport = super::native_http_transport(10); // cap smaller than the 100-byte file
+    let url = format!("file://{}", src.display());
+    let err = transport(&url, &dest).unwrap_err();
+
+    match err {
+        super::HttpGetError::SizeExceeded(msg) => {
+            assert!(msg.contains("100"), "message must mention the actual size: {msg}");
+        }
+        other => panic!("expected HttpGetError::SizeExceeded for an oversized file:// body, got {other:?}"),
+    }
+    assert!(!dest.exists(), "an oversized file:// source must not be copied into dest");
+}
+
+#[test]
+fn fetch_tarball_file_scheme_fetches_and_extracts() {
+    // RustF2 characterization test: a `tarball=(url)"file:///abs/path/…"` dep
+    // fetches + extracts correctly end-to-end — parity with Python's
+    // TarballFetcher, which still supports file:// via bounded_http.py.
+    // Before this fix, this failed with FETCH-DOWNLOAD-FAILED (bounded_http's
+    // scheme guard rejecting file://).
+    let d = tmp();
+    let src = d.path().join("archive.tar.gz");
+    let body = gzip(&single_file_tar("f.nim", b"hello from file scheme"));
+    std::fs::write(&src, &body).unwrap();
+
+    let dest = d.path().join("_deps/filescheme");
+    let transport = super::native_http_transport(super::MAX_COMPRESSED_BYTES);
+    let url = format!("file://{}", src.display());
+    let receipt = fetch_tarball("filescheme", &url, None, 0, &dest, &transport)
+        .expect("file:// tarball fetch+extract succeeds");
+
+    assert_eq!(
+        std::fs::read_to_string(dest.join("f.nim")).unwrap(),
+        "hello from file scheme"
+    );
+    assert!(receipt.archive_sha256.is_some(), "receipt must carry the archive digest (TOFU)");
 }
 
 // --- R5: git argument injection hardening ----------------------------------
@@ -4049,7 +5208,7 @@ fn a0_default_registry_fetch_sets_identity_for_git_prov() {
     let url = format!("file://{}", repo.display());
     let dest = d.path().join("dest");
 
-    let registry = DefaultRegistry::with_curl();
+    let registry = DefaultRegistry::production();
     let prov = milpa_types::Provenance::Git {
         url: url.clone(),
         ref_spec: sha.clone(),
@@ -4086,7 +5245,7 @@ fn a0_receipt_identity_equals_compute_content_hash() {
     let url = format!("file://{}", repo.display());
     let dest = d.path().join("dest");
 
-    let registry = DefaultRegistry::with_curl();
+    let registry = DefaultRegistry::production();
     let prov = milpa_types::Provenance::Git {
         url,
         ref_spec: sha,
@@ -4114,7 +5273,7 @@ fn a0_default_registry_fetch_no_identity_for_local_prov() {
     let dest = d.path().join("_deps/mylib");
     std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
 
-    let registry = DefaultRegistry::with_curl();
+    let registry = DefaultRegistry::production();
     let prov = milpa_types::Provenance::Local { path: src.to_string_lossy().into_owned() };
     let receipt = registry.fetch("mylib", &prov, &dest).unwrap();
 
@@ -4138,7 +5297,7 @@ fn a0_cas_admitting_fetcher_inner_returns_registry_with_identity() {
     let dest = d.path().join("dest");
 
     let store = crate::store::CaStore::new(d.path().join("cas"));
-    let cas = CasAdmittingFetcher::new(DefaultRegistry::with_curl(), store);
+    let cas = CasAdmittingFetcher::new(DefaultRegistry::production(), store);
     let prov = milpa_types::Provenance::Git {
         url,
         ref_spec: sha,

@@ -20,6 +20,7 @@ use milpa_types::ResolvedGraph;
 
 pub mod atomic_cache;
 pub mod binding;
+pub mod bounded_http;
 pub mod dag_identity;
 pub mod dep_decl;
 pub mod dep_decl_store;
@@ -40,6 +41,7 @@ pub mod index_trust;
 pub mod lockfile;
 pub mod manifest_writer;
 pub mod nimcfg;
+pub mod oci_client;
 pub mod ratchet;
 pub mod registry;
 // Offline Rekor inclusion adapter (S2). `pub(crate)` API; consumed by `index_trust`'s

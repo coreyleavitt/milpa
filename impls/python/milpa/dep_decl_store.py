@@ -17,8 +17,8 @@ This file defines:
 
 ``HttpDepDeclStore(base_url: str, cache_dir: Path)``
     Production.  Artifact URL = ``<base_url>/dep-decl/<sha256_hex>.kdl``.
-    Caches immutably by hash (no TTL).  Uses the existing ``urllib`` transport
-    (same as ``index_cache.py``) — no new network machinery.
+    Caches immutably by hash (no TTL).  Uses ``bounded_http.request`` (same
+    native transport as ``index_cache.py``) — no bespoke network machinery.
 
 ``index_base_url(milpa_index_url: str) -> str``
     §3.3 normative URL-derivation: remove last segment if it matches
@@ -42,11 +42,13 @@ Spec authority: spec/dep-decl.md §3.5; docs/rfc-content-addressed-metadata.md
 from __future__ import annotations
 
 import contextlib
+import io
 import os
 import re
 from pathlib import Path
-from typing import Protocol
+from typing import Callable, Protocol
 
+from milpa import bounded_http
 from milpa.atomic_cache import atomic_write_bytes, read_verified_or_self_heal
 from milpa.dep_decl import dep_decl_hash
 from milpa.errors import (
@@ -182,6 +184,141 @@ class FileDepDeclStore:
 
 
 # ---------------------------------------------------------------------------
+# ContentAddressedHttpArtifactStore — the generic fetch-or-cache + hash-
+# verify shape shared by every HTTP artifact store in milpa (issue #201).
+# ---------------------------------------------------------------------------
+
+
+class ContentAddressedHttpArtifactStore:
+    """Generic content-addressed fetch-or-cache + hash-verify HTTP store.
+
+    ``HttpDepDeclStore`` (below) and ``HttpEntryBundleStore``
+    (``entry_bundle_store.py``) are both thin instantiations of this class.
+    They were previously two hand-written, structurally identical copies of
+    this exact fetch-or-cache + hash-verify sequence — unify them here
+    (CLAUDE.md: "Duplicate code paths are bugs ... unify them" — issue
+    #201). What varies per artifact kind (URL sub-path, cache file
+    extension, size cap, the hash-verify predicate, and the concrete
+    fetch-failed error) is supplied by the caller; everything else —
+    cache-first read with self-heal, cache-miss GET via ``bounded_http``,
+    HTTP-status-error handling, verify-before-cache, atomic cache write —
+    lives here once.
+
+    Sequence (identical across artifact kinds):
+        1. Cache-first read, self-healing a locally-corrupt cache entry
+           (``atomic_cache.read_verified_or_self_heal`` — CR16).
+        2. Cache miss: ``GET`` via ``bounded_http.request`` under ``max_bytes``.
+        3. A transport error or HTTP status >= 400 is remapped through
+           ``make_fetch_failed_error`` — the ONE fetch-failure contract for
+           this artifact kind, regardless of cause.
+        4. Verify the freshly-fetched bytes via ``verify`` BEFORE caching —
+           a mismatch here is always a hard error (never self-healed; see
+           ``read_verified_or_self_heal``'s docstring for why freshly-fetched
+           bytes must never be routed through the self-heal path).
+        5. Atomic, best-effort cache write (``atomic_cache.atomic_write_bytes``).
+
+    ``url_token`` (the first argument to ``get``/``is_cached``) is the
+    caller-resolved filename/URL segment — e.g. a bare hex digest for
+    DepDecl, a bare-hex bundle pin for attestation bundles. ``report_key``
+    (optional, defaults to ``url_token``) is what gets passed to ``verify``
+    and ``make_fetch_failed_error`` instead — this exists because
+    ``HttpDepDeclStore``'s public hash pointer (``sha256:<hex>``) differs
+    from the bare-hex token used in the URL/cache filename, and error
+    messages/kwargs must report the original, caller-facing pointer, not
+    the derived token. ``HttpEntryBundleStore``'s bundle pin has no such
+    split (the pin itself IS the URL token), so it never passes
+    ``report_key``.
+    """
+
+    def __init__(
+        self,
+        base_url: str,
+        cache_dir: Path,
+        *,
+        subpath: str,
+        extension: str,
+        max_bytes: int,
+        verify: "Callable[[bytes, str], None]",
+        make_fetch_failed_error: "Callable[[str, str, str], MilpaError]",
+    ) -> None:
+        self._base_url = base_url.rstrip("/")
+        self._cache_dir = cache_dir
+        self._subpath = subpath
+        self._extension = extension
+        self._max_bytes = max_bytes
+        self._verify = verify
+        self._make_fetch_failed_error = make_fetch_failed_error
+
+    def _artifact_url(self, url_token: str) -> str:
+        return f"{self._base_url}/{self._subpath}/{url_token}{self._extension}"
+
+    def _cache_path(self, url_token: str) -> Path:
+        return self._cache_dir / f"{url_token}{self._extension}"
+
+    def get(self, url_token: str, report_key: str | None = None) -> bytes:
+        """Fetch artifact bytes (cache-first), verify hash, return bytes.
+
+        ``report_key`` defaults to ``url_token`` — pass it explicitly when
+        the caller's public hash pointer differs from the URL/cache-filename
+        token (see class docstring).
+
+        Raises:
+            The fetch-failed error built by ``make_fetch_failed_error`` on a
+                network / file / status error.
+            Whatever ``verify`` raises on a hash mismatch (always a hard
+                error — SECURITY INVARIANT, see class docstring).
+        """
+        if report_key is None:
+            report_key = url_token
+
+        cache_path = self._cache_path(url_token)
+        cached_bytes = read_verified_or_self_heal(
+            cache_path, lambda b: self._verify(b, report_key)
+        )
+        if cached_bytes is not None:
+            return cached_bytes
+
+        # Cache miss: fetch from network.
+        artifact_url = self._artifact_url(url_token)
+        sink = io.BytesIO()
+        try:
+            resp = bounded_http.request(
+                "GET", artifact_url, cap=self._max_bytes, sink=sink
+            )
+        except MilpaError as exc:
+            # bounded_http.request itself raises MilpaError for both a
+            # transport failure and a cap breach (FETCH-DOWNLOAD-SIZE-
+            # EXCEEDED) — remap unconditionally so every fetch failure
+            # surfaces the ONE contract this artifact kind documents on its
+            # own store's ``get``, regardless of cause.
+            raise self._make_fetch_failed_error(report_key, artifact_url, exc.message) from exc
+        except Exception as exc:
+            raise self._make_fetch_failed_error(report_key, artifact_url, str(exc)) from exc
+
+        # file:// responses carry no HTTP status (bounded_http leaves it
+        # None) — only a genuine HTTP error status is a failure here.
+        if resp.status is not None and resp.status >= 400:
+            raise self._make_fetch_failed_error(report_key, artifact_url, f"HTTP {resp.status}")
+        fetched_bytes = sink.getvalue()
+
+        # Verify before caching — don't persist a corrupt/tampered artifact.
+        self._verify(fetched_bytes, report_key)
+
+        # Atomic write to cache (unique-per-write temp sibling + os.replace —
+        # registry-protocol §3.5.2 NORMATIVE (concurrency); see atomic_cache.py).
+        self._cache_dir.mkdir(parents=True, exist_ok=True)
+        with contextlib.suppress(OSError):
+            atomic_write_bytes(cache_path, fetched_bytes)
+            # Cache write failure is non-fatal; the bytes were already verified.
+
+        return fetched_bytes
+
+    def is_cached(self, url_token: str) -> bool:
+        """Return True iff the artifact is in the local cache (no network)."""
+        return self._cache_path(url_token).is_file()
+
+
+# ---------------------------------------------------------------------------
 # HttpDepDeclStore
 # ---------------------------------------------------------------------------
 
@@ -197,10 +334,15 @@ _DEP_DECL_CACHE_SUBDIR = "dep-decl"
 #: or misconfigured index can point dep_decl at an arbitrary URL, so we must
 #: never buffer an unbounded response body.
 #:
-#: Enforcement:
-#:   1. Content-Length header > cap → early-reject without reading the body.
-#:   2. Actual read capped at (cap + 1) bytes; if we get cap+1 we know the
-#:      body is oversized even when Content-Length was absent or lying.
+#: Enforcement: the transport (``bounded_http.request``, RFC docs/rfc-native-
+#: oci-fetch.md §3.3) streams the body and rejects as soon as the cumulative
+#: byte count exceeds the cap — the full response is never buffered past it.
+#: A pre-flight Content-Length-header early reject was possible under the
+#: old direct ``urllib.request.urlopen`` call; ``bounded_http.request`` is a
+#: single atomic ``(cap, sink)`` call with no header-peek hook, so that
+#: optimization is gone (NAMED behavior change — see
+#: test_http_store_lying_content_length_no_longer_pre_rejected).  The actual-
+#: bytes-cap enforcement, and therefore the security property, is unchanged.
 #:
 #: On exceed: raises ``TNG-DEPDECL-FETCH-FAILED`` (non-strict fallback is
 #: possible; strict mode is a hard fail — same policy as other fetch failures).
@@ -220,6 +362,22 @@ def _default_dep_decl_cache_dir() -> Path:
     return base / "milpa" / _DEP_DECL_CACHE_SUBDIR
 
 
+def _dep_decl_fetch_failed_error(dep_decl_hash_str: str, artifact_url: str, detail: str) -> MilpaError:
+    """Build the ``TNG-DEPDECL-FETCH-FAILED`` error for a fetch failure.
+
+    Passed to ``ContentAddressedHttpArtifactStore`` as
+    ``make_fetch_failed_error`` — this is the ONE place that builds this
+    error, regardless of whether the failure was a transport exception, a
+    cap breach, or an HTTP error status (``detail`` carries the specifics).
+    """
+    return MilpaError(
+        TNG_DEPDECL_FETCH_FAILED,
+        f"Failed to fetch DepDecl artifact from {artifact_url!r}: {detail}",
+        hash=dep_decl_hash_str,
+        url=artifact_url,
+    )
+
+
 class HttpDepDeclStore:
     """Production DepDecl store: fetch from HTTP + immutable cache.
 
@@ -235,20 +393,24 @@ class HttpDepDeclStore:
     clear message instructing the caller to set ``MILPA_DEP_DECL_DIR``
     (spec §3.3 NOTE on OCI).
 
-    Transport: ``urllib.request.urlopen`` (same as ``index_cache.py``).
-    No new network machinery.  Supports ``http://``, ``https://``, and
-    ``file://`` (air-gapped / local-mirror) schemes.
+    Transport: ``bounded_http.request`` (RFC docs/rfc-native-oci-fetch.md
+    §3.3 — the single native in-process transport every consumer HTTP call
+    site converges on).  Supports ``http://``, ``https://``, and ``file://``
+    (air-gapped / local-mirror) schemes.
     """
 
     def __init__(self, base_url: str, cache_dir: Path | None = None) -> None:
         self._base_url = base_url.rstrip("/")
         self._cache_dir = cache_dir if cache_dir is not None else _default_dep_decl_cache_dir()
-
-    def _artifact_url(self, hex_digest: str) -> str:
-        return f"{self._base_url}/dep-decl/{hex_digest}.kdl"
-
-    def _cache_path(self, hex_digest: str) -> Path:
-        return self._cache_dir / f"{hex_digest}.kdl"
+        self._core = ContentAddressedHttpArtifactStore(
+            self._base_url,
+            self._cache_dir,
+            subpath="dep-decl",
+            extension=".kdl",
+            max_bytes=_DEP_DECL_MAX_ARTIFACT_BYTES,
+            verify=_verify,
+            make_fetch_failed_error=_dep_decl_fetch_failed_error,
+        )
 
     def get(self, dep_decl_hash_str: str) -> bytes:
         """Fetch artifact bytes (cache-first), verify hash, return bytes.
@@ -261,10 +423,12 @@ class HttpDepDeclStore:
             MilpaError(TNG-DEPDECL-FETCH-FAILED): Network / file error.
             MilpaError(TNG-DEPDECL-HASH-MISMATCH): Hash mismatch.
         """
-        hex_digest = _hex_from_hash(dep_decl_hash_str)
-
-        # OCI: not supported — direct caller to MILPA_DEP_DECL_DIR.
+        # OCI: not supported — direct caller to MILPA_DEP_DECL_DIR.  This is
+        # a dep_decl-only pre-check (HttpEntryBundleStore has no OCI-base
+        # concept), so it stays here rather than in the shared
+        # ContentAddressedHttpArtifactStore core.
         if self._base_url.startswith("oci://"):
+            hex_digest = _hex_from_hash(dep_decl_hash_str)
             raise MilpaError(
                 TNG_DEPDECL_FETCH_FAILED,
                 f"OCI index base URLs ({self._base_url!r}) do not support the "
@@ -274,80 +438,8 @@ class HttpDepDeclStore:
                 base_url=self._base_url,
             )
 
-        # Cache-first (immutable: a hit is always valid; no staleness check).
-        # Self-heal on a locally-corrupt cache entry (CR16 — shared with
-        # HttpEntryBundleStore via atomic_cache.read_verified_or_self_heal): a
-        # mismatch on FRESHLY FETCHED bytes below (the server genuinely
-        # served the wrong content) stays a hard error — that path calls
-        # ``_verify`` directly and never reaches the self-heal primitive.
-        cache_path = self._cache_path(hex_digest)
-        artifact_bytes = read_verified_or_self_heal(
-            cache_path, lambda b: _verify(b, dep_decl_hash_str)
-        )
-        if artifact_bytes is not None:
-            return artifact_bytes
-
-        # Cache miss: fetch from network.
-        artifact_url = self._artifact_url(hex_digest)
-        fetched_bytes: bytes
-        try:
-            import urllib.request
-            with urllib.request.urlopen(artifact_url) as resp:  # noqa: S310
-                # R8: Early-reject on Content-Length header (fast path; header
-                # may lie, so we also cap the actual read below).
-                # file:// responses return a BufferedReader with no getheader;
-                # skip the header check for those (the read cap still applies).
-                raw_cl = resp.getheader("Content-Length") if hasattr(resp, "getheader") else None
-                if raw_cl is not None:
-                    try:
-                        cl = int(raw_cl)
-                    except ValueError:
-                        cl = 0
-                    if cl > _DEP_DECL_MAX_ARTIFACT_BYTES:
-                        raise MilpaError(
-                            TNG_DEPDECL_FETCH_FAILED,
-                            f"DepDecl artifact at {artifact_url!r} advertises "
-                            f"Content-Length {cl} which exceeds the "
-                            f"{_DEP_DECL_MAX_ARTIFACT_BYTES}-byte cap — "
-                            f"rejecting to prevent resource exhaustion",
-                            hash=dep_decl_hash_str,
-                            url=artifact_url,
-                        )
-                # Read at most (cap + 1) bytes; if we fill the buffer the body
-                # is oversized even when Content-Length was absent or lying.
-                buf = resp.read(_DEP_DECL_MAX_ARTIFACT_BYTES + 1)
-                if len(buf) > _DEP_DECL_MAX_ARTIFACT_BYTES:
-                    raise MilpaError(
-                        TNG_DEPDECL_FETCH_FAILED,
-                        f"DepDecl artifact at {artifact_url!r} exceeds the "
-                        f"{_DEP_DECL_MAX_ARTIFACT_BYTES}-byte cap "
-                        f"(read {len(buf)} bytes) — rejecting to prevent "
-                        f"resource exhaustion",
-                        hash=dep_decl_hash_str,
-                        url=artifact_url,
-                    )
-                fetched_bytes = buf
-        except MilpaError:
-            raise
-        except Exception as exc:
-            raise MilpaError(
-                TNG_DEPDECL_FETCH_FAILED,
-                f"Failed to fetch DepDecl artifact from {artifact_url!r}: {exc}",
-                hash=dep_decl_hash_str,
-                url=artifact_url,
-            ) from exc
-
-        # Verify before caching — don't persist a corrupt artifact.
-        _verify(fetched_bytes, dep_decl_hash_str)
-
-        # Atomic write to cache (unique-per-write temp sibling + os.replace —
-        # registry-protocol §3.5.2 NORMATIVE (concurrency); see atomic_cache.py).
-        self._cache_dir.mkdir(parents=True, exist_ok=True)
-        with contextlib.suppress(OSError):
-            atomic_write_bytes(cache_path, fetched_bytes)
-            # Cache write failure is non-fatal; the bytes were already verified.
-
-        return fetched_bytes
+        hex_digest = _hex_from_hash(dep_decl_hash_str)
+        return self._core.get(hex_digest, dep_decl_hash_str)
 
     def is_cached(self, dep_decl_hash_str: str) -> bool:
         """Return True iff the artifact is in the local cache (no network)."""
@@ -355,7 +447,7 @@ class HttpDepDeclStore:
             hex_digest = _hex_from_hash(dep_decl_hash_str)
         except ValueError:
             return False
-        return self._cache_path(hex_digest).is_file()
+        return self._core.is_cached(hex_digest)
 
 
 # ---------------------------------------------------------------------------

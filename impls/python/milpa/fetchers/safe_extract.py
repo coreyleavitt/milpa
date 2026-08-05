@@ -14,15 +14,48 @@ non-symlink, non-directory entry types are silently skipped.
 
 SA-1 decompression-bomb guard (Python path — two layers):
 
-Layer 1 — stream-level cap (H1b, defense-in-depth):
-  When the archive is compressed (gz/bz2/xz, detected by magic bytes), the entire
-  compressed stream is pre-decompressed with a hard byte cap (``Limits.decomp_cap``)
-  before ``tarfile`` sees any bytes.  If the decompressor produces more than
-  ``decomp_cap`` bytes, ``EXTRACT-SIZE-LIMIT`` is raised immediately.  This catches
-  decompression bombs that embed large payloads in compressed-stream padding —
-  bytes that never appear in any tar entry's ``member.size`` field and therefore
-  escape Layer 2.  Mirrors the Rust ``.take(decomp_cap)`` mechanism so both impls
-  guard the same threat.
+Layer 1 — stream-level cap (H1b, defense-in-depth), STREAMING (RFC
+docs/rfc-native-oci-fetch.md §3.3; formerly R1-23b, now implemented — see
+``extract_tar``'s docstring):
+  When the archive is compressed gz/bz2/xz (detected by magic bytes), the
+  compressed stream is fed through a genuine streaming decompressor
+  (``gzip.GzipFile`` / ``bz2.BZ2File`` / ``lzma.LZMAFile``) wrapped in
+  ``_CappedDecompressStream``, which ``tarfile`` (opened in stream mode,
+  ``"r|"``) pulls from block-by-block as it parses.  The cap is enforced AS
+  BYTES ARE PULLED — the archive's decompressed bytes are never buffered in
+  full; if the decompressor would produce more than ``decomp_cap`` bytes,
+  ``EXTRACT-SIZE-LIMIT`` is raised as soon as the excess is observed.  This
+  catches decompression bombs that embed large payloads in compressed-stream
+  padding — bytes that never appear in any tar entry's ``member.size`` field
+  and therefore escape Layer 2.  Mirrors the Rust ``CappedReader`` mechanism
+  (``fetchers.rs``, #202) so both impls guard the same threat the same way.
+
+  ``tarfile`` itself stops pulling from the stream the instant it sees the
+  tar logical end-of-archive marker (two zero blocks) — it never asks for
+  bytes concatenated AFTER that marker (e.g. a second, unrelated compressed
+  member appended past an otherwise well-formed tar).  To keep the cap
+  covering the WHOLE decompressed stream — not just the prefix ``tarfile``
+  happened to consume — ``extract_tar`` DRAINS the remaining
+  ``_CappedDecompressStream`` to EOF once extraction finishes, reading in
+  small bounded chunks and discarding them.  For a legitimate archive the
+  drain reads only tar's own small trailing record-size padding (a few KiB)
+  and is cheap; for a bomb tail, ``_CappedDecompressStream`` raises
+  ``EXTRACT-SIZE-LIMIT`` once the cumulative decompressed byte count crosses
+  ``decomp_cap``, exactly as it would have if ``tarfile`` had kept reading
+  itself.  Trailing bytes strictly under the cap are not a bomb and extract
+  normally.
+
+  The one exception is the legacy, magic-byte-less lzma-alone format
+  (``.tar.lzma``): disambiguating it from a coincidentally-similar plain tar
+  requires a bounded trial decode, so this one narrow case is bounded-
+  buffered rather than block-by-block streaming, and it delegates directly
+  to ``_decompress_capped`` (the single place this probe-decode-and-cap
+  logic lives, used by both the buffered ``_decompress_capped``-only callers
+  and this streaming path's lzma-alone branch) — matching the Rust
+  implementation's own documented compromise for the identical ambiguity
+  problem.  It remains bounded by ``decomp_cap`` (not unbounded), just not
+  O(largest-member) — and, being fully buffered already, needs no separate
+  drain step.
 
 Layer 2 — per-entry header cap:
   Python's ``tarfile`` reads ``member.size`` (uncompressed size) from each tar
@@ -277,6 +310,93 @@ def _decompress_capped(
     return (raw, fmt)
 
 
+# ---------------------------------------------------------------------------
+# Streaming decompression-bomb cap (RFC docs/rfc-native-oci-fetch.md §3.3,
+# formerly R1-23b) — the ``extract_tar`` sibling of ``_decompress_capped``
+# ---------------------------------------------------------------------------
+
+
+class _CappedDecompressStream:
+    """A ``read(size)``-only file-like wrapper enforcing the SA-1
+    decompression-bomb cap AS A STREAMING CAP.
+
+    ``extract_tar`` opens ``tarfile`` in stream mode (``"r|"``) against this
+    wrapper, so ``tarfile`` pulls decompressed bytes block-by-block as it
+    parses tar headers and member data — the decompressed archive is never
+    buffered in full; only this wrapper's small internal counter plus
+    whatever ``tarfile``/the current tar member holds is ever in memory at
+    once.  Mirrors Rust's ``CappedReader`` (``fetchers.rs``, #202).
+
+    Same boundary semantics as ``_decompress_capped``: a stream of EXACTLY
+    ``cap`` bytes is admitted; ``cap + 1`` or more trips
+    ``MilpaError(EXTRACT_SIZE_LIMIT)``.  Reads are clamped to the remaining
+    budget so we never hand back more than ``cap`` bytes before the boundary
+    is checked; once at the boundary, a single 1-byte probe on the inner
+    decompressor distinguishes "the stream legitimately ends exactly at
+    ``cap``" (probe reads empty → admitted) from "the stream continues past
+    ``cap``" (probe reads data → decompression bomb, raise).
+    """
+
+    def __init__(self, inner: IO[bytes], cap: int, fmt: str) -> None:
+        self._inner = inner
+        self._cap = cap
+        self._fmt = fmt
+        self._read = 0
+
+    def read(self, size: int = -1) -> bytes:
+        if size is None or size < 0:
+            # tarfile's stream mode always requests an explicit block size;
+            # this branch is a defensive fallback for a generic read-all
+            # call, bounded by the same cap boundary logic below.
+            size = self._cap - self._read + 1
+        if self._read < self._cap:
+            remaining = self._cap - self._read
+            chunk = self._inner.read(min(size, remaining))
+            self._read += len(chunk)
+            return chunk
+        probe = self._inner.read(1)
+        if probe:
+            raise MilpaError(
+                EXTRACT_SIZE_LIMIT,
+                f"decompressed archive stream exceeds cap ({self._cap} bytes); "
+                f"possible decompression bomb (format: {self._fmt})",
+                cap=self._cap,
+                format=self._fmt,
+            )
+        return b""
+
+
+#: Number of leading bytes peeked from the archive to detect its compression
+#: format — long enough for the lzma-alone structural header check (13 B),
+#: which is the widest of the gz(2)/bz2(3)/xz(6)/lzma-alone(13) magics.
+_MAGIC_PEEK_LEN = 13
+
+#: Bounded chunk size used to drain a ``_CappedDecompressStream`` after
+#: ``tarfile`` stops reading it (see ``_drain_capped_stream``).  Small and
+#: fixed so the drain never issues a large/whole-remainder read.
+_DRAIN_CHUNK_SIZE = 1 << 16  # 64 KiB
+
+
+def _drain_capped_stream(stream: "_CappedDecompressStream") -> None:
+    """Read ``stream`` to EOF, discarding bytes, in bounded chunks.
+
+    ``tarfile`` (stream mode ``"r|"``) stops pulling from ``stream`` the
+    moment it sees the tar logical end-of-archive marker (two zero blocks) —
+    any compressed data concatenated AFTER that marker (e.g. a second gzip
+    member) is therefore never read, never decompressed, and never counted
+    by ``_CappedDecompressStream``'s cap.  Calling this after extraction
+    finishes restores the "cap covers the WHOLE decompressed stream"
+    guarantee: for a legitimate archive the remaining bytes are only tar's
+    own small record-size zero-padding, so the drain is cheap; for a bomb
+    tail, ``_CappedDecompressStream.read`` raises
+    ``MilpaError(EXTRACT_SIZE_LIMIT)`` once the cumulative decompressed byte
+    count exceeds its cap — exactly as it would have if ``tarfile`` itself
+    had kept reading.
+    """
+    while stream.read(_DRAIN_CHUNK_SIZE):
+        pass
+
+
 #: Singleton used as the ``extract_tar`` default so ruff B008 (no call in
 #: default position) is satisfied while preserving the normative defaults.
 _DEFAULT_LIMITS = Limits()
@@ -303,7 +423,14 @@ def extract_tar(
     """Extract a tar archive (any compression tarfile supports) into *dest*.
 
     Args:
-        archive:          Path or file-object for the archive.
+        archive:          Path, or a seekable binary file-object (e.g. an
+                          already-open file or ``io.BytesIO``), for the
+                          archive.  A ``Path``/``str`` is opened (and closed
+                          on return) here; a file-object is used as-is and
+                          NEVER closed by this function (the caller owns
+                          it) — it must be positioned at the start of the
+                          archive and support ``seek()`` (format detection
+                          peeks the leading bytes, then rewinds).
         dest:             Directory into which entries are extracted (created if absent).
         strip_components: Drop this many leading path components per entry
                           (like ``tar --strip-components=N``).  Entries with
@@ -323,37 +450,96 @@ def extract_tar(
     # caller passed a symlink-containing path.
     dest_root = dest.resolve()
 
+    # RFC docs/rfc-native-oci-fetch.md §3.3 (formerly R1-23b, now
+    # implemented): the archive is STREAMED, never buffered in full — a
+    # bare Path/str is opened here (and closed below regardless of how
+    # extraction below exits, success or raise); an already-open
+    # file-object is used as-is and left for the caller to manage.
+    owns_file = isinstance(archive, (str, Path))
+    f: IO[bytes] = open(archive, "rb") if owns_file else archive  # type: ignore[assignment]
+    try:
+        return _extract_tar_streaming(
+            f, dest_root, strip_components=strip_components, limits=limits
+        )
+    finally:
+        if owns_file:
+            f.close()
+
+
+def _extract_tar_streaming(
+    f: IO[bytes],
+    dest_root: Path,
+    *,
+    strip_components: int,
+    limits: Limits,
+) -> ExtractionResult:
+    """Format-detect ``f`` and stream-extract into ``dest_root``.
+
+    Split out of ``extract_tar`` purely so that function can guarantee a
+    Path/str-opened archive is closed via ``finally`` regardless of which
+    branch below raises — ``f`` itself is never closed here.
+    """
     total_bytes = 0
     file_count = 0
 
-    # SA-1 decompression-bomb guard — Layer 1: stream-level cap (H1b).
-    # Read the archive bytes upfront so we can (a) detect the compression format
-    # by magic bytes and (b) pre-decompress with a hard byte cap before tarfile
-    # sees any bytes.  This catches decompression bombs embedded in compressed-
-    # stream padding that never appears in any tar entry's member.size field and
-    # would therefore escape Layer 2's per-entry checks.
-    # Mirrors the Rust `.take(decomp_cap)` mechanism (single source of truth
-    # per impl: `_decompress_capped` in this module).
-    #
-    # Memory note (R1-23b): this path buffers the whole compressed archive then
-    # the whole decompressed stream in memory.  Both are bounded by
-    # limits.decomp_cap (≤ ~1 GiB by default).  A streaming rewrite would reduce
-    # peak RSS but is a large refactor; it is deliberately deferred.
-    if isinstance(archive, (str, Path)):
-        raw_archive_bytes = Path(archive).read_bytes()
+    # SA-1 decompression-bomb guard — Layer 1: STREAMING stream-level cap
+    # (H1b; RFC docs/rfc-native-oci-fetch.md §3.3, formerly R1-23b).
+    # Peek the leading bytes to detect the compression format, then rewind
+    # to the start — detection must not consume bytes tarfile will read.
+    # Mirrors the Rust `CappedReader`/`open_streaming_tar` mechanism
+    # (`fetchers.rs`, #202): the decompressed archive is never buffered in
+    # full, only pulled block-by-block as tarfile parses it.
+    magic = f.read(_MAGIC_PEEK_LEN)
+    f.seek(0)
+
+    tar_source: IO[bytes]
+    tar_mode: str
+    if magic[:2] == _MAGIC_GZIP:
+        tar_source = _CappedDecompressStream(  # type: ignore[assignment]
+            gzip.GzipFile(fileobj=f), limits.decomp_cap, "gz"
+        )
+        tar_mode = "r|"
+    elif magic[:3] == _MAGIC_BZ2:
+        tar_source = _CappedDecompressStream(  # type: ignore[assignment]
+            bz2.BZ2File(f), limits.decomp_cap, "bz2"
+        )
+        tar_mode = "r|"
+    elif magic[:6] == _MAGIC_XZ:
+        tar_source = _CappedDecompressStream(  # type: ignore[assignment]
+            lzma.LZMAFile(f, format=lzma.FORMAT_XZ), limits.decomp_cap, "xz"
+        )
+        tar_mode = "r|"
+    elif _is_lzma_alone_header(magic):
+        # R2-02 + R3-01 NORMATIVE: this ambiguous, magic-byte-less legacy
+        # format is the one path that stays bounded-buffered rather than
+        # O(largest-member) streaming, matching the Rust implementation's
+        # own compromise for the identical tar/lzma-alone disambiguation
+        # problem.  Being already bounded-buffered by design, it delegates
+        # directly to `_decompress_capped` — the single place the
+        # structural-header-check + guarded-attempt-decode + cap logic
+        # lives — instead of reimplementing it inline.  `f` is positioned at
+        # 0 (see the magic-peek/seek(0) above), so `f.read()` reads the
+        # whole archive; `_decompress_capped` re-runs its own format
+        # detection (redundant with the `_is_lzma_alone_header(magic)` check
+        # above, since it only saw a 13-byte peek) and re-validates against
+        # the full bytes, then decodes+caps identically for both the
+        # lzma-alone-success case (`fmt == "lzma"`) and the
+        # not-actually-lzma fallthrough case (`fmt == "tar"`, original bytes
+        # returned unchanged) — both land on the same `io.BytesIO` + `"r:"`
+        # handling below, since this branch is unconditionally buffered.
+        result = _decompress_capped(f.read(), limits.decomp_cap)
+        assert result is not None  # _decompress_capped raises on cap breach, never returns None
+        raw_bytes, _fmt = result
+        tar_source = io.BytesIO(raw_bytes)
+        tar_mode = "r:"
     else:
-        raw_archive_bytes = archive.read()
-
-    # Layer 1: apply the stream-level decompressor cap (H1b).
-    # _decompress_capped raises EXTRACT-SIZE-LIMIT if the decompressed stream
-    # exceeds limits.decomp_cap.  For plain tar (no magic match) it returns
-    # the original bytes unchanged without any cap check.
-    raw_tar_bytes, _archive_fmt = _decompress_capped(raw_archive_bytes, limits.decomp_cap)
-
-    # Open with mode "r:" (plain tar — already decompressed above) or "r:*"
-    # if format detection returned "tar" (no magic match → may be plain or
-    # an unrecognised compressed format; let tarfile decide).
-    tar_mode = "r:" if _archive_fmt != "tar" else "r:*"
+        # No recognised magic — may be plain tar or an unrecognised
+        # compressed format; let tarfile's own auto-detect decide (streaming
+        # sibling of the old "r:*" fallback).  No cap applied here, matching
+        # prior behaviour (Layer 2's per-entry checks cover this case).
+        f.seek(0)
+        tar_source = f
+        tar_mode = "r|*"
 
     # H2 — two-pass extraction (spec/plugin-contract.md §2.2).
     # Hardlink entries (typeflag '1') carry an archive-absolute linkname that
@@ -389,11 +575,18 @@ def extract_tar(
             )
         return candidate
 
-    with tarfile.open(fileobj=io.BytesIO(raw_tar_bytes), mode=tar_mode) as tf:
+    with tarfile.open(fileobj=tar_source, mode=tar_mode) as tf:
         # ------------------------------------------------------------------
         # Pass 1: dirs, regular files, symlinks (everything except hardlinks)
         # ------------------------------------------------------------------
-        for member in tf.getmembers():
+        # `for member in tf:` (not `tf.getmembers()`) — stream mode ("r|"/
+        # "r|*") is forward-only and does not support the random-access
+        # `getmembers()` (which would force full consumption before any
+        # extraction could begin, defeating streaming).  Direct iteration
+        # yields the same TarInfo sequence in both stream and random-access
+        # ("r:") modes, and each member's data is read via `extractfile()`
+        # immediately while iterating — exactly what this loop already does.
+        for member in tf:
             candidate = _check_and_strip(member)
             if candidate is None:
                 continue
@@ -588,5 +781,18 @@ def extract_tar(
             # exec bit set must chmod its copy the same way pass 1 does for
             # regular files (see _regular_file_mode).
             candidate.chmod(_regular_file_mode(member))
+
+    # SA-1 decompression-bomb guard — Layer 1 completeness (RFC
+    # docs/rfc-native-oci-fetch.md §3.3): ``tarfile`` (stream mode ``"r|"``)
+    # stopped pulling from ``tar_source`` at the tar logical end-of-archive
+    # marker.  Drain any remaining bytes so the cap covers the WHOLE
+    # decompressed stream, including anything concatenated after that
+    # marker (e.g. a second, unrelated compressed member) — never just the
+    # prefix tarfile happened to consume.  Only the gz/bz2/xz streaming path
+    # needs this: the lzma-alone branch already fully buffers (and caps) its
+    # decompressed output up front via ``_decompress_capped``, and the
+    # unrecognised-format fallback applies no cap at all (Layer 2 covers it).
+    if isinstance(tar_source, _CappedDecompressStream):
+        _drain_capped_stream(tar_source)
 
     return ExtractionResult(file_count=file_count, total_bytes=total_bytes)

@@ -857,8 +857,13 @@ Fields: `registry` (string, required), `repository` (string, required),
 
 > NORMATIVE: The canonical reference form is
 > `<registry>/<repository>@<digest>` (the `oci_ref` property). Implementations
-> MUST use this form when invoking the pull tool (`oras` in the reference
-> implementation).
+> MUST use this form wherever a single string identifies the artifact —
+> diagnostics, lockfile provenance rendering, and (on the separate,
+> CI-only publish path, `spec/cli-contract.md` §10) the reference handed to
+> `oras`. On the consumer pull path the constituent `registry`/`repository`/
+> `digest` fields are used directly to build the native OCI client's request
+> URLs (`spec/registry-protocol.md` §7); there is no subprocess invocation to
+> pass a reference string to.
 
 > NORMATIVE: `oci` is CAS-admissible (`cas_admissible = True`).
 

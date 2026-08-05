@@ -1,13 +1,16 @@
-"""OciFetcher — OCI registry pull transport (slice 7d-5).
+"""OciFetcher — OCI registry pull transport (slice 7d-5; native client S6).
 
 Pulls an OCI artifact identified by ``registry/repository@digest`` and
-safe-extracts the single ``*.tar.gz`` layer into ``dest/``.
+safe-extracts the single milpa source-tarball layer into ``dest/``.
 
 At v1 the **mandatory** deliverable is the ``TNG-*`` parse-path: every
 digest and reference field is validated at parse-time (trust-boundary) by
 ``validate_oci_digest``, ``validate_oci_field``.  The live pull is driven by
-an injected ``OciPull`` transport (production: ``oras pull``; tests inject a
-closure).
+the native ``OciRegistryClient`` (``milpa.fetchers.oci_client``): token →
+manifest → blob, composed directly in ``OciFetcher.fetch`` (RFC
+docs/rfc-native-oci-fetch.md §3.2). The single "exactly one milpa
+source-tarball layer" gate lives in ``select_source_layer`` — there is no
+second copy of that predicate here.
 
 Public surface:
   - ``OciProvenance``   — ``Provenance`` subclass for OCI deps.
@@ -15,7 +18,6 @@ Public surface:
   - ``OciFetcher``      — ``Fetcher`` ABC implementation.
   - ``validate_oci_digest``  — ``TNG-BAD-OCI-DIGEST`` gate.
   - ``validate_oci_field``   — ``TNG-UNSAFE-OCI-FIELD`` gate.
-  - ``make_oras_pull``  — production seam: ``oras pull`` transport.
 
 TNG-* parse-path (registry-protocol.md §4 NORMATIVE):
   ``validate_oci_digest`` and ``validate_oci_field`` are called from the
@@ -29,27 +31,27 @@ Digest format (registry-protocol.md §4):
 
 Registry/repository safety (registry-protocol.md §4):
     Any value beginning with ``-`` raises ``TNG-UNSAFE-OCI-FIELD``
-    (flag-injection prevention; values flow into ``oras`` argv).
+    (flag-injection prevention; historically these values flowed into
+    ``oras`` argv — the native client has no subprocess/argv surface, but
+    the gate is retained as defense-in-depth on untrusted manifest/index
+    input).
 """
 
 from __future__ import annotations
 
-import subprocess
 import tempfile
-from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import ClassVar
 
+from milpa import bounded_http
 from milpa.errors import (
     FETCH_EXTRACT_FAILED,
-    FETCH_OCI_AMBIGUOUS_TARBALL,
-    FETCH_OCI_NO_TARBALL,
-    FETCH_OCI_PULL_FAILED,
     TNG_BAD_OCI_DIGEST,
     TNG_UNSAFE_OCI_FIELD,
     MilpaError,
 )
+from milpa.fetchers.oci_client import OciRegistryClient, TokenCache, select_source_layer
 from milpa.fetchers.safe_extract import _DEFAULT_LIMITS, Limits, extract_tar
 from milpa.fetchers.types import (
     Fetcher,
@@ -86,7 +88,9 @@ def validate_oci_field(field_name: str, value: str) -> None:
     """Raise ``MilpaError(TNG_UNSAFE_OCI_FIELD)`` if ``value`` begins with ``-``.
 
     Registry-protocol.md §4 NORMATIVE: ``registry`` and ``repository`` MUST NOT
-    begin with ``-`` (flag-injection prevention; values flow into ``oras`` argv).
+    begin with ``-`` (defense-in-depth on untrusted manifest/index input; the
+    native client builds these directly into request URLs, not subprocess argv,
+    but the gate is retained regardless — see the module docstring).
     """
     if value.startswith("-"):
         raise MilpaError(
@@ -156,36 +160,6 @@ class OciReceipt(ProvenanceReceipt):
 
 
 # ---------------------------------------------------------------------------
-# OciPull seam type
-# ---------------------------------------------------------------------------
-
-#: Injected OCI pull transport: given a full OCI reference string and an output
-#: directory path (as ``str``), produces a list of files (as ``Path``) placed in
-#: that directory, or raises ``MilpaError(FETCH_OCI_PULL_FAILED, …)``.
-OciPull = Callable[[str, Path], list[Path]]
-
-
-def make_oras_pull() -> OciPull:
-    """Return a production ``OciPull`` backed by ``oras pull``."""
-
-    def _pull(reference: str, output_dir: Path) -> list[Path]:
-        result = subprocess.run(
-            ["oras", "pull", reference, "--output", str(output_dir)],
-            capture_output=True,
-        )
-        if result.returncode != 0:
-            detail = result.stderr.decode(errors="replace").strip()
-            raise MilpaError(
-                FETCH_OCI_PULL_FAILED,
-                f"oras pull failed for {reference!r}: {detail}",
-                reference=reference,
-            )
-        return sorted(output_dir.iterdir())
-
-    return _pull
-
-
-# ---------------------------------------------------------------------------
 # enumerate_oci_entries — the OCI materialize seam (RFC slice B2-oci: STUB)
 # ---------------------------------------------------------------------------
 
@@ -220,33 +194,50 @@ def enumerate_oci_entries(*_args: object, **_kwargs: object) -> list:
 
 
 class OciFetcher(Fetcher):
-    """Pull + safe-extract fetcher for OCI-registry deps (slice 7d-5).
+    """Pull + safe-extract fetcher for OCI-registry deps (slice 7d-5; S6 native client).
 
-    The pull transport is injected via ``oci_pull`` so tests need no real
-    registry.  The production transport is ``make_oras_pull()``.
+    Composes the native ``OciRegistryClient`` (token → manifest → blob) and
+    the pure ``select_source_layer`` policy directly — no intermediate
+    whole-pull closure (RFC docs/rfc-native-oci-fetch.md §3.2). The client
+    is injectable for tests; production defaults to ``bounded_http.request``
+    over a fresh ``TokenCache``.
+
+    RustF1 (doc-accuracy note, cross-impl): unlike the Rust twin's
+    ``fetchers.rs::fetch_oci`` (which mints a new ``OciRegistryClient`` /
+    ``TokenCache`` on every individual dep fetch), this ``OciFetcher`` — and
+    therefore its one ``TokenCache`` — genuinely IS constructed once per
+    resolve: ``build_registry()`` builds one ``OciFetcher`` in
+    ``_build_env()`` (``cli.py``), and that single instance is reused for
+    every OCI dep fetched by the ``ThreadPoolExecutor`` workers. Cross-dep
+    token reuse within one resolve is therefore already live in Python. The
+    Rust side does not have this yet (tracked by #203).
 
     Protocol (plugin-contract.md §1):
         1. ``can_handle`` → True for ``OciProvenance``.
-        2. ``fetch``      → validate fields, pull the OCI artifact (which must
-                            contain exactly one ``*.tar.gz``), safe-extract to
-                            ``dest/``, return ``OciReceipt``.
+        2. ``fetch``      → validate fields, acquire a token, fetch + verify
+                            the manifest, select the single milpa
+                            source-tarball layer, fetch + verify the blob,
+                            safe-extract to ``dest/``, return ``OciReceipt``.
         3. Receipt carries ``layer_digest`` (transport-pinning field).
 
     Failure codes:
         ``TNG-BAD-OCI-DIGEST``          — malformed digest at fetch time.
         ``TNG-UNSAFE-OCI-FIELD``        — leading-dash in registry/repo.
-        ``FETCH-OCI-PULL-FAILED``       — oras/transport error.
-        ``FETCH-OCI-NO-TARBALL``        — artifact had 0 ``*.tar.gz`` files.
-        ``FETCH-OCI-AMBIGUOUS-TARBALL`` — artifact had >1 ``*.tar.gz`` files.
+        ``FETCH-OCI-PULL-FAILED``       — token/manifest/blob transport error.
+        ``FETCH-OCI-DIGEST-MISMATCH``   — manifest or blob digest mismatch.
+        ``FETCH-OCI-NO-TARBALL``        — artifact had 0 source-tarball layers.
+        ``FETCH-OCI-AMBIGUOUS-TARBALL`` — artifact had >1 source-tarball layers.
         ``FETCH-EXTRACT-FAILED``        — safe_extract raised.
     """
 
     def __init__(
         self,
-        oci_pull: OciPull | None = None,
+        client: OciRegistryClient | None = None,
         limits: Limits = _DEFAULT_LIMITS,
     ) -> None:
-        self._oci_pull: OciPull = oci_pull if oci_pull is not None else make_oras_pull()
+        self._client = client if client is not None else OciRegistryClient(
+            bounded_http.request, TokenCache()
+        )
         self._limits = limits
 
     def can_handle(self, p: Provenance) -> bool:
@@ -267,55 +258,23 @@ class OciFetcher(Fetcher):
         validate_oci_field("registry", p.registry)
         validate_oci_field("repository", p.repository)
 
-        reference = p.reference
-
-        # Pull into a scratch directory so we can inspect the artifact
-        # before touching dest.
+        # Pull into a scratch directory so the raw tarball never lands
+        # inside `dest` alongside the extracted tree — `dest`'s content_hash
+        # is computed over the source tree alone (identity vs provenance).
         with tempfile.TemporaryDirectory(prefix=f".milpa-oci-{name}.") as _tmp:
-            scratch = Path(_tmp)
-            try:
-                pulled_files = self._oci_pull(reference, scratch)
-            except MilpaError:
-                raise
-            except Exception as exc:
-                raise MilpaError(
-                    FETCH_OCI_PULL_FAILED,
-                    f"fetching {name!r} ({reference!r}): {exc}",
-                    dep=name,
-                    reference=reference,
-                ) from exc
+            blob_path = Path(_tmp) / "source.tar.gz"
 
-            # Artifact MUST contain exactly one *.tar.gz.
-            tarballs = sorted(
-                f for f in pulled_files
-                if f.name.endswith(".tar.gz") or f.name.endswith(".tgz")
+            token = self._client.token(p.registry, p.repository)
+            manifest = self._client.manifest(p.registry, p.repository, p.digest, token)
+            layer = select_source_layer(manifest)
+            self._client.blob(
+                p.registry, p.repository, layer.digest, layer.size, token, dest=blob_path
             )
 
-            if len(tarballs) == 0:
-                raise MilpaError(
-                    FETCH_OCI_NO_TARBALL,
-                    f"OCI artifact {reference!r} for {name!r} contained no *.tar.gz",
-                    dep=name,
-                    reference=reference,
-                )
-            if len(tarballs) > 1:
-                names = [t.name for t in tarballs]
-                raise MilpaError(
-                    FETCH_OCI_AMBIGUOUS_TARBALL,
-                    f"OCI artifact {reference!r} for {name!r} has "
-                    f"{len(tarballs)} *.tar.gz files; ambiguous: {names!r}",
-                    dep=name,
-                    reference=reference,
-                    tarballs=names,
-                )
-
-            tarball_path = tarballs[0]
-
-            # Extract.
             dest.mkdir(parents=True, exist_ok=True)
             try:
                 extract_tar(
-                    tarball_path,
+                    blob_path,
                     dest,
                     strip_components=0,
                     limits=self._limits,
@@ -325,7 +284,7 @@ class OciFetcher(Fetcher):
                     FETCH_EXTRACT_FAILED,
                     f"fetching {name!r}: safe extraction failed ({exc.slug}): {exc.message}",
                     dep=name,
-                    reference=reference,
+                    reference=p.reference,
                     inner_slug=exc.slug,
                 ) from exc
             except Exception as exc:
@@ -333,7 +292,7 @@ class OciFetcher(Fetcher):
                     FETCH_EXTRACT_FAILED,
                     f"fetching {name!r}: extraction error: {exc}",
                     dep=name,
-                    reference=reference,
+                    reference=p.reference,
                 ) from exc
 
         return OciReceipt(layer_digest=p.digest)

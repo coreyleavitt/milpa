@@ -1,0 +1,38 @@
+{
+  "description": "Manifest bytes served do not hash to the pinned digest requested in the URL -> FETCH-OCI-DIGEST-MISMATCH, phase=manifest.",
+  "exchanges": [
+    {
+      "method": "GET",
+      "url": "https://ghcr.io/v2/",
+      "response": {
+        "status": 401,
+        "headers": {
+          "WWW-Authenticate": "Bearer realm=\"https://ghcr.io/token\",service=\"ghcr.io\"",
+          "Content-Length": "0"
+        }
+      }
+    },
+    {
+      "method": "GET",
+      "url": "https://ghcr.io/token?scope=repository%3Acoreyleavitt%2Ftest-pkg%3Apull&service=ghcr.io",
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": "{\"token\": \"test-token-abc\"}"
+      }
+    },
+    {
+      "method": "GET",
+      "url": "https://ghcr.io/v2/coreyleavitt/test-pkg/manifests/sha256:abababababababababababababababababababababababababababababababab",
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/vnd.oci.image.manifest.v1+json"
+        },
+        "body": "{\n  \"schemaVersion\": 2,\n  \"mediaType\": \"application/vnd.oci.image.manifest.v1+json\",\n  \"layers\": [\n    {\n      \"mediaType\": \"application/vnd.milpa.source.v1.tar+gzip\",\n      \"digest\": \"sha256:0136074d159d69d15e33d557d57da884d81644d327ee060bfa6ecb0ffc72431b\",\n      \"size\": 152\n    }\n  ],\n  \"artifactType\": \"application/vnd.milpa.source.v1\",\n  \"config\": {\n    \"mediaType\": \"application/vnd.oci.empty.v1+json\",\n    \"digest\": \"sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a\",\n    \"size\": 2\n  }\n}"
+      }
+    }
+  ]
+}

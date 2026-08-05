@@ -1,0 +1,37 @@
+{
+  "description": "The manifest GET returns 404 -> FETCH-OCI-PULL-FAILED, phase=manifest.",
+  "exchanges": [
+    {
+      "method": "GET",
+      "url": "https://ghcr.io/v2/",
+      "response": {
+        "status": 401,
+        "headers": {
+          "WWW-Authenticate": "Bearer realm=\"https://ghcr.io/token\",service=\"ghcr.io\"",
+          "Content-Length": "0"
+        }
+      }
+    },
+    {
+      "method": "GET",
+      "url": "https://ghcr.io/token?scope=repository%3Acoreyleavitt%2Ftest-pkg%3Apull&service=ghcr.io",
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": "{\"token\": \"test-token-abc\"}"
+      }
+    },
+    {
+      "method": "GET",
+      "url": "https://ghcr.io/v2/coreyleavitt/test-pkg/manifests/sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+      "response": {
+        "status": 404,
+        "headers": {
+          "Content-Length": "0"
+        }
+      }
+    }
+  ]
+}

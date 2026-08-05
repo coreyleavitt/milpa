@@ -68,8 +68,11 @@ fn validate_safe_name(name: &str) -> Result<(), CoreError> {
     }
 }
 
-/// Reject a value beginning with `-` — git/oras would read it as a flag
-/// (flag-injection). `code` is the field-specific TNG slug.
+/// Reject a value beginning with `-` — the `git` CLI would read it as a flag
+/// (flag-injection). OCI registry/repository fields have no subprocess/argv
+/// surface (the native `OciRegistryClient` builds request URLs directly), but
+/// the gate is retained on them too as defense-in-depth on untrusted
+/// manifest/index input. `code` is the field-specific TNG slug.
 fn validate_no_leading_dash(value: &str, field: &str, code: &'static str) -> Result<(), CoreError> {
     if value.starts_with('-') {
         Err(tng(
