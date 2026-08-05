@@ -1,15 +1,22 @@
-# The milpa specification — v1.0
+# The milpa specification — pre-v1 working draft
 
 This directory is the **normative specification** of milpa: the language-
-agnostic contract that any conformant implementation (the Python reference
-impl, the planned Rust reference impl, a future Nim dogfood impl, or a
-third-party port) must satisfy. The spec is the durable artifact; an
-implementation is correct insofar as it conforms to this spec and passes
-the conformance suite. See `../rfc-multi-impl-strategy.md` for why the spec
-is factored out from any one implementation.
+agnostic contract that any conformant implementation (the Python and Rust
+reference impls, a future Nim dogfood impl, or a third-party port) must
+satisfy. The spec is the durable artifact; an implementation is correct
+insofar as it conforms to this spec and passes the conformance suite. See
+`../rfc-multi-impl-strategy.md` for why the spec is factored out from any one
+implementation.
 
-> **Spec version: 1.0.** This is a frozen surface. Changes are governed by
-> the amendment process in §4 below.
+> **Status: pre-v1, not frozen.** The spec is still being written toward a v1
+> that no implementation fully covers yet. Until stabilization there are **no
+> external consumers**, so the working surface under `conformance/spec-v1/` is
+> mutated **in place** — a breaking change edits the normative docs and
+> regenerates the affected fixtures directly, without an epoch bump. The
+> additive-vs-breaking governance in §4 is what the spec commits to **once v1
+> is stamped**; it describes the future contract, not a freeze that is already
+> in force. v1 is stamped when a reference impl fully implements the spec and
+> the surface has settled.
 
 ## 1. Normative documents
 
@@ -27,7 +34,7 @@ implementation observations), and opens with a "Normative surface" summary.
 | [`plugin-contract.md`](plugin-contract.md) (S10) | the fetcher/transport extension contract — obligations, receipts, exclusive dispatch, `cas_admissible`, extraction limits |
 | [`cli-contract.md`](cli-contract.md) (S15) | the CLI surface — conformance verbs, flags, exit codes, stdout/stderr discipline, environment variables, workspace detection |
 | [`conformance-fixtures.md`](conformance-fixtures.md) (S8a) | the conformance fixture format — the executable definition of "conformant" |
-| [`errors.md`](errors.md) | the error catalog — every coded, user-facing error. **Generated** from `milpa/error_codes/`; do not hand-edit |
+| [`errors.md`](errors.md) | the error catalog — every coded, user-facing error. **Spec-owned and hand-maintained**; each implementation bijection-checks its own slug catalog against this file |
 
 ## 2. What "conformant" means
 
@@ -68,7 +75,13 @@ This README and the conformance suite directory together pin the
 
 ## 4. Amendment and governance
 
-The spec outlives any implementation, so changes are deliberate.
+The spec outlives any implementation, so changes are deliberate. **This
+section is the governance that takes effect at v1 stabilization.** Pre-v1
+(the current phase, per the status note above) there are no external
+consumers and the `spec-v1/` surface is mutated in place: a breaking change
+edits the normative docs and regenerates the affected fixtures in the same
+change, with no new `spec-v<N+1>/` directory and no epoch bump. The taxonomy
+below defines how that discipline tightens the moment v1 is stamped.
 
 **Change taxonomy.** A change is one of:
 - **Additive** — a new dep kind, manifest node, error code, or behavior that
@@ -84,24 +97,28 @@ The spec outlives any implementation, so changes are deliberate.
 
 **Process.** A change is proposed as an RFC (`../rfc-*.md`), lands as a
 normative diff to the relevant document(s) here, and is accompanied by
-fixtures that exercise it. The error catalog is edited only in
-`milpa/error_codes/` and `errors.md` is regenerated (a round-trip test pins
-the bijection).
+fixtures that exercise it. The error catalog `errors.md` is spec-owned and
+edited directly; each implementation bijection-checks its own slug catalog
+against it (a round-trip test pins the bijection).
 
 **Arbiter rule.** If a prose `> NORMATIVE:` clause and a conformance fixture
 disagree, that is a spec defect: open an RFC/issue and reconcile them. Do not
 silently follow one over the other.
 
-**Freeze policy.** Within spec v1, no new `> NORMATIVE:` requirement is added
+**Freeze policy.** Once v1 is stamped, within spec v1 no new `> NORMATIVE:` requirement is added
 that would invalidate a currently-conformant implementation. Tightening
 ambiguity (making an already-implied requirement explicit) is permitted and
 preferred; changing a requirement is a v2 matter.
 
 ## 5. Reference implementation
 
-The Python package in `../../milpa/` is the current reference
-implementation and the oracle that generates the conformance fixtures. It is
-not normative — this specification is. Where the reference impl lags the
-spec, the gap is tracked as an issue and noted inline (`> NOTE:`). The
-multi-impl lifecycle (Python design vehicle → Rust reference → clean rewrites)
-is described in `../rfc-multi-impl-strategy.md`.
+Two reference implementations co-exist: the Python package in
+`../../impls/python/milpa/` and the Rust workspace in `../../impls/rust/`.
+Neither is normative — this specification is. The Python impl is currently
+the design vehicle and the oracle that generates the conformance fixtures
+(`impls/python/tools/regen_corpus.py`); it is **slated for a clean rewrite
+once the spec has solidified**, so its internal structure is deliberately
+treated as provisional. Where an impl lags the spec, the gap is tracked as
+an issue and noted inline (`> NOTE:`). The multi-impl lifecycle (Python
+design vehicle → Rust reference → clean rewrites → future Nim dogfood) is
+described in `../rfc-multi-impl-strategy.md`.
