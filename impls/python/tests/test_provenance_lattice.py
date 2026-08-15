@@ -37,6 +37,7 @@ import pytest
 
 from milpa.cas import CAStore
 from milpa.context import MilpaEnv, ResolveParams
+from tests._gated_index_helpers import for_test
 from milpa.errors import MilpaError, RES_BINDING_CONFLICT, RES_REGISTRY_SHADOW
 from milpa.fetchers.cas_admitting import CasAdmittingFetcher
 from milpa.fetchers.mocked import mocked_registry, url_key
@@ -183,7 +184,8 @@ def _env(tmp_path: Path, mocked_dir: Path, index_kdl: str | None) -> MilpaEnv:
     store = CAStore(tmp_path / "cas")
     fetcher = CasAdmittingFetcher(mocked_registry(mocked_dir), store)
     index = parse_index(index_kdl) if index_kdl is not None else None
-    return MilpaEnv(fetcher=fetcher, index=index, store=store)
+    gated_index = for_test(index) if index is not None else None
+    return MilpaEnv(fetcher=fetcher, index=gated_index, store=store)
 
 
 def _resolve(root_kdl: str, env: MilpaEnv, tmp_path: Path) -> ResolvedGraph:

@@ -105,7 +105,7 @@ def test_unarmed_index_computes_unarmed_status(tmp_path: Path, monkeypatch: pyte
 
     env = _make_minimal_env()
     result_env = _load_index_for_verb(env, project_dir)
-    assert isinstance(result_env.index.epoch_commitment_status, Unarmed)
+    assert isinstance(result_env.index.index.epoch_commitment_status, Unarmed)
 
 
 def test_armed_valid_computes_armed_status(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -128,7 +128,7 @@ def test_armed_valid_computes_armed_status(tmp_path: Path, monkeypatch: pytest.M
 
     env = _make_minimal_env()
     result_env = _load_index_for_verb(env, project_dir)
-    status = result_env.index.epoch_commitment_status
+    status = result_env.index.index.epoch_commitment_status
     assert isinstance(status, Armed)
     assert status.integrated_time == 1700000000
 
@@ -191,16 +191,17 @@ def test_d18_armed_all_strict_is_ok(tmp_path: Path, monkeypatch: pytest.MonkeyPa
 
     env = _make_minimal_env()
     result_env = _load_index_for_verb(env, project_dir)
-    assert isinstance(result_env.index.epoch_commitment_status, Armed)
+    assert isinstance(result_env.index.index.epoch_commitment_status, Armed)
 
 
 def test_no_epoch_armed_notice_fires_on_fetch_lock_path_when_strict_and_unarmed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """RFC attestation-v1-normative.md §6 S5 (Dsgn-H2): the fetch/lock gate
-    (`_apply_epoch_commitment_phase`, invoked via `_load_index_for_verb`)
-    must emit the no-epoch-armed observability notice once when entry-trust
-    is effectively strict and the loaded index is Unarmed — otherwise
+    (the epoch-commitment fold inside `load_default_index`'s mint, invoked
+    via `_load_index_for_verb`) must emit the no-epoch-armed observability
+    notice once when entry-trust is effectively strict and the loaded index
+    is Unarmed — otherwise
     strict silently degrades to warn-equivalent with zero signal."""
     from milpa.entry_trust import NO_EPOCH_ARMED_NOTICE, _reset_no_epoch_armed_notice
 

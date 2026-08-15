@@ -329,6 +329,7 @@ def test_resolve_two_namespaced_deps_distinct(tmp_path: Path) -> None:
     from milpa.resolver import resolve
     from milpa.version import Strategy
     from milpa.fetchers.mocked import MockedGitFetcher
+    from tests._gated_index_helpers import for_test
 
     content_hash_core = "dag-sha256:" + "a" * 64
     content_hash_tp = "dag-sha256:" + "b" * 64
@@ -375,7 +376,7 @@ def test_resolve_two_namespaced_deps_distinct(tmp_path: Path) -> None:
 
     fetcher = mocked_registry(mocked_dir)
     store = CAStore(tmp_path / ".cas")
-    env = MilpaEnv(fetcher=fetcher, index=idx, store=store)
+    env = MilpaEnv(fetcher=fetcher, index=for_test(idx), store=store)
 
     # Manifest with TWO alpha deps from different namespaces
     # Using attribute form

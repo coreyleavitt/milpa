@@ -51,6 +51,7 @@ from milpa.identity import compute_content_hash
 from milpa.lockfile import LockedDep, load_lockfile
 from milpa.registry import Index, IndexVersion, Package
 from milpa.version import Strategy
+from tests._gated_index_helpers import for_test
 
 # ---------------------------------------------------------------------------
 # Shared helpers (mirrors test_b4_upgrade.py / test_s5b_mutation_verb_audit.py)
@@ -371,7 +372,7 @@ def test_verify_dep_decl_pins_namespaced_dep_not_conflated_by_bare_ambiguity_liv
             ),
         ]
     )
-    monkeypatch.setattr(cli_mod, "load_default_index", lambda: index)
+    monkeypatch.setattr(cli_mod, "load_default_index", lambda: for_test(index))
     monkeypatch.setenv("MILPA_INDEX_URL", "file:///dummy-index.kdl")
 
     pinned_dep = LockedDep(
@@ -415,7 +416,7 @@ def test_verify_dep_decl_pins_bare_dep_ambiguous_still_reports_pin_missing(
             ),
         ]
     )
-    monkeypatch.setattr(cli_mod, "load_default_index", lambda: index)
+    monkeypatch.setattr(cli_mod, "load_default_index", lambda: for_test(index))
     monkeypatch.setenv("MILPA_INDEX_URL", "file:///dummy-index.kdl")
 
     pinned_dep = LockedDep(

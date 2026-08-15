@@ -24,7 +24,7 @@ from milpa.edge_sources import (
     edgeset_to_terms,
     resolve_edges,
 )
-from milpa.registry import Index
+from milpa.gated_index import GatedIndex
 from milpa.source_id import GitSourceId, SourceId, normalize_source
 from milpa.version import Version, VersionSource
 
@@ -508,7 +508,7 @@ def test_edgeset_to_terms_named_require() -> None:
         src_dir="",
         source=EdgeSource.MILPA_KDL,
     )
-    dep_terms, requires_names, requires_predicates = edgeset_to_terms(es, {}, Index())
+    dep_terms, requires_names, requires_predicates = edgeset_to_terms(es, {}, GatedIndex.empty())
 
     assert requires_names == ["pkg+tianguis/stew"]
     assert len(dep_terms) == 1
@@ -542,7 +542,7 @@ def test_edgeset_to_terms_overridden_named_becomes_full_self_term() -> None:
         src_dir="",
         source=EdgeSource.MILPA_KDL,
     )
-    dep_terms, requires_names, requires_predicates = edgeset_to_terms(es, {"stew": ov}, Index())
+    dep_terms, requires_names, requires_predicates = edgeset_to_terms(es, {"stew": ov}, GatedIndex.empty())
 
     assert requires_names == ["git+https://github.com/example/stew#ref=main"]  # DE2-ref: override pins ref="main"
     assert len(dep_terms) == 1
@@ -563,7 +563,7 @@ def test_edgeset_to_terms_nim_excluded() -> None:
         src_dir="",
         source=EdgeSource.NIMBLE_FALLBACK,
     )
-    dep_terms, requires_names, requires_predicates = edgeset_to_terms(es, {}, Index())
+    dep_terms, requires_names, requires_predicates = edgeset_to_terms(es, {}, GatedIndex.empty())
 
     assert "nim" not in requires_names
     # S5-rekey: the require-name key is the canonical source-id string.
@@ -591,7 +591,7 @@ def test_edgeset_to_terms_url_require() -> None:
         src_dir="",
         source=EdgeSource.DEP_DECL,
     )
-    dep_terms, requires_names, requires_predicates = edgeset_to_terms(es, {}, Index())
+    dep_terms, requires_names, requires_predicates = edgeset_to_terms(es, {}, GatedIndex.empty())
 
     assert "git+https://github.com/status-im/nim-chronos#ref=v3" in requires_names  # DE2-ref: UrlRequire ref="v3"
     assert len(dep_terms) == 1

@@ -1097,7 +1097,8 @@ def _load_manifest_entry_trust_policy(project_dir: Path) -> str:
 def _effective_entry_trust_policy(env: MilpaEnv, project_dir: Path) -> "TrustPolicy":
     """The effective entry-trust policy alone (steps 1-3 of
     ``_build_entry_trust``, factored out as the SSOT both that function and
-    the S-EpochCommitment D18 co-requirement check (``_apply_epoch_commitment_phase``)
+    the S-EpochCommitment D18 co-requirement check (``_load_index_for_verb``,
+    which threads it into ``load_default_index``'s epoch-commitment fold)
     call — computing the full ``EntryTrustConfig`` just for its policy field
     would build a bundle store and resolve a verifier for no reason)."""
     from milpa.trust import effective_trust_policy
@@ -1315,15 +1316,34 @@ def _load_index_for_verb(env: MilpaEnv, project_dir: "Path | None" = None) -> Mi
     the trust gate was previously unplumbed — ``load_default_index()`` was called
     bare with no config/verifier).
 
+    S-EpochCommitment (rfc-attestation-v1-normative.md §6, D14-D18;
+    registry-protocol §3.4.8/§3.4.9): folded into ``load_default_index``'s
+    mint (RFC rfc-trusted-index-invariant.md §2.2) rather than applied as a
+    separate post-hoc mutation — this function builds the epoch-commitment
+    verifier + re-arm signer (CLI-layer concerns: the
+    ``MILPA_INDEX_EPOCH_MOCK_VERIFIER`` mock seam, manifest-derived
+    entry-trust policy) and threads them down, preserving the pre-fold
+    JUDGMENT CALL EXACTLY: the phase runs ONLY when index-trust is active
+    for this invocation (``config``/``verifier`` both resolved, i.e. not
+    ``"off"``) — since the phase's crypto has no trust root to verify
+    against otherwise. An index that HAS armed a commitment while a
+    consumer runs with index-trust off is therefore silently treated as
+    ``Unarmed`` — a documented residual, not a silent security downgrade of
+    a check the consumer opted into.
+
     TNG-* parse errors always propagate — the index was fetched but failed
     validation; the correct slug is more useful than silently treating a
-    malformed index as absent.
+    malformed index as absent. Likewise
+    ``TNG-INDEX-EPOCH-COMMITMENT-INVALID`` / ``TNG-INDEX-EPOCH-RATCHET-REQUIRED``
+    (the epoch-commitment fold, when active) propagate from
+    ``load_default_index``.
 
     spec/cli-contract.md §8.1 NORMATIVE.
     """
     from dataclasses import replace
 
     from milpa.errors import MILPA_INDEX_UNREACHABLE
+    from milpa.index_cache import index_url_from_env
 
     # --no-index flag OR present-but-empty MILPA_INDEX_URL → explicitly no
     # index (the flag overrides any configured index). Absent → default URL.
@@ -1334,9 +1354,26 @@ def _load_index_for_verb(env: MilpaEnv, project_dir: "Path | None" = None) -> Mi
     config: object = None
     verifier: object = None
     index_history_policy = "off"
+    # S-EpochCommitment fold inputs (§2.2) — stay at their off-defaults
+    # unless index-trust resolves active below (trust_active conditionality,
+    # preserved verbatim from the pre-fold JUDGMENT CALL).
+    entry_trust_policy = "off"
+    epoch_verifier: object = None
+    epoch_expected_signer: str | None = None
     if project_dir is not None:
         config, verifier = _build_index_trust(env, project_dir)
         index_history_policy = _build_index_history(env, project_dir)
+        if config is not None and verifier is not None:
+            resolved_index_url = index_url_from_env()
+            # Verifier + re-arm signer: the SAME construction ``milpa
+            # verify``'s offline re-derivation uses
+            # (``_build_epoch_commitment_verifier`` — extracted in RFC
+            # attestation-v1-normative.md §6 S5 to avoid a second hand-rolled
+            # copy of the mock/production dispatch).
+            epoch_verifier, epoch_expected_signer = _build_epoch_commitment_verifier(
+                resolved_index_url
+            )
+            entry_trust_policy = _effective_entry_trust_policy(env, project_dir)
 
     # Absent → DEFAULT_INDEX_URL; non-empty → that URL.
     # load_default_index() calls index_url_from_env() which handles both cases.
@@ -1346,6 +1383,9 @@ def _load_index_for_verb(env: MilpaEnv, project_dir: "Path | None" = None) -> Mi
             verifier=verifier,
             refresh=env.refresh_index,
             index_history_policy=index_history_policy,
+            entry_trust_policy=entry_trust_policy,
+            epoch_verifier=epoch_verifier,
+            epoch_expected_signer=epoch_expected_signer,
         )
     except MilpaError as exc:
         if exc.slug == MILPA_INDEX_UNREACHABLE:
@@ -1353,112 +1393,26 @@ def _load_index_for_verb(env: MilpaEnv, project_dir: "Path | None" = None) -> Mi
             return replace(env, index=None)
         raise  # TNG-* and other catalog errors propagate
 
-    # S-EpochCommitment (rfc-attestation-v1-normative.md §6, D14-D18;
-    # registry-protocol §3.4.8/§3.4.9): the index-gate epoch-commitment
-    # phase, once per resolve, after index-trust's own verification
-    # succeeds and BEFORE any candidate is selected (this function runs
-    # before the resolver in every verb that calls it).
-    if project_dir is not None and config is not None and verifier is not None:
-        _apply_epoch_commitment_phase(env, project_dir, index, config, index_history_policy)
-
     return replace(env, index=index)
 
 
 # ---------------------------------------------------------------------------
-# S-EpochCommitment — the index-gate epoch-commitment phase (RFC
-# rfc-attestation-v1-normative.md §6, D14-D18; registry-protocol §3.4.8/§3.4.9)
+# S-EpochCommitment — the index-gate epoch-commitment phase's CLI-layer
+# inputs (RFC attestation-v1-normative.md §6, D14-D18; registry-protocol
+# §3.4.8/§3.4.9). The phase ITSELF runs inside index_cache.py's mint
+# (RFC rfc-trusted-index-invariant.md §2.2, ``_fold_epoch_commitment``);
+# this function only builds the verifier/signer this CLI layer injects.
 # ---------------------------------------------------------------------------
-
-
-def _apply_epoch_commitment_phase(
-    env: MilpaEnv,
-    project_dir: Path,
-    index: "object",
-    index_trust_config: "object",
-    index_history_policy: str,
-) -> None:
-    """Compute + enforce the epoch-commitment phase for one already-loaded
-    ``Index`` (mutated in place — ``Index`` is not frozen).
-
-    Reuses index-trust's already-resolved trust ROOT (``index_trust_config
-    .trust_bundle``) — the epoch commitment is authenticated against a
-    DEDICATED re-arm signer identity (D15), never the whole-index signer,
-    but the Fulcio/Rekor trust root is the same one index-trust resolved
-    for this invocation (spec §3.4.8: "resolved the same way").
-
-    JUDGMENT CALL (flagged, not spec-mandated): this phase runs ONLY when
-    index-trust is active for this invocation (the caller only invokes this
-    function when ``config is not None``, i.e. effective index-trust policy
-    is not ``"off"``). Spec §3.4.8 frames the phase as part of "the index
-    gate" without explicitly stating whether it is reachable when the
-    index-trust axis itself is disabled; since the phase's crypto has no
-    trust root to verify against in that case, gating it on index-trust's
-    own on/off state is the defensible reading adopted here. An index that
-    HAS armed a commitment while a consumer runs with index-trust off is
-    therefore silently treated as ``Unarmed`` by this consumer — a
-    documented residual, not a silent security downgrade of a check the
-    consumer opted into (index-trust off already means "no whole-index
-    crypto for this invocation").
-
-    Raises:
-        MilpaError(TNG-INDEX-EPOCH-COMMITMENT-INVALID) — unconditional
-            abort on ``ArmingInvalid`` (D14).
-        MilpaError(TNG-INDEX-EPOCH-RATCHET-REQUIRED) — the D18
-            co-requirement (``Armed`` + ``entry-trust=strict`` requires
-            ``index-history=strict``).
-    """
-    from milpa.epoch_commitment import (
-        check_epoch_ratchet_requirement,
-        enforce_epoch_commitment,
-    )
-    from milpa.index_cache import (
-        index_url_from_env,
-        load_epoch_commitment_status,
-        read_cached_epoch_commitment_pointer,
-    )
-
-    index_url = index_url_from_env()
-    pointer = read_cached_epoch_commitment_pointer(index_url)
-
-    # Verifier + re-arm signer: the SAME construction ``milpa verify``'s
-    # offline re-derivation uses (``_build_epoch_commitment_verifier`` —
-    # extracted in RFC attestation-v1-normative.md §6 S5 to avoid a second
-    # hand-rolled copy of the mock/production dispatch).
-    verifier, expected_signer = _build_epoch_commitment_verifier(index_url)
-
-    status = load_epoch_commitment_status(
-        index_url=index_url,
-        pointer=pointer,
-        verifier=verifier,
-        trust_bundle=index_trust_config.trust_bundle,  # type: ignore[attr-defined]
-        expected_signer=expected_signer,
-    )
-    index.epoch_commitment_status = status  # type: ignore[attr-defined]
-
-    enforce_epoch_commitment(status)
-
-    entry_trust_policy = _effective_entry_trust_policy(env, project_dir)
-    check_epoch_ratchet_requirement(
-        status,
-        entry_trust_policy=entry_trust_policy,
-        index_history_policy=index_history_policy,
-    )
-
-    # Dsgn-H2 (RFC attestation-v1-normative.md §6 S5): informational, never
-    # gates the resolve — see maybe_emit_no_epoch_armed_notice's docstring.
-    from milpa.entry_trust import maybe_emit_no_epoch_armed_notice
-
-    maybe_emit_no_epoch_armed_notice(entry_trust_policy, status)
 
 
 def _build_epoch_commitment_verifier(index_url: str) -> "tuple[object, str]":
     """``(verifier, expected_signer)`` for the epoch-commitment phase — the
-    SAME construction ``_apply_epoch_commitment_phase`` uses (extracted so
-    ``milpa verify``'s offline re-derivation, RFC attestation-v1-normative.md
-    §6 S5, builds the identical mock/production verifier and re-arm signer
-    rather than a second hand-rolled copy). ``index_url`` MUST be the already
+    SAME construction ``_load_index_for_verb`` uses (extracted so ``milpa
+    verify``'s offline re-derivation, RFC attestation-v1-normative.md §6 S5,
+    builds the identical mock/production verifier and re-arm signer rather
+    than a second hand-rolled copy). ``index_url`` MUST be the already
     three-way-resolved URL (``index_url_from_env()``), matching the guard
-    ``_apply_epoch_commitment_phase`` enforces."""
+    ``_load_index_for_verb`` enforces before calling this."""
     from milpa.epoch_commitment import DEFAULT_REARM_SIGNER
     from milpa.index_trust import MockVerifier, SigstoreVerifier, VerificationResult
 
@@ -1542,7 +1496,7 @@ def _reverify_cached_index_bundle(
     reverify_cached_index(index_url_from_env(), _default_cache_dir(), config, verifier)
 
     if config is None or verifier is None:
-        return None  # index-trust inactive — mirrors _apply_epoch_commitment_phase's gate
+        return None  # index-trust inactive — mirrors _load_index_for_verb's epoch-fold gate
 
     resolved_index_url = index_url_from_env()
     epoch_verifier, expected_signer = _build_epoch_commitment_verifier(resolved_index_url)
@@ -3185,7 +3139,13 @@ def _verify_dep_decl_pins(
     from milpa.errors import MILPA_INDEX_UNREACHABLE
 
     try:
-        index = load_default_index()
+        # RFC rfc-trusted-index-invariant.md §2.1: load_default_index now
+        # mints a GatedIndex. This call site pre-dates the gate (it's the
+        # "fourth bypass" the RFC names at §4 — the S-Verify reroute is a
+        # LATER slice, not this one) and only needs the plain Index for its
+        # lookup_bare/lookup_qualified calls below, so unwrap immediately
+        # rather than threading GatedIndex through unrelated lookup helpers.
+        index = load_default_index().index
     except MilpaError as exc:
         if exc.slug == MILPA_INDEX_UNREACHABLE:
             if strict:

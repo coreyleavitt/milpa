@@ -38,9 +38,9 @@ from pathlib import Path
 from milpa.cas import CAStore
 from milpa.entry_trust import EntryTrustConfig
 from milpa.fetchers.cas_admitting import CasAdmittingFetcher
+from milpa.gated_index import GatedIndex
 from milpa.lockfile import Lockfile
 from milpa.profile import Profile
-from milpa.registry import Index
 from milpa.version import Strategy
 
 
@@ -56,10 +56,17 @@ class MilpaEnv:
         ``CasAdmittingFetcher`` for the in-process conformance adapter.
 
     index:
-        Loaded tianguis ``Index`` (for named-dep resolution), or ``None`` when
-        the verb does not require named-dep resolution
-        (``show``/``verify``/``clean`` and the frozen fast-path).
+        Loaded tianguis index, wrapped as a ``GatedIndex`` (RFC
+        ``rfc-trusted-index-invariant.md``) — possessing one proves the
+        index-trust + epoch-commitment gates ran under the effective policy
+        (§2.1, §2.3). ``None`` when the verb does not require named-dep
+        resolution (``show``/``verify``/``clean`` and the frozen fast-path).
         Loaded EAGERLY — ``None`` is NOT "load later," it is "not needed here."
+        Only ``milpa.index_cache`` may mint a non-``None`` ``GatedIndex``
+        (``load_default_index`` / ``load_index_gated``); ``resolve()`` and
+        ``resolve_workspace()`` (``resolver.py``) assert this at their entry
+        points rather than trusting the type hint alone (Python has no
+        compile-time enforcement).
 
     store:
         The ``CAStore`` instance.  Used by the frozen path
@@ -77,7 +84,7 @@ class MilpaEnv:
     """
 
     fetcher: CasAdmittingFetcher
-    index: Index | None
+    index: GatedIndex | None
     store: CAStore
     dep_decl_store: object | None = None  # DepDeclStore protocol (S3b)
 

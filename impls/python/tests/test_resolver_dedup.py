@@ -18,6 +18,7 @@ import pytest
 
 from milpa.cas import CAStore
 from milpa.context import MilpaEnv, ResolveParams
+from tests._gated_index_helpers import for_test
 from milpa.fetchers.cas_admitting import CasAdmittingFetcher
 from milpa.fetchers.mocked import mocked_registry
 from milpa.lockfile import from_graph
@@ -829,7 +830,8 @@ def _make_env_with_index(mocked_dir: Path, tmp_path: Path, index: Index | None) 
     store = CAStore(cas_root)
     inner = mocked_registry(mocked_dir)
     fetcher = CasAdmittingFetcher(inner, store)
-    return MilpaEnv(fetcher=fetcher, index=index, store=store)
+    gated_index = for_test(index) if index is not None else None
+    return MilpaEnv(fetcher=fetcher, index=gated_index, store=store)
 
 
 class TestCrossOriginDedupRegistryAndGit:

@@ -407,6 +407,7 @@ class TestRegistryTargetRebindsResolution:
         from milpa.fetchers.oci import OciFetcher
         from milpa.fetchers.types import FetcherRegistry
         from milpa.cas import CAStore
+        from tests._gated_index_helpers import for_test
         from tests._oci_fake_client import FakeOciClient
 
         tar_bytes = _build_tar_gz(
@@ -418,7 +419,7 @@ class TestRegistryTargetRebindsResolution:
         registry.register(OciFetcher(client=fake_client))
         store = CAStore(root=tmp_path / ".cas")
         fetcher = CasAdmittingFetcher(registry, store)
-        return MilpaEnv(fetcher=fetcher, index=self._index(), store=store)
+        return MilpaEnv(fetcher=fetcher, index=for_test(self._index()), store=store)
 
     def test_rebinds_to_registry_coordinate_maxver_default(self, tmp_path: Path) -> None:
         """No version= on the override -> ordinary maxver precedence picks

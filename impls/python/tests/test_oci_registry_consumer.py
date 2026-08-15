@@ -22,6 +22,7 @@ from pathlib import Path
 
 from milpa.cas import CAStore
 from milpa.context import MilpaEnv, ResolveParams
+from tests._gated_index_helpers import for_test
 from milpa.fetchers.cas_admitting import CasAdmittingFetcher
 from milpa.fetchers.oci import OciFetcher
 from milpa.fetchers.types import FetcherRegistry
@@ -105,7 +106,7 @@ def _make_env(tmp_path: Path, index: Index) -> tuple[MilpaEnv, FakeOciClient]:
     registry.register(OciFetcher(client=fake_client))
     store = CAStore(root=tmp_path / ".cas")
     fetcher = CasAdmittingFetcher(registry, store)
-    env = MilpaEnv(fetcher=fetcher, index=index, store=store)
+    env = MilpaEnv(fetcher=fetcher, index=for_test(index), store=store)
     return env, fake_client
 
 

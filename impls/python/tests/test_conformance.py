@@ -113,6 +113,7 @@ from milpa.resolver import (
 from milpa.solver import SolverError, certificate_to_json
 from milpa.version import Strategy
 from milpa.workspace import load_workspace
+from tests._gated_index_helpers import for_test
 
 # ---------------------------------------------------------------------------
 # Corpus path — parents[N] depth assertion
@@ -656,9 +657,17 @@ def _build_env(fixture_dir: Path, tmp_dir: Path, no_index: bool = False) -> Milp
         no_index=no_index,
     )
 
+    # RFC rfc-trusted-index-invariant.md §2.5/S2b: resolve()/resolve_workspace()
+    # now assert isinstance(env.index, GatedIndex). This adapter still builds
+    # the index by reading fixture bytes directly (bypassing the real
+    # index-trust gate entirely) — that reroute is S2b, not this slice — so
+    # wrap via the test-only for_test escape hatch to keep the corpus green
+    # without adding real gating behavior here.
+    gated_index = for_test(index) if index is not None else None
+
     return MilpaEnv(
         fetcher=fetcher,
-        index=index,
+        index=gated_index,
         store=store,
         dep_decl_store=dep_decl_store,
         no_index=no_index,
@@ -3172,9 +3181,15 @@ class TestConformanceAdapterMachinery:
         assert isinstance(env, MilpaEnv)
         assert isinstance(env.fetcher, CasAdmittingFetcher)
         assert isinstance(env.store, CAStore)
-        # fixture-003 has an index.kdl (empty index) → index is loaded
+        # fixture-003 has an index.kdl (empty index) → index is loaded, wrapped
+        # as a GatedIndex (RFC rfc-trusted-index-invariant.md §2.5) — the
+        # adapter still bypasses the real gate (for_test), so it carries no
+        # verification claim, but resolve()/resolve_workspace() only accept
+        # the wrapper type, never a bare Index.
+        from milpa.gated_index import GatedIndex
         from milpa.registry import Index
-        assert isinstance(env.index, Index)
+        assert isinstance(env.index, GatedIndex)
+        assert isinstance(env.index.index, Index)
 
     def test_resolve_params_defaults(self) -> None:
         """ResolveParams has correct defaults."""

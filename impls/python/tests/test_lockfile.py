@@ -2607,14 +2607,14 @@ class TestEdgesetToTermsRequiresPredicates:
     def test_no_predicates_gives_empty_dict(self) -> None:
         from milpa.dep_decl import EdgeSet, EdgeSource, NamedRequire
         from milpa.edge_sources import edgeset_to_terms
-        from milpa.registry import Index
+        from milpa.gated_index import GatedIndex
 
         es = EdgeSet(
             requires=[NamedRequire(name="stew", constraint_str=">= 0.1.0")],
             src_dir="",
             source=EdgeSource.NIMBLE_FALLBACK,
         )
-        _, _, requires_predicates = edgeset_to_terms(es, {}, Index())
+        _, _, requires_predicates = edgeset_to_terms(es, {}, GatedIndex.empty())
         assert requires_predicates == {}
 
     def test_predicate_bearing_entry_recorded(self) -> None:
@@ -2625,7 +2625,7 @@ class TestEdgesetToTermsRequiresPredicates:
         """
         from milpa.dep_decl import EdgeSet, EdgeSource, NamedRequire
         from milpa.edge_sources import edgeset_to_terms
-        from milpa.registry import Index
+        from milpa.gated_index import GatedIndex
 
         p = Predicate(name="platform", values=("linux",), negated=False)
         es = EdgeSet(
@@ -2633,7 +2633,7 @@ class TestEdgesetToTermsRequiresPredicates:
             src_dir="",
             source=EdgeSource.NIMBLE_FALLBACK,
         )
-        _, _, requires_predicates = edgeset_to_terms(es, {}, Index())
+        _, _, requires_predicates = edgeset_to_terms(es, {}, GatedIndex.empty())
         # S5-rekey (RFC origin-as-identity §4.4): requires_predicates is
         # keyed by the PubGrub solver-variable string — the canonical
         # source-id form for an unqualified require against an empty index.
@@ -2649,7 +2649,7 @@ class TestEdgesetToTermsRequiresPredicates:
         """
         from milpa.dep_decl import EdgeSet, EdgeSource, NamedRequire
         from milpa.edge_sources import edgeset_to_terms
-        from milpa.registry import Index
+        from milpa.gated_index import GatedIndex
 
         p_linux = Predicate(name="platform", values=("linux",), negated=False)
         p_mac = Predicate(name="platform", values=("macosx",), negated=False)
@@ -2662,7 +2662,7 @@ class TestEdgesetToTermsRequiresPredicates:
             src_dir="",
             source=EdgeSource.NIMBLE_FALLBACK,
         )
-        dep_terms, requires_names, requires_predicates = edgeset_to_terms(es, {}, Index())
+        dep_terms, requires_names, requires_predicates = edgeset_to_terms(es, {}, GatedIndex.empty())
         # S5-rekey: requires_names/requires_predicates are keyed by the
         # canonical solver-variable string (unqualified require, empty index).
         # Dep appears once in the solver (one term, one requires_name)

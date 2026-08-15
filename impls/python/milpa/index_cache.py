@@ -86,8 +86,15 @@ from milpa.errors import (
 
 if TYPE_CHECKING:
     from milpa.epoch_commitment import EpochCommitmentStatus
+    from milpa.gated_index import GatedIndex
     from milpa.index_ratchet_seam import BaselineMeta, GateDecision
-    from milpa.index_trust import IndexBundleVerifier, IndexTrustConfig, TrustBundle
+    from milpa.index_trust import (
+        IndexBundleInfo,
+        IndexBundleVerifier,
+        IndexTrustConfig,
+        TrustBundle,
+        VerificationResult,
+    )
     from milpa.registry import Index
 
 # ---------------------------------------------------------------------------
@@ -328,7 +335,7 @@ def _verify_and_enforce(
     verifier: "IndexBundleVerifier",
     index_url: str,
     is_network_fetch: bool,
-) -> None:
+) -> "VerificationResult | None":
     """Verify the bundle against index_bytes and enforce the configured policy.
 
     Args:
@@ -345,11 +352,20 @@ def _verify_and_enforce(
         is_network_fetch: True on network-fetch paths (States 2 + recovery
             refetch) — freshness assertion fires.  False on pure cache reads
             (States 1 and 3) — freshness NOT asserted (offline safety).
+
+    Returns:
+        The ``VerificationResult`` actually computed (or ``BundleMissing``
+        when ``bundle_bytes`` is ``None``), so callers building a
+        ``GatedIndex`` (RFC rfc-trusted-index-invariant.md §2.1) have it in
+        scope for the mint without a second call. ``None`` only for
+        ``config.policy == "off"`` (verifier never invoked — §2.3's ``off``
+        case) — existing callers that predate the gate ignore the return
+        value, so this addition is backward compatible.
     """
     from milpa.index_trust import BundleMissing, enforce_index_trust, verify_index_bundle
 
     if config.policy == "off":
-        return
+        return None
 
     if bundle_bytes is None:
         result = BundleMissing
@@ -364,6 +380,7 @@ def _verify_and_enforce(
         )
 
     enforce_index_trust(result, config.policy, index_url)
+    return result
 
 
 def reverify_cached_index(
@@ -735,11 +752,79 @@ def reverify_cached_epoch_commitment_status(
 
 
 # ---------------------------------------------------------------------------
-# load_index — main entry point (S5: new signature with trust gate)
+# The epoch-commitment fold (RFC rfc-trusted-index-invariant.md §2.2) —
+# folded INTO the mint (load_index_gated, below) so a GatedIndex proves BOTH
+# index-trust AND epoch-commitment ran, with no caller-visible mutation of an
+# already-minted value. Mirrors the pre-fold cli.py::_apply_epoch_commitment_phase
+# (only the seam moved) and Rust's index_cache.rs::apply_epoch_fold.
 # ---------------------------------------------------------------------------
 
 
-def load_index(
+def _fold_epoch_commitment(
+    index: "Index",
+    url: str,
+    cache_dir: Path,
+    index_history_policy: str,
+    entry_trust_policy: str,
+    epoch_verifier: "IndexBundleVerifier",
+    epoch_expected_signer: str,
+    trust_bundle: "TrustBundle",
+) -> None:
+    """Apply the S-EpochCommitment index-gate phase to an already
+    index-trust-gated ``Index``, BEFORE the final ``GatedIndex`` mint.
+    Mutates ``index.epoch_commitment_status`` in place and enforces the
+    D14/D18 rules — the caller (``load_index_gated``) only invokes this when
+    the index-trust gate is itself active (``trust_active`` — see RFC §2.2
+    HIGH: there is no trust root to build an epoch verifier from under
+    ``off``, so this function assumes an active trust root is already in
+    scope via *trust_bundle*).
+
+    ``entry_trust_policy`` / ``epoch_verifier`` / ``epoch_expected_signer``
+    are pre-resolved leaf values threaded down from the CLI layer (mirrors
+    the existing injected-``verifier``/``config`` pattern this module already
+    uses for index-trust itself) — this function does NOT read env vars or
+    a manifest, so it has no need for ``env``/``project_dir`` (avoiding the
+    cli.py <-> index_cache.py import cycle those would risk).
+
+    Raises:
+        ``MilpaError(TNG-INDEX-EPOCH-COMMITMENT-INVALID)`` — unconditional
+            abort on ``ArmingInvalid`` (D14).
+        ``MilpaError(TNG-INDEX-EPOCH-RATCHET-REQUIRED)`` — the D18
+            co-requirement (``Armed`` + ``entry-trust=strict`` requires
+            ``index-history=strict``).
+    """
+    from milpa.entry_trust import maybe_emit_no_epoch_armed_notice
+    from milpa.epoch_commitment import check_epoch_ratchet_requirement, enforce_epoch_commitment
+
+    pointer = read_cached_epoch_commitment_pointer(url, cache_dir)
+    status = load_epoch_commitment_status(
+        index_url=url,
+        pointer=pointer,
+        verifier=epoch_verifier,
+        trust_bundle=trust_bundle,
+        expected_signer=epoch_expected_signer,
+    )
+    index.epoch_commitment_status = status
+
+    enforce_epoch_commitment(status)
+    check_epoch_ratchet_requirement(
+        status,
+        entry_trust_policy=entry_trust_policy,  # type: ignore[arg-type]
+        index_history_policy=index_history_policy,  # type: ignore[arg-type]
+    )
+
+    # Dsgn-H2 (RFC attestation-v1-normative.md §6 S5): informational, never
+    # gates the resolve.
+    maybe_emit_no_epoch_armed_notice(entry_trust_policy, status)  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# load_index_gated — main entry point (S5: trust gate; RFC
+# rfc-trusted-index-invariant.md §2.1: the production mint)
+# ---------------------------------------------------------------------------
+
+
+def load_index_gated(
     url: str,
     cache_dir: Path,
     http_get: HttpGet,
@@ -752,13 +837,37 @@ def load_index(
     refresh: bool = False,
     # A2d addition — append-only ratchet seam:
     index_history_policy: str = "off",
-) -> "Index":
-    """Fetch + cache + parse the ``index.kdl`` at *url*.
+    *,
+    # RFC rfc-trusted-index-invariant.md §2.2 — epoch-commitment fold:
+    entry_trust_policy: str = "off",
+    epoch_verifier: "IndexBundleVerifier | None" = None,
+    epoch_expected_signer: str | None = None,
+) -> "GatedIndex":
+    """Fetch + cache + parse the ``index.kdl`` at *url*, returning a
+    ``GatedIndex`` (RFC rfc-trusted-index-invariant.md §2.1) — the
+    production mint. This is the function every resolver-consumable index
+    load ultimately goes through (via ``load_default_index``); the plain
+    ``Index``-returning ``load_index`` below is a thin backward-compatible
+    unwrap kept for the existing low-level cache-mechanics test suite
+    (``test_index_cache.py`` / ``test_index_history_ratchet.py``) — it is
+    NOT part of the resolver-consumption boundary and must not be used to
+    obtain an index for ``MilpaEnv.index``.
 
     S5 trust gate: when ``config`` is provided (not None), the Sigstore
     bundle is fetched/cached and verified BEFORE parsing.  The single-read
     invariant is maintained: the same ``index_bytes`` object is passed to
     both ``verifier.verify`` and ``parse_index`` — no second disk read.
+
+    S-EpochCommitment fold (§2.2): when ``epoch_verifier`` is provided AND
+    the index-trust gate is active (``config``/``verifier`` both set), the
+    epoch-commitment phase runs on the freshly-loaded ``Index`` immediately
+    before the ``GatedIndex`` mint, at every return point (states 1/2/3 and
+    the bounded crash-recovery refetch) — mirroring
+    ``cli.py``'s pre-fold ``_apply_epoch_commitment_phase`` conditionality
+    EXACTLY: ``off`` (``epoch_verifier is None``, which is what the CLI
+    layer passes whenever index-trust itself is inactive) means the phase
+    never runs and ``epoch_commitment_status`` stays at its dataclass
+    default (``Unarmed``), untouched.
 
     Arguments:
         url:         Index URL to fetch.  Supports ``http://``, ``https://``,
@@ -796,7 +905,7 @@ def load_index(
                      for callers that don't opt in.
 
     Returns:
-        Parsed ``Index``.
+        ``GatedIndex`` wrapping the parsed ``Index``.
 
     Raises:
         ``MilpaError(MILPA_INDEX_UNREACHABLE)`` — network failure with no
@@ -808,8 +917,12 @@ def load_index(
         ``MilpaError(TNG-INDEX-BASELINE-CORRUPT)`` — an existing baseline
         sidecar is unparseable, regardless of ``index_history_policy``
         (except ``"off"``, which never reads it).
+        ``MilpaError(TNG-INDEX-EPOCH-COMMITMENT-INVALID | TNG-INDEX-EPOCH-RATCHET-REQUIRED)``
+        — the epoch-commitment fold (§2.2), only when ``epoch_verifier`` is provided.
         Any ``MilpaError(TNG-*)`` raised by ``parse_index`` — propagate unchanged.
     """
+    from milpa.gated_index import GatedIndex
+    from milpa.index_trust import describe_index_bundle
     from milpa.registry import parse_index  # local import to avoid circular at module level
 
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -820,6 +933,30 @@ def load_index(
 
     # Determine whether the trust gate is active.
     trust_active = config is not None and verifier is not None
+    epoch_active = trust_active and epoch_verifier is not None
+
+    def _finish(
+        finished_index: "Index",
+        gate_verification: "VerificationResult | None",
+        gate_bundle_info: "IndexBundleInfo | None",
+    ) -> "GatedIndex":
+        """Apply the epoch-commitment fold (§2.2, when active) and mint the
+        final ``GatedIndex`` — the ONE place every return path in this
+        function converges, so the fold's conditionality is expressed once
+        rather than re-checked at each of the state-machine's exit points."""
+        if epoch_active:
+            assert config is not None and epoch_verifier is not None  # type narrowing
+            _fold_epoch_commitment(
+                finished_index,
+                url,
+                cache_dir,
+                index_history_policy,
+                entry_trust_policy,
+                epoch_verifier,
+                epoch_expected_signer or "",
+                config.trust_bundle,
+            )
+        return GatedIndex._mint(finished_index, gate_verification, gate_bundle_info)
 
     # -------------------------------------------------------------------------
     # State 1: Fresh cache (age < TTL) → serve without network.
@@ -831,6 +968,8 @@ def load_index(
         age = now_unix - fetched_at
         if age < ttl_seconds:
             index_bytes = cache_file.read_bytes()
+            state1_verification: "VerificationResult | None" = None
+            state1_bundle_info: "IndexBundleInfo | None" = None
             if trust_active:
                 assert config is not None and verifier is not None  # type narrowing
                 if bundle_file.is_file():
@@ -838,7 +977,44 @@ def load_index(
                     # Consistency check: empty bundle bytes = interrupted write.
                     if not _cache_bundle_looks_ok(bundle_bytes_cached, bundle_file):
                         _delete_bundle_sidecars(bundle_file, no_bundle_marker)
-                        return _refetch_with_recovery(
+                        recovered_index, recovered_verification, recovered_bundle_info = (
+                            _refetch_with_recovery(
+                                url=url, cache_dir=cache_dir, cache_file=cache_file,
+                                stamp_file=stamp_file, bundle_file=bundle_file,
+                                no_bundle_marker=no_bundle_marker,
+                                http_get=http_get, bundle_http_get=bundle_http_get,
+                                config=config, verifier=verifier,
+                                now_unix=now_unix, is_recovery=True,
+                                index_history_policy=index_history_policy,
+                            )
+                        )
+                        return _finish(recovered_index, recovered_verification, recovered_bundle_info)
+                    # is_network_fetch=False: freshness NOT re-asserted on cache reads.
+                    state1_verification = _verify_and_enforce(
+                        index_bytes=index_bytes,
+                        bundle_bytes=bundle_bytes_cached,
+                        config=config,
+                        verifier=verifier,
+                        index_url=url,
+                        is_network_fetch=False,
+                    )
+                    state1_bundle_info = describe_index_bundle(bundle_bytes_cached)
+                elif no_bundle_marker.is_file():
+                    # Degraded mode: bundle transport previously returned 404 (RFC §7.2).
+                    # Enforce BundleMissing per policy; the marker is preserved — this is
+                    # NOT a crash state (H4 fix: the pre-fix code mis-classified this as
+                    # crash → _cache_bundle_looks_ok(None, absent_file) → False → recovery).
+                    from milpa.index_trust import BundleMissing, enforce_index_trust
+                    enforce_index_trust(BundleMissing, config.policy, url)
+                    state1_verification = BundleMissing
+                    # warn: execution continues to parse_index below.
+                    # strict: enforce_index_trust raises; we never reach here.
+                else:
+                    # No bundle AND no degraded marker: pre-RFC cache or interrupted write.
+                    # Trigger bounded crash recovery (one refetch).
+                    _delete_bundle_sidecars(bundle_file, no_bundle_marker)
+                    recovered_index, recovered_verification, recovered_bundle_info = (
+                        _refetch_with_recovery(
                             url=url, cache_dir=cache_dir, cache_file=cache_file,
                             stamp_file=stamp_file, bundle_file=bundle_file,
                             no_bundle_marker=no_bundle_marker,
@@ -847,39 +1023,14 @@ def load_index(
                             now_unix=now_unix, is_recovery=True,
                             index_history_policy=index_history_policy,
                         )
-                    # is_network_fetch=False: freshness NOT re-asserted on cache reads.
-                    _verify_and_enforce(
-                        index_bytes=index_bytes,
-                        bundle_bytes=bundle_bytes_cached,
-                        config=config,
-                        verifier=verifier,
-                        index_url=url,
-                        is_network_fetch=False,
                     )
-                elif no_bundle_marker.is_file():
-                    # Degraded mode: bundle transport previously returned 404 (RFC §7.2).
-                    # Enforce BundleMissing per policy; the marker is preserved — this is
-                    # NOT a crash state (H4 fix: the pre-fix code mis-classified this as
-                    # crash → _cache_bundle_looks_ok(None, absent_file) → False → recovery).
-                    from milpa.index_trust import BundleMissing, enforce_index_trust
-                    enforce_index_trust(BundleMissing, config.policy, url)
-                    # warn: execution continues to parse_index below.
-                    # strict: enforce_index_trust raises; we never reach here.
-                else:
-                    # No bundle AND no degraded marker: pre-RFC cache or interrupted write.
-                    # Trigger bounded crash recovery (one refetch).
-                    _delete_bundle_sidecars(bundle_file, no_bundle_marker)
-                    return _refetch_with_recovery(
-                        url=url, cache_dir=cache_dir, cache_file=cache_file,
-                        stamp_file=stamp_file, bundle_file=bundle_file,
-                        no_bundle_marker=no_bundle_marker,
-                        http_get=http_get, bundle_http_get=bundle_http_get,
-                        config=config, verifier=verifier,
-                        now_unix=now_unix, is_recovery=True,
-                        index_history_policy=index_history_policy,
-                    )
+                    return _finish(recovered_index, recovered_verification, recovered_bundle_info)
             try:
-                return parse_index(index_bytes.decode("utf-8"))
+                return _finish(
+                    parse_index(index_bytes.decode("utf-8")),
+                    state1_verification,
+                    state1_bundle_info,
+                )
             except UnicodeDecodeError as exc:
                 # Non-UTF-8 index bytes (e.g. a tianguis encoding bug over a
                 # validly-signed blob) → surface via index-parse error path.
@@ -912,6 +1063,8 @@ def load_index(
                 file=sys.stderr,
             )
             index_bytes = cache_file.read_bytes()
+            state3_verification: "VerificationResult | None" = None
+            state3_bundle_info: "IndexBundleInfo | None" = None
             if trust_active:
                 assert config is not None and verifier is not None  # type narrowing
                 if bundle_file.is_file():
@@ -927,7 +1080,7 @@ def load_index(
                             url=url,
                         )
                     # is_network_fetch=False: stale offline fallback — no freshness.
-                    _verify_and_enforce(
+                    state3_verification = _verify_and_enforce(
                         index_bytes=index_bytes,
                         bundle_bytes=bundle_bytes_stale,
                         config=config,
@@ -935,12 +1088,14 @@ def load_index(
                         index_url=url,
                         is_network_fetch=False,
                     )
+                    state3_bundle_info = describe_index_bundle(bundle_bytes_stale)
                 elif no_bundle_marker.is_file():
                     # Degraded mode: serve cached index under BundleMissing policy.
                     # Marker preserved; cannot refetch (network down) — not a crash state
                     # (H4 fix: pre-fix code mis-classified this as crash → hard-fail).
                     from milpa.index_trust import BundleMissing, enforce_index_trust
                     enforce_index_trust(BundleMissing, config.policy, url)
+                    state3_verification = BundleMissing
                     # warn: execution continues to parse_index below.
                     # strict: enforce_index_trust raises; we never reach here.
                 else:
@@ -953,7 +1108,11 @@ def load_index(
                         url=url,
                     )
             try:
-                return parse_index(index_bytes.decode("utf-8"))
+                return _finish(
+                    parse_index(index_bytes.decode("utf-8")),
+                    state3_verification,
+                    state3_bundle_info,
+                )
             except UnicodeDecodeError as exc:
                 from milpa.errors import TNG_KDL_SYNTAX
                 raise MilpaError(
@@ -993,6 +1152,8 @@ def load_index(
             bundle_transport_error = True
 
     # Verify BEFORE caching (is_network_fetch=True → freshness asserted).
+    state2_verification: "VerificationResult | None" = None
+    state2_bundle_info: "IndexBundleInfo | None" = None
     if trust_active:
         assert config is not None and verifier is not None  # type narrowing
         if bundle_was_404 or bundle_transport_error:
@@ -1005,8 +1166,9 @@ def load_index(
             else:
                 # warn: proceed; marker written below (only for genuine 404).
                 enforce_index_trust(BundleMissing, config.policy, url)
+            state2_verification = BundleMissing
         else:
-            _verify_and_enforce(
+            state2_verification = _verify_and_enforce(
                 index_bytes=fetched_bytes,
                 bundle_bytes=fetched_bundle,
                 config=config,
@@ -1014,6 +1176,8 @@ def load_index(
                 index_url=url,
                 is_network_fetch=True,  # freshness ASSERTED on network-fetch path
             )
+            if fetched_bundle is not None:
+                state2_bundle_info = describe_index_bundle(fetched_bundle)
 
     # -------------------------------------------------------------------------
     # Append-only ratchet gate (registry-protocol §3.5.2, RFC
@@ -1064,7 +1228,50 @@ def load_index(
     # baseline only ever reflects content actually served).
     _apply_ratchet_writes(cache_file, gate_decision, fetched_bytes)
 
-    return gate_decision.index
+    return _finish(gate_decision.index, state2_verification, state2_bundle_info)
+
+
+# ---------------------------------------------------------------------------
+# load_index — backward-compatible Index-returning wrapper over
+# load_index_gated (RFC rfc-trusted-index-invariant.md §2.1). NOT part of
+# the resolver-consumption boundary — kept solely so the existing low-level
+# cache-mechanics test suite (test_index_cache.py / test_index_history_ratchet.py)
+# can keep exercising the 4-state cache machinery without threading a
+# GatedIndex through ~100 call sites that only ever asserted on Index fields
+# (``.packages``) and never touched the trust/gate axis at all.
+# ---------------------------------------------------------------------------
+
+
+def load_index(
+    url: str,
+    cache_dir: Path,
+    http_get: HttpGet,
+    ttl_seconds: int,
+    now_unix: int,
+    config: "IndexTrustConfig | None" = None,
+    verifier: "IndexBundleVerifier | None" = None,
+    bundle_http_get: "BundleHttpGet | None" = None,
+    refresh: bool = False,
+    index_history_policy: str = "off",
+) -> "Index":
+    """Fetch + cache + parse the ``index.kdl`` at *url*; returns the bare
+    ``Index`` (unwrapped). See ``load_index_gated`` for the full contract —
+    this is a thin ``.index`` unwrap over it, kept for existing low-level
+    cache-mechanics tests. Production code that needs a resolver-consumable
+    index must go through ``load_default_index`` / ``load_index_gated``
+    instead — never this function."""
+    return load_index_gated(
+        url,
+        cache_dir,
+        http_get,
+        ttl_seconds,
+        now_unix,
+        config=config,
+        verifier=verifier,
+        bundle_http_get=bundle_http_get,
+        refresh=refresh,
+        index_history_policy=index_history_policy,
+    ).index
 
 
 # ---------------------------------------------------------------------------
@@ -1221,7 +1428,7 @@ def _refetch_with_recovery(
     now_unix: int,
     is_recovery: bool,
     index_history_policy: str = "off",
-) -> "Index":
+) -> "tuple[Index, VerificationResult | None, IndexBundleInfo | None]":
     """Bounded crash-recovery refetch (RFC §7.2).
 
     Called when a CACHE READ detects a missing/corrupt bundle sidecar (interrupted
@@ -1233,6 +1440,12 @@ def _refetch_with_recovery(
     §3.5.2) runs here identically, after Layer-1 verification succeeds and
     before any write, so forced cache corruption can't smuggle a history
     rewrite past the ratchet.
+
+    Returns the ``(Index, VerificationResult | None, IndexBundleInfo | None)``
+    triple (RFC rfc-trusted-index-invariant.md §2.1) rather than minting a
+    ``GatedIndex`` itself — the caller (``load_index_gated``) applies the
+    epoch-commitment fold and mints via its own ``_finish`` closure, so the
+    fold's conditionality lives in exactly one place.
     """
     # Attempt one recovery refetch.
     fetch_error: str | None = None
@@ -1267,6 +1480,8 @@ def _refetch_with_recovery(
             bundle_transport_error = True
 
     # Verify recovery fetch (is_network_fetch=True — freshness asserted).
+    recovery_verification: "VerificationResult | None" = None
+    recovery_bundle_info: "IndexBundleInfo | None" = None
     if bundle_was_404 or bundle_transport_error:
         from milpa.index_trust import enforce_index_trust, BundleMissing
         # Second consecutive miss: hard-fail regardless of policy (RFC §7.2).
@@ -1278,10 +1493,12 @@ def _refetch_with_recovery(
                 url=url,
             )
         enforce_index_trust(BundleMissing, config.policy, url)
+        recovery_verification = BundleMissing
     else:
         # On recovery, ALWAYS hard-fail if verification fails (not policy-gated).
         from milpa.index_trust import (
             BundleMissing as _BM, Trusted,
+            describe_index_bundle,
             enforce_index_trust, VerificationResult,
         )
         max_age = config.max_age_seconds  # recovery = network fetch → freshness checked
@@ -1300,6 +1517,9 @@ def _refetch_with_recovery(
                 f"(result={result.value!r}) — hard-fail (active adversary signal per RFC §7.2)",
                 url=url,
             )
+        recovery_verification = result
+        if fetched_bundle is not None:
+            recovery_bundle_info = describe_index_bundle(fetched_bundle)
 
     # Append-only ratchet gate — after Layer-1 verification succeeds, before
     # any write (registry-protocol §3.5.2; same placement as the ordinary
@@ -1329,7 +1549,7 @@ def _refetch_with_recovery(
     _write_stamp(stamp_file, now_unix)
     _apply_ratchet_writes(cache_file, gate_decision, fetched_bytes)
 
-    return gate_decision.index
+    return gate_decision.index, recovery_verification, recovery_bundle_info
 
 
 # ---------------------------------------------------------------------------
@@ -1400,10 +1620,19 @@ def load_default_index(
     bundle_http_get: "BundleHttpGet | None" = None,
     refresh: bool = False,
     index_history_policy: str = "off",
-) -> "Index":
-    """Load the index from ``MILPA_INDEX_URL`` (or the default URL).
+    # RFC rfc-trusted-index-invariant.md §2.2 — epoch-commitment fold, threaded
+    # straight through to load_index_gated (see its docstring for the
+    # trust_active-conditional semantics).
+    entry_trust_policy: str = "off",
+    epoch_verifier: "IndexBundleVerifier | None" = None,
+    epoch_expected_signer: str | None = None,
+) -> "GatedIndex":
+    """Load the index from ``MILPA_INDEX_URL`` (or the default URL), gated
+    (RFC rfc-trusted-index-invariant.md §2.1) — this is THE production entry
+    point ``cli.py._load_index_for_verb`` calls; its return value is what
+    ends up on ``MilpaEnv.index``.
 
-    Convenience wrapper over ``load_index`` for production callers:
+    Convenience wrapper over ``load_index_gated`` for production callers:
 
     - ``cache_dir``:   defaults to the XDG cache dir.
     - ``http_get``:    defaults to ``urllib_http_get`` (returns bytes).
@@ -1417,6 +1646,11 @@ def load_default_index(
       (``"off" | "warn" | "strict"``, registry-protocol §3.5.2); orthogonal
       to ``config``/``verifier`` (index-trust). Defaults to ``"off"``;
       ``cli.py`` passes the resolved manifest/env policy.
+    - ``entry_trust_policy`` / ``epoch_verifier`` / ``epoch_expected_signer``:
+      the epoch-commitment fold's inputs (§2.2). ``epoch_verifier is None``
+      (the default) disables the fold — ``cli.py`` passes these only when
+      index-trust itself is active, preserving the pre-fold
+      ``trust_active``-conditional behavior exactly.
     """
     import time
 
@@ -1424,7 +1658,7 @@ def load_default_index(
     if config is not None and effective_bundle_get is None:
         effective_bundle_get = urllib_bundle_http_get
 
-    return load_index(
+    return load_index_gated(
         url=index_url_from_env(),
         cache_dir=cache_dir if cache_dir is not None else _default_cache_dir(),
         http_get=http_get if http_get is not None else urllib_http_get,
@@ -1435,4 +1669,7 @@ def load_default_index(
         bundle_http_get=effective_bundle_get,
         refresh=refresh,
         index_history_policy=index_history_policy,
+        entry_trust_policy=entry_trust_policy,
+        epoch_verifier=epoch_verifier,
+        epoch_expected_signer=epoch_expected_signer,
     )

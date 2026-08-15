@@ -19,6 +19,7 @@ import pytest
 
 from milpa.cas import CAStore
 from milpa.context import MilpaEnv, ResolveParams
+from tests._gated_index_helpers import for_test
 from milpa.errors import SOLVE_CONFLICT
 from milpa.fetchers.mocked import mocked_registry
 from milpa.manifest import Manifest, NamedDep
@@ -36,7 +37,7 @@ def _make_env(tmp_path: Path, index: Index) -> MilpaEnv:
     mocked_dir = tmp_path / "no-mocked-fetches"
     mocked_dir.mkdir(parents=True, exist_ok=True)
     fetcher = mocked_registry(mocked_dir)
-    return MilpaEnv(fetcher=fetcher, index=index, store=store)
+    return MilpaEnv(fetcher=fetcher, index=for_test(index), store=store)
 
 
 def _manifest(deps: list) -> Manifest:

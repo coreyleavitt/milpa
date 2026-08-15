@@ -66,6 +66,7 @@ from milpa.binding import (
     resolved_registry_namespace,
 )
 from milpa.context import MilpaEnv, ResolveParams
+from milpa.gated_index import GatedIndex
 from milpa.errors import (
     FETCH_ALL_FAILED,
     FETCH_PROVENANCE_DIVERGENCE,
@@ -3365,6 +3366,18 @@ def resolve(
     MilpaError
         Any MAN-*, TNG-*, FETCH-*, SOLVE-*, RES-* slug.
     """
+    # RFC rfc-trusted-index-invariant.md §2.5: the runtime assert Python
+    # needs in place of Rust's compile-time enforcement — env.index must
+    # either be absent or have passed the real gate (index_cache.py's mint).
+    # A bare Index here would mean some caller bypassed load_default_index.
+    if env.index is not None and not isinstance(env.index, GatedIndex):
+        raise TypeError(
+            "resolve() requires env.index to be a GatedIndex or None — got "
+            f"{type(env.index).__name__!r}. Construct it via the trust gate "
+            "(milpa.index_cache.load_default_index), never a bare Index "
+            "(RFC rfc-trusted-index-invariant.md §2.1/§2.5)."
+        )
+
     deps_dir.mkdir(parents=True, exist_ok=True)
 
     # ------------------------------------------------------------------
@@ -3463,7 +3476,7 @@ def resolve(
             names=named_needing_index,
         )
 
-    index: Index = env.index if env.index is not None else Index()
+    index: Index = env.index.index if env.index is not None else GatedIndex.empty().index
 
     # ------------------------------------------------------------------
     # Step 3: root authority set (§10 provenance precedence)
@@ -5674,6 +5687,17 @@ def resolve_workspace(
         RES-WS-OVERRIDE-MEMBER-COLLISION, RES-WS-MEMBER-REF-UNKNOWN,
         RES-WS-NO-INDEX, or any other MAN-*/TNG-*/FETCH-*/SOLVE-*/RES-* slug.
     """
+    # RFC rfc-trusted-index-invariant.md §2.5: mirrors resolve()'s assert —
+    # asserting only resolve() would leave the workspace path gated by
+    # convention (the C1 defect, relocated one layer down).
+    if env.index is not None and not isinstance(env.index, GatedIndex):
+        raise TypeError(
+            "resolve_workspace() requires env.index to be a GatedIndex or "
+            f"None — got {type(env.index).__name__!r}. Construct it via the "
+            "trust gate (milpa.index_cache.load_default_index), never a "
+            "bare Index (RFC rfc-trusted-index-invariant.md §2.1/§2.5)."
+        )
+
     # §13.1 workspace attestation policy: effective strict = OR of
     # params.require_attested_metadata (flag/env) OR any member's
     # attestation-policy == "strict".
@@ -5775,7 +5799,7 @@ def resolve_workspace(
                 names=unresolvable,
             )
 
-    index: Index = env.index if env.index is not None else Index()
+    index: Index = env.index.index if env.index is not None else GatedIndex.empty().index
 
     # ------------------------------------------------------------------
     # Build provider with workspace root authority

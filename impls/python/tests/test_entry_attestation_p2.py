@@ -17,6 +17,7 @@ from pathlib import Path
 
 from milpa.cas import CAStore
 from milpa.context import MilpaEnv, ResolveParams
+from tests._gated_index_helpers import for_test
 from milpa.fetchers.cas_admitting import CasAdmittingFetcher
 from milpa.fetchers.mocked import mocked_registry, url_key
 from milpa.lockfile import LockAttestation, from_graph
@@ -70,7 +71,7 @@ def _make_env(mocked_dir: Path, tmp_path: Path, index: Index) -> MilpaEnv:
     store = CAStore(root=tmp_path / ".cas")
     inner = mocked_registry(mocked_dir)
     fetcher = CasAdmittingFetcher(inner, store)
-    return MilpaEnv(fetcher=fetcher, index=index, store=store)
+    return MilpaEnv(fetcher=fetcher, index=for_test(index), store=store)
 
 
 def _index_with(attestation: EntryAttestation | None) -> Index:

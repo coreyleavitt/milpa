@@ -35,6 +35,7 @@ from pathlib import Path
 
 from milpa.cas import CAStore
 from milpa.context import MilpaEnv, ResolveParams
+from tests._gated_index_helpers import for_test
 from milpa.fetchers.cas_admitting import CasAdmittingFetcher
 from milpa.fetchers.mocked import mocked_registry, url_key
 from milpa.manifest import Manifest, NamedDep, UrlDep
@@ -116,7 +117,7 @@ def _make_env(tmp_path: Path, index: Index) -> MilpaEnv:
     mocked_dir.mkdir(parents=True, exist_ok=True)
     _stage_all(mocked_dir)
     fetcher = CasAdmittingFetcher(mocked_registry(mocked_dir), store)
-    return MilpaEnv(fetcher=fetcher, index=index, store=store)
+    return MilpaEnv(fetcher=fetcher, index=for_test(index), store=store)
 
 
 def _manifest(deps: list) -> Manifest:

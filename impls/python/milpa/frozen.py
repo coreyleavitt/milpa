@@ -43,6 +43,7 @@ from pathlib import Path
 
 from milpa.binding import DEFAULT_REGISTRY_ALIAS, Claim, reconcile_root_claims
 from milpa.context import MilpaEnv
+from milpa.gated_index import GatedIndex
 from milpa.errors import (
     FROZEN_CONSTRAINT_UNSATISFIED,
     FROZEN_EXCLUDE_NEWER_MISMATCH,
@@ -68,7 +69,7 @@ from milpa.lockfile import (
     ResolvedGraph,
 )
 from milpa.manifest import Manifest, MemberDep, MemberTarget, NamedDep
-from milpa.registry import EntryAttestation, Index
+from milpa.registry import EntryAttestation
 from milpa.source_id import RegistrySourceId, SourceId, format_source_id
 from milpa.version import DepKey, Strategy, VersionSet, parse_version
 from milpa.workspace import LoadedWorkspace
@@ -237,8 +238,13 @@ def _check_source_id_preconditions(
     ONE component for an unqualified declaration rather than passing a real
     index through the frozen path (which never fetches / never loads one).
     """
+    # RFC rfc-trusted-index-invariant.md §2.6: spelled via GatedIndex.empty()
+    # (unwrapped) rather than a bare Index() literal — the anchor is the SAME
+    # "no live index, sound under every policy" witness the resolver's own
+    # env.index-is-None fallback uses, keeping every "no real index" call
+    # site traceable to one source (mirrors Rust frozen.rs's identical move).
     declared_claims: "list[Claim]" = reconcile_root_claims(
-        declared_deps, list(overrides), index=Index()  # type: ignore[arg-type]
+        declared_deps, list(overrides), index=GatedIndex.empty().index  # type: ignore[arg-type]
     )
     declared_by_key: "dict[DepKey, SourceId]" = {
         DepKey.from_solver_var(c.name): c.source_id for c in declared_claims

@@ -53,8 +53,8 @@ from milpa.version import VersionSource, parse_version
 
 if TYPE_CHECKING:
     from milpa.binding import BindingResolver
+    from milpa.gated_index import GatedIndex
     from milpa.manifest import Override
-    from milpa.registry import Index
     from milpa.solver import Term
     from milpa.source_id import SourceId
     from milpa.version import Version, VersionSet
@@ -742,7 +742,7 @@ def resolve_edges(
 def edgeset_to_terms(
     es: EdgeSet,
     overrides_by_name: dict[str, "Override"],
-    index: "Index",
+    index: "GatedIndex | None",
     root_self_name: str | None = None,
     binding_resolver: "BindingResolver | None" = None,
 ) -> tuple[list["Term"], list[str], dict[str, "list[tuple[object, ...]]"]]:
@@ -789,13 +789,17 @@ def edgeset_to_terms(
         fresh guess. ``None`` only in a standalone/unit-test context with no
         live resolve() in progress — falls back to the guess-only behavior.
     index:
-        The tianguis index — needed (RFC origin-as-identity §4.4, S5-rekey)
-        to compute the PubGrub solver-variable string for a ``NamedRequire``
-        entry via ``binding.canonical_key_for_requirement``: the BOUND
-        source-id's canonical form, not the bare/qualified label, so that a
-        parent's OWN requirement on a name and another parent's requirement
-        on a differently-qualified alias for the SAME origin collapse to one
-        PubGrub variable. Computed via the pure, side-effect-free
+        The tianguis index, wrapped as a ``GatedIndex`` (RFC
+        rfc-trusted-index-invariant.md §2.5) — needed (RFC origin-as-identity
+        §4.4, S5-rekey) to compute the PubGrub solver-variable string for a
+        ``NamedRequire`` entry via ``binding.canonical_key_for_requirement``:
+        the BOUND source-id's canonical form, not the bare/qualified label,
+        so that a parent's OWN requirement on a name and another parent's
+        requirement on a differently-qualified alias for the SAME origin
+        collapse to one PubGrub variable. Unwrapped to the plain ``Index``
+        ONCE, internally, at the top of this function — every call site
+        (5 in ``resolver.py``) can pass ``env.index`` straight through
+        without remembering to unwrap. Computed via the pure, side-effect-free
         ``canonical_key_for_requirement`` rather than
         ``BindingResolver.canonical_for`` because this Term is built BEFORE
         the child's own claim is formally ``submit()``ted (that happens
@@ -815,6 +819,11 @@ def edgeset_to_terms(
         Advisory metadata only — never consulted for selection/solving
         (S4, RFC §3.4.3 option a).
     """
+    # RFC rfc-trusted-index-invariant.md §2.5: unwrap ONCE, here, rather than
+    # at each of the 5 resolver.py call sites — collapses "5 sites must
+    # remember to unwrap" into 1.
+    plain_index = index.index if index is not None else None
+
     from milpa.predicate import Predicate as _Predicate
     from milpa.solver import Term
     from milpa.version import VersionSet, parse_version
@@ -868,7 +877,7 @@ def edgeset_to_terms(
                 url=entry.url,
                 ref=entry.ref,
                 overrides_by_name=overrides_by_name,
-                index=index,
+                index=plain_index,
                 root_self_name=root_self_name,
                 binding_resolver=binding_resolver,
             )
@@ -903,7 +912,7 @@ def edgeset_to_terms(
                 namespace=entry.namespace,
                 url=None,
                 overrides_by_name=overrides_by_name,
-                index=index,
+                index=plain_index,
                 root_self_name=root_self_name,
                 binding_resolver=binding_resolver,
             )
