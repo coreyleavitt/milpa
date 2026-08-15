@@ -154,3 +154,112 @@ def test_epoch_fold_never_runs_under_index_trust_off(tmp_path: Path) -> None:
     # off ⇒ no VerificationResult was ever computed either (§2.3's off case).
     assert gated.verification is None
     assert not gated.is_cryptographically_trusted()
+
+
+# ---------------------------------------------------------------------------
+# 3. S2b: GatedIndex.acquire — the cache-free mint the rerouted
+#    tests/test_conformance.py::_build_env now uses instead of the test-only
+#    for_test bypass. Behavioral RED->GREEN: before the reroute, nothing in
+#    the in-process adapter ever called this gate for real.
+# ---------------------------------------------------------------------------
+
+_ACQUIRE_INDEX_TEXT = (
+    "schema_version 1\n\n"
+    'package "bar" {\n'
+    '    namespace "example"\n'
+    '    version "1.0.0" {\n'
+    '        content_hash "sha256:' + "0" * 64 + '"\n'
+    "        provenance {\n"
+    '            kind "git"\n'
+    '            url "https://example.com/bar.git"\n'
+    '            ref "v1.0.0"\n'
+    "        }\n"
+    "    }\n"
+    "}\n"
+)
+
+
+def test_acquire_strict_no_bundle_raises_bundle_missing() -> None:
+    """``acquire`` under ``strict`` with no bundle raises
+    ``TNG-INDEX-BUNDLE-MISSING`` — the #199 regression this RFC exists to
+    pin, now proven directly at the primitive (not just via the reroute)."""
+    from milpa.epoch_commitment import Unarmed
+    from milpa.errors import MilpaError
+    from milpa.index_cache import acquire
+    from milpa.index_trust import IndexTrustConfig, MockVerifier, TrustBundle, VerificationResult
+
+    config = IndexTrustConfig(
+        policy="strict",
+        trust_bundle=TrustBundle.test(),
+        expected_signer="fixture-signer",
+    )
+    verifier = MockVerifier(VerificationResult.TRUSTED)
+
+    with pytest.raises(MilpaError) as exc_info:
+        acquire(
+            _ACQUIRE_INDEX_TEXT,
+            None,
+            config,
+            verifier,
+            "file:///fake/index.kdl",
+            Unarmed(),
+        )
+    assert exc_info.value.slug == "TNG-INDEX-BUNDLE-MISSING"
+
+
+def test_acquire_warn_no_bundle_mints_with_bundle_missing_verification() -> None:
+    """``acquire`` under ``warn`` with no bundle does NOT raise — it mints a
+    ``GatedIndex`` carrying the ``BundleMissing`` verification outcome
+    (warned-and-continued, RFC §2.3's ``warn`` case)."""
+    from milpa.epoch_commitment import Unarmed
+    from milpa.gated_index import GatedIndex
+    from milpa.index_cache import acquire
+    from milpa.index_trust import (
+        BundleMissing,
+        IndexTrustConfig,
+        MockVerifier,
+        TrustBundle,
+        VerificationResult,
+    )
+
+    config = IndexTrustConfig(
+        policy="warn",
+        trust_bundle=TrustBundle.test(),
+        expected_signer="fixture-signer",
+    )
+    verifier = MockVerifier(VerificationResult.TRUSTED)
+
+    gated = acquire(
+        _ACQUIRE_INDEX_TEXT,
+        None,
+        config,
+        verifier,
+        "file:///fake/index.kdl",
+        Unarmed(),
+    )
+
+    assert isinstance(gated, GatedIndex)
+    assert gated.verification is BundleMissing
+    assert not gated.is_cryptographically_trusted()
+
+
+def test_acquire_off_mints_without_verification() -> None:
+    """``acquire`` with ``config=None, verifier=None`` (effective policy
+    ``off``) mints a ``GatedIndex`` with ``verification is None`` — the
+    verifier is never invoked (RFC §2.3's ``off`` case)."""
+    from milpa.epoch_commitment import Unarmed
+    from milpa.gated_index import GatedIndex
+    from milpa.index_cache import acquire
+
+    gated = acquire(
+        _ACQUIRE_INDEX_TEXT,
+        None,
+        None,
+        None,
+        "file:///fake/index.kdl",
+        Unarmed(),
+    )
+
+    assert isinstance(gated, GatedIndex)
+    assert gated.verification is None
+    assert not gated.is_cryptographically_trusted()

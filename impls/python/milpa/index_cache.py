@@ -383,6 +383,81 @@ def _verify_and_enforce(
     return result
 
 
+def acquire(
+    index_text: str,
+    bundle_bytes: "bytes | None",
+    config: "IndexTrustConfig | None",
+    verifier: "IndexBundleVerifier | None",
+    url: str,
+    epoch_status: "EpochCommitmentStatus",
+) -> "GatedIndex":
+    """Cache-free convenience mint (RFC ``rfc-trusted-index-invariant.md``
+    §2.1 "the ``GatedIndex.acquire`` paragraph", §2.2; mirrors Rust
+    ``GatedIndex::acquire``, ``index_cache.rs``).
+
+    For callers that hold index bytes directly rather than going through the
+    on-disk 4-state cache above — the in-process conformance adapter (S2b
+    reroutes ``tests/test_conformance.py``'s ``_build_env`` onto this) and a
+    future ``milpa verify --index-only``. Reuses ``_verify_and_enforce`` — the
+    SAME trust-dispatch helper every cache-integrated mint site
+    (``load_index_gated``'s ``_finish``) calls — rather than reimplementing
+    policy dispatch; this is a thin wrap, not a second gate.
+
+    Gate ordering mirrors ``load_index_gated`` exactly: verify the raw bytes
+    FIRST (eager / before-parse, spec §3.4.1), parse only after the gate
+    passes (or warns-and-continues).
+
+    - ``config``/``verifier`` both ``None`` ⇒ effective policy ``off``: the
+      verifier is never invoked, the minted ``GatedIndex.verification`` is
+      ``None`` (RFC §2.3's ``off`` case).
+    - ``bundle_bytes is None`` under an active policy ⇒
+      ``VerificationResult.BundleMissing`` (``_verify_and_enforce`` already
+      handles the ``None`` case internally) — raises
+      ``TNG-INDEX-BUNDLE-MISSING`` under ``strict``, warns-and-continues
+      under ``warn``.
+    - ``bundle_bytes`` present ⇒ real verify+enforce via
+      ``_verify_and_enforce``, with ``bundle_info`` populated from the same
+      bytes (mirrors the cache-integrated mint's zero-extra-I/O population).
+
+    ``epoch_status`` is the ALREADY-RESOLVED ``EpochCommitmentStatus`` (RFC
+    §2.2): the cache-integrated mint computes this itself via
+    ``_fold_epoch_commitment``'s own sidecar I/O; a cache-free caller has no
+    on-disk cache to read that sidecar from, so it injects the value it
+    already computed (e.g. the conformance adapter's
+    ``_fixture_epoch_commitment_status``). ``acquire`` does NOT run the
+    epoch-commitment phase itself; it only stamps the injected value onto the
+    parsed ``Index`` before minting — no caller-visible mutation of an
+    already-gated index exists.
+
+    ``is_network_fetch=False`` is passed to ``_verify_and_enforce`` uncondi­
+    tionally — a cache-free acquisition is never a background TTL refresh, so
+    freshness is never asserted here (mirrors the offline/cache-read States
+    1 and 3, not State 2).
+    """
+    from milpa.gated_index import GatedIndex
+    from milpa.index_trust import describe_index_bundle
+    from milpa.registry import parse_index
+
+    verification: "VerificationResult | None" = None
+    bundle_info: "IndexBundleInfo | None" = None
+
+    if config is not None and verifier is not None:
+        verification = _verify_and_enforce(
+            index_bytes=index_text.encode("utf-8"),
+            bundle_bytes=bundle_bytes,
+            config=config,
+            verifier=verifier,
+            index_url=url,
+            is_network_fetch=False,
+        )
+        if bundle_bytes is not None:
+            bundle_info = describe_index_bundle(bundle_bytes)
+
+    index = parse_index(index_text)
+    index.epoch_commitment_status = epoch_status
+    return GatedIndex._mint(index, verification, bundle_info)
+
+
 def reverify_cached_index(
     url: str,
     cache_dir: Path,

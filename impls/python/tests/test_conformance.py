@@ -113,7 +113,6 @@ from milpa.resolver import (
 from milpa.solver import SolverError, certificate_to_json
 from milpa.version import Strategy
 from milpa.workspace import load_workspace
-from tests._gated_index_helpers import for_test
 
 # ---------------------------------------------------------------------------
 # Corpus path — parents[N] depth assertion
@@ -576,12 +575,106 @@ def _fixture_epoch_commitment_status(fixture_dir: Path, index_path: Path) -> "ob
     )
 
 
+def _fixture_index_trust_config(
+    fixture_dir: Path, doc: object
+) -> "tuple[object, object] | tuple[None, None]":
+    """Build ``(IndexTrustConfig, IndexBundleVerifier)`` for the in-process
+    resolve-tier index-trust gate (RFC ``rfc-trusted-index-invariant.md``
+    §2.1/S2b).
+
+    Mirrors ``_fixture_entry_trust_config``'s fixture-``env``-file pattern
+    (the SAME per-fixture ``env`` file the black-box harness's own
+    ``_build_env`` merges straight into the CLI subprocess environment as
+    real ``MILPA_INDEX_TRUST*`` vars, ``harness/runner.py``
+    ``_build_env``/§7 precedence) rather than re-deriving policy dispatch —
+    reuses ``milpa.trust.effective_trust_policy``, the SAME authority-model
+    SSOT ``milpa.cli._build_index_trust`` calls, so the in-process adapter
+    cannot silently drift from the CLI's own policy computation.
+
+    Returns ``(None, None)`` when the effective policy is ``"off"`` (gate
+    disabled) — mirrors ``_build_index_trust``'s own ``(None, None)``
+    off-case.
+    """
+    from milpa.index_trust import (
+        DEFAULT_INDEX_SIGNER,
+        IndexTrustConfig,
+        MockVerifier,
+        SigstoreVerifier,
+        TrustBundle,
+        VerificationResult,
+    )
+    from milpa.trust import effective_trust_policy
+
+    env_vars = read_env_file(fixture_dir)
+    env_policy = env_vars.get("MILPA_INDEX_TRUST", "").strip() or None
+
+    manifest_policy = None
+    if isinstance(doc, (Manifest, WorkspaceManifest)):
+        manifest_policy = doc.index_trust_policy
+
+    policy = effective_trust_policy(manifest_policy, flag=False, env_override=env_policy)  # type: ignore[arg-type]
+    if policy == "off":
+        return None, None
+
+    manifest_signer = (
+        doc.index_trust_signer if isinstance(doc, (Manifest, WorkspaceManifest)) else None
+    )
+    env_signer = env_vars.get("MILPA_INDEX_TRUST_SIGNER", "").strip() or None
+    expected_signer = env_signer or manifest_signer or DEFAULT_INDEX_SIGNER
+
+    max_age_raw = env_vars.get("MILPA_INDEX_MAX_AGE", "").strip()
+    try:
+        max_age = int(max_age_raw) if max_age_raw else 604800
+    except ValueError:
+        max_age = 604800
+
+    config = IndexTrustConfig(
+        policy=policy,  # type: ignore[arg-type]
+        trust_bundle=TrustBundle.test(),
+        expected_signer=expected_signer,
+        max_age_seconds=max_age,
+    )
+
+    # MILPA_INDEX_TRUST_MOCK_VERIFIER conformance seam (spec/cli-contract.md
+    # §8.6.6) — same 7 wire strings as milpa.cli._build_index_trust. The
+    # file://-scheme guard that seam enforces in production is moot here:
+    # this adapter's index URL is always file:// (the fixture's own
+    # index.kdl on disk).
+    _MOCK_MAP = {
+        "trusted": VerificationResult.TRUSTED,
+        "sig-invalid": VerificationResult.SIG_INVALID,
+        "digest-mismatch": VerificationResult.DIGEST_MISMATCH,
+        "signer-mismatch": VerificationResult.SIGNER_MISMATCH,
+        "bundle-stale": VerificationResult.BUNDLE_STALE,
+        "bundle-missing": VerificationResult.BUNDLE_MISSING,
+        "bundle-malformed": VerificationResult.BUNDLE_MALFORMED,
+    }
+    mock_result_str = env_vars.get("MILPA_INDEX_TRUST_MOCK_VERIFIER", "").strip()
+    if mock_result_str:
+        if mock_result_str not in _MOCK_MAP:
+            raise ValueError(
+                f"MILPA_INDEX_TRUST_MOCK_VERIFIER={mock_result_str!r} is not a valid "
+                f"result wire string (expected one of: {', '.join(_MOCK_MAP)}). "
+                "Test seam must never fail-open silently."
+            )
+        verifier: object = MockVerifier(_MOCK_MAP[mock_result_str])
+    else:
+        verifier = SigstoreVerifier()
+
+    return config, verifier
+
+
 # ---------------------------------------------------------------------------
 # MilpaEnv construction for in-process conformance
 # ---------------------------------------------------------------------------
 
 
-def _build_env(fixture_dir: Path, tmp_dir: Path, no_index: bool = False) -> MilpaEnv:
+def _build_env(
+    fixture_dir: Path,
+    tmp_dir: Path,
+    no_index: bool = False,
+    project_root: "Path | None" = None,
+) -> MilpaEnv:
     """Build a ``MilpaEnv`` for the fixture's in-process run.
 
     Uses ``mocked_registry(mocked_dir)`` wrapped in ``CasAdmittingFetcher``,
@@ -594,8 +687,22 @@ def _build_env(fixture_dir: Path, tmp_dir: Path, no_index: bool = False) -> Milp
     ``no_index`` mirrors the CLI ``--no-index`` flag (cli-contract §2.6): when
     set, the index and dep_decl_store are suppressed (``None``) even if
     ``index.kdl`` is present — the flag overrides a configured index.
+
+    ``project_root`` is the resolution root (``project-dir`` control file,
+    §2.8.1) whose ``milpa.kdl`` governs the index-trust policy — defaults to
+    ``fixture_dir`` when the caller has no project-dir override (mirrors
+    every other ``project_root``-aware call site in this module).
+
+    RFC ``rfc-trusted-index-invariant.md`` §2.1/S2b: the index is now routed
+    through the REAL index-trust gate (``index_cache.acquire``) instead of
+    the test-only ``for_test`` bypass — MANIFEST-FIRST (root manifest parsed
+    BEFORE the index gate runs), so a fixture expecting a ``MAN-*``/``WS-*``
+    error still surfaces THAT error rather than a ``TNG-INDEX-*`` one: the
+    manifest parse below is unguarded (any ``MilpaError`` propagates to the
+    caller, exactly like the index-trust gate itself), while the gate
+    strictly follows it.
     """
-    from milpa.registry import parse_index
+    from milpa import index_cache
 
     cas_root = tmp_dir / ".cas"
     cas_root.mkdir(parents=True, exist_ok=True)
@@ -614,26 +721,46 @@ def _build_env(fixture_dir: Path, tmp_dir: Path, no_index: bool = False) -> Milp
     fetcher = CasAdmittingFetcher(inner_registry, store)
 
     index_path = fixture_dir / "index.kdl"
-    index = None
+    gated_index = None
     if not no_index and index_path.exists():
-        # Let MilpaError propagate — TNG-* parse errors from index.kdl must
-        # surface as the fixture's expected error (not be swallowed).
-        # Non-MilpaError exceptions (e.g. KDL syntax error not yet typed)
-        # are still silently ignored so the adapter stays robust for
-        # structurally-invalid KDL (which would produce MAN-KDL-SYNTAX anyway).
+        root = project_root if project_root is not None else fixture_dir
+        # Manifest-first: parse the resolution-root manifest BEFORE the index
+        # gate. Unguarded on purpose — a MAN-*/WS-* MilpaError here MUST
+        # propagate (and win) ahead of any index-trust error below, matching
+        # every other manifest-parse call site in this module.
+        kdl_path = root / "milpa.kdl"
+        doc: object = None
+        if kdl_path.is_file():
+            doc = parse_workspace_or_manifest(kdl_path.read_text(encoding="utf-8"))
+
+        config, verifier = _fixture_index_trust_config(fixture_dir, doc)
+        bundle_path = fixture_dir / "index.kdl.bundle"
+        bundle_bytes = bundle_path.read_bytes() if bundle_path.is_file() else None
+        # S-EpochGate: a no-op for the overwhelming majority of fixtures
+        # (no ``attestation-epoch-commitment`` -> Unarmed, the existing
+        # default) — see _fixture_epoch_commitment_status's docstring.
+        epoch_status = _fixture_epoch_commitment_status(fixture_dir, index_path)
+        index_url = f"file://{index_path.resolve()}"
+
+        # Let MilpaError propagate — TNG-INDEX-* gate failures (strict) and
+        # TNG-* parse errors from index.kdl must surface as the fixture's
+        # expected error (not be swallowed). Non-MilpaError exceptions (e.g.
+        # a KDL syntax error not yet typed) are still silently ignored so the
+        # adapter stays robust for structurally-invalid KDL (which would
+        # produce MAN-KDL-SYNTAX anyway) — mirrors the pre-reroute contract.
         try:
-            index = parse_index(index_path.read_text(encoding="utf-8"))
+            gated_index = index_cache.acquire(
+                index_path.read_text(encoding="utf-8"),
+                bundle_bytes,
+                config,
+                verifier,
+                index_url,
+                epoch_status,
+            )
         except MilpaError:
             raise
         except Exception:
-            index = None
-        if index is not None:
-            # S-EpochGate: a no-op for the overwhelming majority of fixtures
-            # (no ``attestation-epoch-commitment`` -> Unarmed, the existing
-            # default) — see _fixture_epoch_commitment_status's docstring.
-            index.epoch_commitment_status = _fixture_epoch_commitment_status(
-                fixture_dir, index_path
-            )
+            gated_index = None
 
     # S3b: when the fixture ships a ``dep-decl/`` artifact dir, build a
     # ``FileDepDeclStore`` over it — the in-process mirror of the harness
@@ -658,12 +785,9 @@ def _build_env(fixture_dir: Path, tmp_dir: Path, no_index: bool = False) -> Milp
     )
 
     # RFC rfc-trusted-index-invariant.md §2.5/S2b: resolve()/resolve_workspace()
-    # now assert isinstance(env.index, GatedIndex). This adapter still builds
-    # the index by reading fixture bytes directly (bypassing the real
-    # index-trust gate entirely) — that reroute is S2b, not this slice — so
-    # wrap via the test-only for_test escape hatch to keep the corpus green
-    # without adding real gating behavior here.
-    gated_index = for_test(index) if index is not None else None
+    # assert isinstance(env.index, GatedIndex) — `gated_index` above was
+    # minted by the REAL gate (index_cache.acquire), not the test-only
+    # for_test bypass.
 
     return MilpaEnv(
         fetcher=fetcher,
@@ -2012,9 +2136,14 @@ def _execute_fixture(
     deps_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        env = _build_env(fixture_dir, tmp_dir, no_index=fixture.no_index)
+        env = _build_env(
+            fixture_dir, tmp_dir, no_index=fixture.no_index, project_root=project_root
+        )
     except MilpaError as e:
-        # TNG-* parse errors from index.kdl surface here (before any resolve).
+        # MAN-*/WS-* manifest errors and TNG-* index-trust/parse errors all
+        # surface here (before any resolve) — manifest-first ordering (RFC
+        # rfc-trusted-index-invariant.md §2.1/S2b) means a MAN-*/WS-* fixture
+        # always matches here before a TNG-INDEX-* could ever fire.
         if fixture.expected_error is not None and e.slug == fixture.expected_error:
             return ("pass", "")
         elif fixture.expected_error is not None:
@@ -3181,11 +3310,12 @@ class TestConformanceAdapterMachinery:
         assert isinstance(env, MilpaEnv)
         assert isinstance(env.fetcher, CasAdmittingFetcher)
         assert isinstance(env.store, CAStore)
-        # fixture-003 has an index.kdl (empty index) → index is loaded, wrapped
-        # as a GatedIndex (RFC rfc-trusted-index-invariant.md §2.5) — the
-        # adapter still bypasses the real gate (for_test), so it carries no
-        # verification claim, but resolve()/resolve_workspace() only accept
-        # the wrapper type, never a bare Index.
+        # fixture-003 has an index.kdl (empty index) declaring index-trust
+        # "warn" → the REAL gate runs (RFC rfc-trusted-index-invariant.md
+        # §2.1/S2b): no bundle sidecar → BundleMissing, warned-and-continued
+        # under "warn" — the minted GatedIndex carries that verification
+        # outcome. resolve()/resolve_workspace() only accept the wrapper
+        # type, never a bare Index.
         from milpa.gated_index import GatedIndex
         from milpa.registry import Index
         assert isinstance(env.index, GatedIndex)
