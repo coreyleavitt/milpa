@@ -38,12 +38,16 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
-use crate::epoch_commitment::{evaluate_epoch_commitment, EpochCommitmentStatus};
+use crate::epoch_commitment::{
+    check_epoch_ratchet_requirement, enforce_epoch_commitment, evaluate_epoch_commitment,
+    EpochCommitmentStatus,
+};
 use crate::error::{CoreError, MilpaError};
+use crate::gated_index::GatedIndex;
 use crate::index_ratchet_seam::{evaluate_gate, parse_baseline_meta, raw_attestation_epoch_commitment,
                                  BaselineMeta, GateDecision};
-use crate::index_trust::{enforce_index_trust, IndexBundleVerifier, IndexTrustConfig, TrustBundle,
-                          VerificationResult};
+use crate::index_trust::{describe_index_bundle, enforce_index_trust, IndexBundleInfo,
+                          IndexBundleVerifier, IndexTrustConfig, TrustBundle, VerificationResult};
 use crate::registry::Index;
 use milpa_manifest::TrustPolicy;
 
@@ -305,7 +309,7 @@ fn verify_and_enforce(
     policy: &TrustPolicy,
     index_url: &str,
     is_network_fetch: bool,
-) -> Result<(), MilpaError> {
+) -> Result<VerificationResult, MilpaError> {
     let max_age = if is_network_fetch {
         Some(config.max_age_seconds)
     } else {
@@ -318,7 +322,8 @@ fn verify_and_enforce(
         &config.expected_signer,
         max_age,
     );
-    enforce_index_trust(result, policy, index_url)
+    enforce_index_trust(result, policy, index_url)?;
+    Ok(result)
 }
 
 /// Re-verify the ALREADY-CACHED index attestation bundle, fully offline (Sv,
@@ -366,7 +371,8 @@ pub fn reverify_cached_index(
             &config.policy,
             url,
             false,
-        ),
+        )
+        .map(|_| ()),
         Err(_) => enforce_index_trust(VerificationResult::BundleMissing, &config.policy, url),
     }
 }
@@ -690,6 +696,91 @@ pub fn reverify_cached_epoch_commitment_status(
     )
 }
 
+// ---------------------------------------------------------------------------
+// The epoch-commitment fold (RFC trusted-index-invariant.md §2.2) — folded
+// INTO the mint so a `GatedIndex` proves BOTH index-trust AND epoch-commitment
+// ran, with no caller-visible `&mut` write on an already-minted value.
+// ---------------------------------------------------------------------------
+
+/// Injected inputs for the S-EpochCommitment gate phase, assembled by
+/// milpa-cli (the verifier/signer/HTTP transport are CLI-layer concerns —
+/// env reads, the mock-seam file:// guard, the native HTTP transport) and
+/// threaded down through `load_index → load_index_with_history → the mint
+/// sites`, mirroring the existing injected-verifier pattern
+/// (`verifier: Option<&dyn IndexBundleVerifier>` already threads the same
+/// way). `None` at the call site means index-trust policy is `off`
+/// (`trust_active` false) — the phase does not run at all, preserving the
+/// pre-fold `if let (Some(active), Some(index)) = (gate.as_ref(), ...)`
+/// conditionality verbatim (RFC §2.2 HIGH: no trust root exists to build an
+/// epoch verifier from under `off`, so starting epoch crypto there would be
+/// both a behavior change and a structural impossibility).
+///
+/// All fields are shared references / closures, so the struct is `Copy` —
+/// callers can pass it to both `try_serve_from_cache` call sites (States 1
+/// and 3) and the State-2 mint without fighting the borrow checker.
+#[derive(Clone, Copy)]
+pub struct EpochCommitmentInputs<'a> {
+    /// The SAME verifier construction (mock seam or `SigstoreVerifier`)
+    /// `milpa verify`'s offline re-derivation uses — see
+    /// `build_epoch_commitment_verifier` (milpa-cli).
+    pub verifier: &'a dyn IndexBundleVerifier,
+    /// A DEDICATED re-arm signer identity (D15) — never the whole-index signer.
+    pub expected_signer: &'a str,
+    /// Index-trust's already-resolved trust ROOT, reused (registry-protocol
+    /// §3.4.8: "resolved the same way").
+    pub trust_bundle: &'a TrustBundle,
+    /// Fetch transport for the epoch-commitment sidecar (native HTTP in
+    /// production; poisoned/mocked in tests).
+    pub http_get: EpochCommitmentHttpGet<'a>,
+    /// The epoch-commitment sidecar's OWN content-addressed cache directory
+    /// (distinct from the index cache dir — see [`epoch_commitment_cache_path`]).
+    pub status_cache_dir: &'a Path,
+    /// The entry-trust policy axis — feeds ONLY the D18 co-requirement check
+    /// (`Armed` + `entry-trust "strict"` requires `index-history "strict"`)
+    /// and the informational no-epoch-armed notice; does not otherwise affect
+    /// index loading.
+    pub entry_trust_policy: &'a TrustPolicy,
+}
+
+/// Apply the S-EpochCommitment gate phase to an already index-trust-gated
+/// `Index`, BEFORE the final `GatedIndex::mint` wrap (RFC §2.2): mutates
+/// `index.epoch_commitment_status` in place and enforces the D14/D18 rules.
+/// A minted `GatedIndex` therefore proves both gates ran. Mirrors the
+/// pre-fold `main.rs::apply_epoch_commitment_phase` /
+/// `cli.py::_apply_epoch_commitment_phase` exactly — only the seam moved.
+///
+/// # Errors
+/// - `TNG-INDEX-EPOCH-COMMITMENT-INVALID` — unconditional abort on `ArmingInvalid` (D14).
+/// - `TNG-INDEX-EPOCH-RATCHET-REQUIRED` — the D18 co-requirement.
+fn apply_epoch_fold(
+    index: &mut Index,
+    url: &str,
+    index_cache_dir: &Path,
+    index_history_policy: &TrustPolicy,
+    epoch: &EpochCommitmentInputs<'_>,
+) -> Result<(), MilpaError> {
+    let pointer = read_cached_epoch_commitment_pointer(url, index_cache_dir);
+    let status = load_epoch_commitment_status(
+        url,
+        pointer.as_deref(),
+        epoch.status_cache_dir,
+        epoch.http_get,
+        epoch.verifier,
+        epoch.trust_bundle,
+        epoch.expected_signer,
+    );
+    index.epoch_commitment_status = status.clone();
+
+    enforce_epoch_commitment(&status)?;
+    check_epoch_ratchet_requirement(&status, epoch.entry_trust_policy, index_history_policy)?;
+
+    // Dsgn-H2 (RFC attestation-v1-normative.md §6 S5): informational, never
+    // gates the resolve.
+    crate::entry_trust::maybe_emit_no_epoch_armed_notice(epoch.entry_trust_policy, &status);
+
+    Ok(())
+}
+
 /// Force a network fetch of `url` and verify it under the effective
 /// index-trust policy — WITHOUT any cache mutation (no bundle sidecar, no
 /// index write, no freshness stamp, no ratchet baseline touched).
@@ -766,7 +857,7 @@ pub fn load_index(
     verifier: Option<&dyn IndexBundleVerifier>,
     bundle_http_get: Option<BundleHttpGet<'_>>,
     refresh: bool,
-) -> Result<Index, MilpaError> {
+) -> Result<GatedIndex, MilpaError> {
     load_index_with_history(
         url,
         cache_dir,
@@ -778,6 +869,7 @@ pub fn load_index(
         bundle_http_get,
         refresh,
         &TrustPolicy::Off,
+        None,
     )
 }
 
@@ -803,6 +895,16 @@ pub fn load_index(
 ///                       body, including the `is_recovery` crash-recovery
 ///                       re-fetch — ONE function, both flows gated), never on
 ///                       a pure cache read (States 1/3).
+/// - `epoch`           — S-EpochCommitment gate inputs (RFC trusted-index-
+///                       invariant.md §2.2); `None` ⇔ index-trust policy is
+///                       `off` for this invocation — the epoch phase does not
+///                       run at all, and the minted `GatedIndex` carries
+///                       `epoch_commitment_status` untouched. `Some` folds the
+///                       phase into the mint, BEFORE the final wrap, at every
+///                       state (1/2/3) that reaches one.
+///
+/// Returns a [`GatedIndex`] — the trust-boundary witness type. See
+/// [`GatedIndex`]'s own docs for the per-policy meaning of a passed gate.
 #[allow(clippy::too_many_arguments)]
 pub fn load_index_with_history(
     url: &str,
@@ -815,7 +917,8 @@ pub fn load_index_with_history(
     bundle_http_get: Option<BundleHttpGet<'_>>,
     refresh: bool,
     index_history_policy: &TrustPolicy,
-) -> Result<Index, MilpaError> {
+    epoch: Option<EpochCommitmentInputs<'_>>,
+) -> Result<GatedIndex, MilpaError> {
     std::fs::create_dir_all(cache_dir).map_err(net_or_io)?;
     let cache_file = cache_path_for(url, cache_dir);
     let stamp_file = cache_file.with_extension("kdl.at");
@@ -843,11 +946,14 @@ pub fn load_index_with_history(
                 match try_serve_from_cache(
                     url,
                     &cache_file,
+                    cache_dir,
                     config,
                     verifier,
                     &policy,
                     trust_active,
                     false, // not a network fetch — skip freshness check
+                    index_history_policy,
+                    epoch,
                 ) {
                     Ok(Some(index)) => return Ok(index),
                     Ok(None) => {
@@ -898,6 +1004,13 @@ pub fn load_index_with_history(
             #[allow(unused_assignments)]
             let mut ratchet_decision: Option<GateDecision> = None;
 
+            // The mint's witness fields (RFC trusted-index-invariant.md §2.4),
+            // threaded the same way as `ratchet_decision` above: each branch
+            // below sets them before the final mint; the `off`/no-gate branch
+            // leaves both `None` (§2.3: "off ⇒ no trust claim is asserted").
+            let mut verification: Option<VerificationResult> = None;
+            let mut bundle_info: Option<IndexBundleInfo> = None;
+
             // Spec §7.2: resolve the trust-gate disposition entirely in-memory before
             // touching the cache.  Each arm either returns an error (no cache write)
             // or completes the appropriate cache write on success.
@@ -946,10 +1059,14 @@ pub fn load_index_with_history(
                             atomic_write_bytes(&bundle_path(&cache_file), &bundle_bytes)?;
                             write_index_to_cache(&cache_file, &index_bytes, &stamp_file, now_unix)?;
                             ratchet_decision = Some(decision);
+                            // `raw == Trusted` was already asserted above (else this arm
+                            // returned MILPA-INDEX-UNREACHABLE).
+                            verification = Some(VerificationResult::Trusted);
+                            bundle_info = describe_index_bundle(&bundle_bytes);
                         } else {
                             // Non-recovery: normal verify-and-enforce (policy gates errors).
                             // On failure (Strict): return error WITHOUT writing anything.
-                            verify_and_enforce(
+                            let result = verify_and_enforce(
                                 &index_bytes,
                                 &bundle_bytes,
                                 cfg_ref,
@@ -972,6 +1089,9 @@ pub fn load_index_with_history(
                             atomic_write_bytes(&bundle_path(&cache_file), &bundle_bytes)?;
                             write_index_to_cache(&cache_file, &index_bytes, &stamp_file, now_unix)?;
                             ratchet_decision = Some(decision);
+                            // §2.4: populate from the SAME verify call — zero extra I/O.
+                            verification = Some(result);
+                            bundle_info = describe_index_bundle(&bundle_bytes);
                         }
                     }
                     Err(BundleError::NotFound) => {
@@ -1017,6 +1137,8 @@ pub fn load_index_with_history(
                         write_index_to_cache(&cache_file, &index_bytes, &stamp_file, now_unix)?;
                         enforce_index_trust(VerificationResult::BundleMissing, &policy, url)?;
                         ratchet_decision = Some(decision);
+                        // No bundle bytes ever arrived — bundle_info stays None (§2.4).
+                        verification = Some(VerificationResult::BundleMissing);
                     }
                     Err(BundleError::Other(_e)) => {
                         // Non-404 transport error: bytes never arrived → BundleMissing
@@ -1063,6 +1185,8 @@ pub fn load_index_with_history(
                         }
                         write_index_to_cache(&cache_file, &index_bytes, &stamp_file, now_unix)?;
                         ratchet_decision = Some(decision);
+                        // Bytes never arrived (transport error) — bundle_info stays None.
+                        verification = Some(VerificationResult::BundleMissing);
                     }
                 }
             } else {
@@ -1086,7 +1210,12 @@ pub fn load_index_with_history(
             let decision = ratchet_decision
                 .expect("every branch above that reaches here set ratchet_decision");
             apply_ratchet_writes(&cache_file, &decision, &index_bytes)?;
-            Ok(decision.index)
+
+            let mut index = decision.index;
+            if let Some(epoch) = &epoch {
+                apply_epoch_fold(&mut index, url, cache_dir, index_history_policy, epoch)?;
+            }
+            Ok(GatedIndex::mint(index, verification, bundle_info))
         }
 
         Err(fetch_err) => {
@@ -1095,11 +1224,14 @@ pub fn load_index_with_history(
                 match try_serve_from_cache(
                     url,
                     &cache_file,
+                    cache_dir,
                     config,
                     verifier,
                     &policy,
                     trust_active,
                     false, // offline → no freshness check
+                    index_history_policy,
+                    epoch,
                 ) {
                     Ok(Some(index)) => return Ok(index),
                     Ok(None) => {
@@ -1129,20 +1261,31 @@ pub fn load_index_with_history(
 /// Attempt to serve the index from the on-disk cache.
 ///
 /// Returns:
-///   - `Ok(Some(index))` — cache hit, trust gate passed (or inactive).
+///   - `Ok(Some(gated))` — cache hit, trust gate passed (or inactive); minted
+///                         (RFC trusted-index-invariant.md §2.1/§2.2 — the
+///                         epoch-commitment phase, when `epoch` is `Some`,
+///                         runs BEFORE the mint).
 ///   - `Ok(None)`        — cache exists but bundle sidecar is inconsistent;
 ///                         caller should attempt crash recovery / fall through.
-///   - `Err(_)`          — hard trust-gate failure (Strict) or I/O error.
+///   - `Err(_)`          — hard trust-gate failure (Strict), epoch-gate
+///                         failure, or I/O error.
+#[allow(clippy::too_many_arguments)]
 fn try_serve_from_cache(
     url: &str,
     cache_file: &Path,
+    cache_dir: &Path,
     config: Option<&IndexTrustConfig>,
     verifier: Option<&dyn IndexBundleVerifier>,
     policy: &TrustPolicy,
     trust_active: bool,
     is_network_fetch: bool,
-) -> Result<Option<Index>, MilpaError> {
+    index_history_policy: &TrustPolicy,
+    epoch: Option<EpochCommitmentInputs<'_>>,
+) -> Result<Option<GatedIndex>, MilpaError> {
     let index_bytes = std::fs::read(cache_file).map_err(net_or_io)?;
+
+    let mut verification: Option<VerificationResult> = None;
+    let mut bundle_info: Option<IndexBundleInfo> = None;
 
     if trust_active {
         let bp = bundle_path(cache_file);
@@ -1152,13 +1295,14 @@ fn try_serve_from_cache(
         if nbp.exists() {
             enforce_index_trust(VerificationResult::BundleMissing, policy, url)?;
             // Warn → continue; Strict handled in the caller (never reaches here).
+            verification = Some(VerificationResult::BundleMissing);
         } else if cache_bundle_looks_ok(&bp) {
             // Bundle sidecar present — verify.
             // config and verifier are always Some here: trust_active asserts it
             // (trust_active = policy≠Off && config.is_some() && verifier.is_some()).
             // The inner Option-check was dead code (Item 5a); removed.
             let bundle_bytes = std::fs::read(&bp).map_err(net_or_io)?;
-            verify_and_enforce(
+            let result = verify_and_enforce(
                 &index_bytes,
                 &bundle_bytes,
                 config.expect("config must be Some when trust_active"),
@@ -1167,6 +1311,11 @@ fn try_serve_from_cache(
                 url,
                 is_network_fetch,
             )?;
+            // §2.4: populate bundle_info from the SAME verify call — zero
+            // extra I/O. NOT an endorsement of trust (a Warn-tolerated
+            // DigestMismatch still populates it from the mismatched sidecar).
+            bundle_info = describe_index_bundle(&bundle_bytes);
+            verification = Some(result);
         } else {
             // Bundle sidecar absent (neither a .no-bundle marker nor a .bundle
             // file) — inconsistent cache state; signal crash recovery needed.
@@ -1181,7 +1330,13 @@ fn try_serve_from_cache(
             format!("cached index at {:?} is not valid UTF-8", cache_file),
         ))
     })?;
-    Ok(Some(Index::parse(text).map_err(MilpaError::from)?))
+    let mut index = Index::parse(text).map_err(MilpaError::from)?;
+
+    if let Some(epoch) = &epoch {
+        apply_epoch_fold(&mut index, url, cache_dir, index_history_policy, epoch)?;
+    }
+
+    Ok(Some(GatedIndex::mint(index, verification, bundle_info)))
 }
 
 #[cfg(test)]

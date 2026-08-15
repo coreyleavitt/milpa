@@ -286,7 +286,7 @@ fn count_comments(text: &str) -> usize {
 #[allow(clippy::too_many_arguments)]
 pub fn apply_workspace_manifest_change<F>(
     root: &Path,
-    index: Option<&crate::registry::Index>,
+    index: Option<&crate::gated_index::GatedIndex>,
     fetcher: &dyn crate::fetch::FetcherRegistry,
     profile: Option<&milpa_manifest::Profile>,
     prior: Option<&milpa_types::Lockfile>,

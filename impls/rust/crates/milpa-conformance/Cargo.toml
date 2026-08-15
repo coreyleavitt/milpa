@@ -17,7 +17,11 @@ corpus = "spec-v1"
 known-failing = "known_failing.txt"
 
 [dependencies]
-milpa-core = { workspace = true }
+# `test-support`: the runner's in-process bypass sites construct a bare `Index`
+# from fixture bytes and wrap it via `GatedIndex::for_test` (RFC
+# trusted-index-invariant.md §2.6) — see milpa-core's Cargo.toml for why this
+# needs a real feature flag rather than `#[cfg(test)]`.
+milpa-core = { workspace = true, features = ["test-support"] }
 milpa-types = { workspace = true }
 # Used in run_index_trust_fixture (Item 4 M4): real workspace manifest writes for
 # fixture-355 and fixture-349 runners require a temp dir outside the fixture dir.

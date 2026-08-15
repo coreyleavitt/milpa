@@ -57,6 +57,10 @@ fn cfg(policy: TrustPolicy) -> IndexTrustConfig {
 }
 
 /// Convenience wrapper: load_index with no trust gate (backwards-compat path).
+///
+/// Unwraps the `GatedIndex` witness internally so the ~30 existing call
+/// sites checking `.packages` etc. stay unchanged — these tests exercise the
+/// 4-state cache mechanics, not the `GatedIndex` type itself.
 fn load(
     url: &str,
     cache_dir: &std::path::Path,
@@ -64,7 +68,7 @@ fn load(
     ttl: u64,
     now: u64,
 ) -> Result<Index, MilpaError> {
-    load_index(url, cache_dir, http_get, ttl, now, None, None, None, false)
+    load_index(url, cache_dir, http_get, ttl, now, None, None, None, false).map(|g| g.index().clone())
 }
 
 // ---------------------------------------------------------------------------
@@ -723,7 +727,7 @@ fn recovery_warn_valid_bundle_serves_and_repairs_cache() {
         result
     );
     let idx = result.unwrap();
-    assert_eq!(idx.packages.len(), 1, "index must be parsed correctly after recovery");
+    assert_eq!(idx.index().packages.len(), 1, "index must be parsed correctly after recovery");
     // Bundle sidecar must be written (cache repaired).
     assert!(
         bundle_file.exists(),
@@ -1105,7 +1109,8 @@ fn load_with_history(
     refresh: bool,
     policy: &TrustPolicy,
 ) -> Result<Index, MilpaError> {
-    load_index_with_history(url, cache_dir, http_get, DEFAULT_TTL_SECONDS, now, None, None, None, refresh, policy)
+    load_index_with_history(url, cache_dir, http_get, DEFAULT_TTL_SECONDS, now, None, None, None, refresh, policy, None)
+        .map(|g| g.index().clone())
 }
 
 #[test]
@@ -1130,6 +1135,38 @@ fn a3_off_policy_never_writes_baseline() {
     assert!(result.is_ok());
     let cache_file = cache_path_for(URL, d.path());
     assert!(!baseline_path(&cache_file).exists(), "off policy must never write a baseline");
+}
+
+/// RFC trusted-index-invariant.md §2.2 (REQUIRED pin — the epoch fold's
+/// `trust_active` conditionality): an `off`-policy load (`config=None` ⇒ no
+/// `EpochCommitmentInputs` is ever assembled, so the mint receives
+/// `epoch: None`) must leave `epoch_commitment_status` completely untouched
+/// (`Unarmed`, the `Index::parse` default) even when the candidate text
+/// carries an `attestation-epoch-commitment` pointer. The epoch phase's
+/// crypto has no trust root to verify against under `off` (there is no
+/// `IndexTrustConfig`, hence no `TrustBundle`) — it must not run AT ALL, not
+/// merely "run and report nothing armed". `load_with_history` (this file's
+/// helper) hardcodes `epoch: None` on every call, mirroring `load_index`'s
+/// pre-A3 signature — so this test doubles as a structural pin that no
+/// verifier reference is ever threaded through under `off`: there is none to
+/// invoke, by construction, not merely by observed behavior.
+#[test]
+fn off_policy_with_epoch_pointer_present_leaves_status_unarmed() {
+    let d = tmp();
+    let index_with_pointer = "schema_version 1\n\
+         attestation-epoch-commitment \"deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\"\n\
+         package \"bar\" {\n    version \"1.0.0\"\n}\n";
+    let get = |_: &str| Ok(index_with_pointer.as_bytes().to_vec());
+
+    let idx = load_with_history(URL, d.path(), &get, 1000, false, &TrustPolicy::Off).unwrap();
+
+    assert_eq!(
+        idx.epoch_commitment_status,
+        crate::epoch_commitment::EpochCommitmentStatus::Unarmed,
+        "index-trust off must leave epoch_commitment_status untouched (Unarmed) even when \
+         the candidate carries an attestation-epoch-commitment pointer — the epoch phase must \
+         not run at all under off (RFC trusted-index-invariant.md §2.2)"
+    );
 }
 
 #[test]

@@ -51,7 +51,7 @@ use crate::registry::Index;
 /// Fields are private — the only way to build a non-empty, non-test
 /// `GatedIndex` is [`GatedIndex::mint`], which is `pub(crate)` (privileged to
 /// the gate modules, per RFC §2.1).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct GatedIndex {
     index: Index,
     verification: Option<VerificationResult>,
@@ -72,12 +72,9 @@ impl GatedIndex {
     /// produced `result`, already enforced by the caller per policy before
     /// minting).
     ///
-    /// S1a-i (this slice) is purely additive: no production call site is
-    /// wired to `mint` yet — that lands in S1a-ii, which retypes the ~4
-    /// `index_cache` / `index_ratchet_seam` mint points and the `load_*` /
-    /// `maybe_index` return types. Until then this is only exercised by this
-    /// module's own tests, hence the explicit `allow`.
-    #[allow(dead_code)]
+    /// S1a-ii wires this into the `index_cache` mint points (`load_index_with_history`
+    /// / `try_serve_from_cache`) and the `load_*` / `maybe_index` return types now
+    /// return `GatedIndex`.
     pub(crate) fn mint(
         index: Index,
         verification: Option<VerificationResult>,
@@ -126,11 +123,23 @@ impl GatedIndex {
     }
 
     /// Test-only escape hatch: wrap an arbitrary [`Index`] without going
-    /// through the gate. `#[cfg(test)]`-gated so it cannot ship in a release
-    /// build (RFC §2.6) — Rust enforces this at compile time, unlike Python's
+    /// through the gate. Gated so it cannot ship in a release build (RFC
+    /// §2.6) — Rust enforces this at compile time, unlike Python's
     /// `for_test`, which needs a runtime containment story.
-    #[cfg(test)]
-    pub(crate) fn for_test(index: Index) -> GatedIndex {
+    ///
+    /// Two gates, not one: `cfg(test)` covers milpa-core's OWN unit tests
+    /// (same-crate compilation shares one `--cfg test`), but the shared
+    /// conformance runner (`milpa-conformance`, a SEPARATE crate depending on
+    /// milpa-core as an ordinary library) cannot see a `#[cfg(test)]` item —
+    /// `cfg(test)` never propagates across a crate boundary. Its `runner.rs`
+    /// constructs an `Index` directly from fixture bytes (the C2 bypass RFC
+    /// §2.1 names; S1b/S2b reroute it onto the real gate) and needs a real,
+    /// linkable `for_test` to keep compiling in the interim. The
+    /// `test-support` Cargo feature is the standard idiom for exactly this:
+    /// milpa-conformance's `Cargo.toml` enables it; milpa-cli's does NOT, so
+    /// a standalone `cargo build -p milpa-cli` release binary never links it.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn for_test(index: Index) -> GatedIndex {
         GatedIndex { index, verification: None, bundle_info: None }
     }
 }

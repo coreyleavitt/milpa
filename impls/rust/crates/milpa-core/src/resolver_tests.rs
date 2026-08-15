@@ -22,10 +22,20 @@ use crate::lockfile::{collapse_notes, format_lockfile, from_graph, parse_lockfil
 
 use crate::error::MilpaError;
 use crate::fetch::{FetchError, FetcherRegistry, Receipt};
+use crate::gated_index::GatedIndex;
 use crate::identity::compute_content_hash;
 use crate::registry::{Index, IndexVersion, Package};
 use crate::resolver::{resolve, resolve_with_features};
 use crate::store::CaStore;
+
+/// Test-only: wrap a bare `Index` fixture as a `GatedIndex` for the
+/// `resolve`/`resolve_with_features` entry-point call sites (RFC
+/// trusted-index-invariant.md §2.6 `for_test` escape hatch). These tests
+/// build fixtures directly, bypassing the real gate by construction — that
+/// is the whole point of a unit test, not a bypass to reroute.
+fn gi(idx: &Index) -> GatedIndex {
+    GatedIndex::for_test(idx.clone())
+}
 
 // --- fake fetcher ----------------------------------------------------------
 
@@ -599,7 +609,7 @@ fn resolve_named_dep_strategy_selects_version() {
     let tmp_max = tempfile::tempdir().unwrap();
     let g_max = resolve(
         &m,
-        Some(&index),
+        Some(&gi(&index)),
         &reg_max,
         None,
         None,
@@ -618,7 +628,7 @@ fn resolve_named_dep_strategy_selects_version() {
     let tmp_min = tempfile::tempdir().unwrap();
     let g_min = resolve(
         &m,
-        Some(&index),
+        Some(&gi(&index)),
         &reg_min,
         None,
         None,
@@ -763,7 +773,7 @@ fn resolve_b2_fresh_resolve_picks_newest() {
     let m = manifest(vec![named_dep("libfoo", None), named_dep("libbar", None)]);
     let graph = resolve(
         &m,
-        Some(&index),
+        Some(&gi(&index)),
         &reg,
         None,
         None,
@@ -793,7 +803,7 @@ fn resolve_b2_prior_lock_pins_unconstrained_deps() {
     let prior = b2_prior_lock("1.0.0", "1.0.0");
     let graph = resolve(
         &m,
-        Some(&index),
+        Some(&gi(&index)),
         &reg,
         None,
         Some(&prior),
@@ -828,7 +838,7 @@ fn resolve_b2_bump_one_dep_leaves_unrelated_pinned() {
     let prior = b2_prior_lock("1.0.0", "1.0.0");
     let graph = resolve(
         &m,
-        Some(&index),
+        Some(&gi(&index)),
         &reg,
         None,
         Some(&prior),
@@ -865,7 +875,7 @@ fn resolve_b4_stripped_pin_named_dep_opts_out_of_preference() {
     foo_entry.identity = None; // pin stripped -> no preference
     let graph = resolve(
         &m,
-        Some(&index),
+        Some(&gi(&index)),
         &reg,
         None,
         Some(&prior),
@@ -969,7 +979,7 @@ fn resolve_c2_lowest_direct_root_direct_minver_transitive_maxver() {
     let m = manifest(vec![named_dep("direct", None)]);
     let graph = resolve(
         &m,
-        Some(&index),
+        Some(&gi(&index)),
         &reg,
         None,
         None,
@@ -1092,7 +1102,7 @@ fn resolve_c3_maxver_explicit_on_maxver_lock_keeps_locked_pin() {
     let prior = c3_prior_lock("1.0.0", "2.0.0", "maxver");
     let graph = resolve(
         &m,
-        Some(&index),
+        Some(&gi(&index)),
         &reg,
         None,
         Some(&prior),
@@ -1129,7 +1139,7 @@ fn resolve_c3_lowest_direct_bypasses_root_direct_only() {
     let prior = c3_prior_lock("2.0.0", "1.0.0", "maxver");
     let graph = resolve(
         &m,
-        Some(&index),
+        Some(&gi(&index)),
         &reg,
         None,
         Some(&prior),
@@ -1169,7 +1179,7 @@ fn resolve_c3_minver_vs_maxver_lock_bypasses_whole_graph() {
     let prior = c3_prior_lock("2.0.0", "2.0.0", "maxver");
     let graph = resolve(
         &m,
-        Some(&index),
+        Some(&gi(&index)),
         &reg,
         None,
         Some(&prior),
@@ -1373,7 +1383,7 @@ fn resolve_r6_namespace_qualified_transitive_gets_transitive_default_not_minver(
     let m = r6_root_manifest();
     let graph = resolve(
         &m,
-        Some(&index),
+        Some(&gi(&index)),
         &reg,
         None,
         None,
@@ -1425,7 +1435,7 @@ fn resolve_r6_namespace_qualified_transitive_keeps_lock_preference() {
     };
     let graph = resolve(
         &m,
-        Some(&index),
+        Some(&gi(&index)),
         &reg,
         None,
         Some(&prior),
@@ -1508,7 +1518,7 @@ fn resolve_r9_bare_fetch_keeps_locked_versions_despite_nondefault_lock() {
     // "minver" as the lock's strategy.
     let one_off = resolve(
         &m,
-        Some(&index),
+        Some(&gi(&index)),
         &reg,
         None,
         None,
@@ -1534,7 +1544,7 @@ fn resolve_r9_bare_fetch_keeps_locked_versions_despite_nondefault_lock() {
     // NOT fire — both deps must stay at their locked 1.0.0.
     let bare = resolve(
         &m,
-        Some(&index),
+        Some(&gi(&index)),
         &reg,
         None,
         Some(&prior),
@@ -1574,7 +1584,7 @@ fn resolve_r9_manifest_resolution_block_diverging_from_lock_bypasses() {
     // what minver would pick), simulating an earlier maxver run.
     let maxver_run = resolve(
         &m,
-        Some(&index),
+        Some(&gi(&index)),
         &reg,
         None,
         None,
@@ -1615,7 +1625,7 @@ fn resolve_r9_manifest_resolution_block_diverging_from_lock_bypasses() {
 
     let bare = resolve(
         &m_with_resolution,
-        Some(&index),
+        Some(&gi(&index)),
         &reg,
         None,
         Some(&prior),
@@ -1664,7 +1674,7 @@ fn resolve_r9_new_dep_picked_under_default_not_prior_explicit_strategy() {
     let m_two = manifest(vec![named_dep("libfoo", None), named_dep("libbar", None)]);
     let one_off = resolve(
         &m_two,
-        Some(&index),
+        Some(&gi(&index)),
         &reg,
         None,
         None,
@@ -1691,7 +1701,7 @@ fn resolve_r9_new_dep_picked_under_default_not_prior_explicit_strategy() {
     ]);
     let bare = resolve(
         &m_three,
-        Some(&index),
+        Some(&gi(&index)),
         &reg,
         None,
         Some(&prior),
@@ -1801,7 +1811,7 @@ fn resolve_named_dep_oci_provenance_produces_oci_record() {
     let m = manifest(vec![named_dep("widget", None)]);
     let graph = resolve(
         &m,
-        Some(&index),
+        Some(&gi(&index)),
         &reg,
         None,
         None,
@@ -1857,7 +1867,7 @@ fn resolve_named_dep_oci_provenance_round_trips_through_lockfile() {
     let m = manifest(vec![named_dep("widget", None)]);
     let graph = resolve(
         &m,
-        Some(&index),
+        Some(&gi(&index)),
         &reg,
         None,
         None,
@@ -1932,7 +1942,7 @@ fn s5b_phase_a_error_slug_divergence_spike() {
 
     let err = resolve(
         &m,
-        Some(&index),
+        Some(&gi(&index)),
         &reg,
         None,
         None,
@@ -3113,7 +3123,7 @@ fn resolve_cross_origin_dedup_registry_and_git_identical_content() {
     let tmp = tempfile::tempdir().unwrap();
     let graph = resolve(
         &m,
-        Some(&index),
+        Some(&gi(&index)),
         &reg,
         None,
         None,
@@ -3190,7 +3200,7 @@ fn resolve_cross_origin_no_dedup_for_different_content() {
     let tmp = tempfile::tempdir().unwrap();
     let graph = resolve(
         &m,
-        Some(&index),
+        Some(&gi(&index)),
         &reg,
         None,
         None,
@@ -4669,7 +4679,7 @@ fn b5_assert_round_trip_reproduces(specs: &[(&str, &[&str], Option<usize>)]) {
     let tmp1 = tempfile::tempdir().unwrap();
     let graph1 = resolve(
         &m,
-        Some(&index),
+        Some(&gi(&index)),
         &reg,
         None,
         None,
@@ -4688,7 +4698,7 @@ fn b5_assert_round_trip_reproduces(specs: &[(&str, &[&str], Option<usize>)]) {
     let tmp2 = tempfile::tempdir().unwrap();
     let graph2 = resolve(
         &m,
-        Some(&index),
+        Some(&gi(&index)),
         &reg,
         None,
         Some(&prior),
@@ -4880,7 +4890,7 @@ fn d3_resolve(
 ) -> Result<ResolvedGraph, MilpaError> {
     resolve_with_features(
         m,
-        Some(index),
+        Some(&gi(index)),
         reg,
         None,
         None,
@@ -5469,7 +5479,7 @@ fn resolve_a4_version_unknown_constrained_names_both_real_constrainers() {
     let tmp = tempfile::tempdir().unwrap();
     let err = resolve(
         &m,
-        Some(&index),
+        Some(&gi(&index)),
         &reg,
         None,
         None,
@@ -5615,7 +5625,7 @@ fn resolve_lattice_disagreeing_url_conflicts_url_branch_discovered_first() {
         url_dep("wrapb", wrapb_url, "main"),
     ]);
     let err = resolve(
-        &m, Some(&index), &reg, None, None, Strategy::Maxver, true,
+        &m, Some(&gi(&index)), &reg, None, None, Strategy::Maxver, true,
         &deps_dir(&tmp), None, false, &cas_store(&tmp),
     )
     .unwrap_err();
@@ -5685,7 +5695,7 @@ fn resolve_lattice_disagreeing_url_conflicts_named_branch_discovered_first() {
         url_dep("wrapa", wrapa_url, "main"),
     ]);
     let err = resolve(
-        &m, Some(&index), &reg, None, None, Strategy::Maxver, true,
+        &m, Some(&gi(&index)), &reg, None, None, Strategy::Maxver, true,
         &deps_dir(&tmp), None, false, &cas_store(&tmp),
     )
     .unwrap_err();
@@ -5748,7 +5758,7 @@ fn resolve_lattice_mid_solve_residual_closed_by_immediate_validation() {
         named_dep("outer-mid", None),
     ]);
     let err = resolve(
-        &m, Some(&index), &reg, None, None, Strategy::Maxver, true,
+        &m, Some(&gi(&index)), &reg, None, None, Strategy::Maxver, true,
         &deps_dir(&tmp), None, false, &cas_store(&tmp),
     )
     .unwrap_err();
@@ -5804,7 +5814,7 @@ fn resolve_lattice_two_disagreeing_urls_for_registry_name_both_conflict() {
         url_dep("r2", r2_url, "main"),
     ]);
     let err = resolve(
-        &m, Some(&index), &reg, None, None, Strategy::Maxver, true,
+        &m, Some(&gi(&index)), &reg, None, None, Strategy::Maxver, true,
         &deps_dir(&tmp), None, false, &cas_store(&tmp),
     )
     .unwrap_err();
@@ -5843,7 +5853,7 @@ fn resolve_lattice_root_beats_both_registry_and_url() {
         url_dep("t2", t2_url, "main"),
     ]);
     let graph = resolve(
-        &m, Some(&index), &reg, None, None, Strategy::Maxver, true,
+        &m, Some(&gi(&index)), &reg, None, None, Strategy::Maxver, true,
         &deps_dir(&tmp), None, false, &cas_store(&tmp),
     )
     .unwrap();
@@ -5884,7 +5894,7 @@ fn resolve_lattice_lone_url_pin_of_registry_name_agrees_is_accepted() {
     let tmp = tempfile::tempdir().unwrap();
     let m = manifest(vec![url_dep("t1agree", t1_url, "main")]);
     let graph = resolve(
-        &m, Some(&index), &reg, None, None, Strategy::Maxver, true,
+        &m, Some(&gi(&index)), &reg, None, None, Strategy::Maxver, true,
         &deps_dir(&tmp), None, false, &cas_store(&tmp),
     )
     .unwrap();
@@ -5938,7 +5948,7 @@ fn resolve_lattice_lone_url_pin_of_registry_name_disagrees_warns_and_resolves() 
     let tmp = tempfile::tempdir().unwrap();
     let m = manifest(vec![url_dep("t1lone", t1_url, "main")]);
     let graph = resolve(
-        &m, Some(&index), &reg, None, None, Strategy::Maxver, true,
+        &m, Some(&gi(&index)), &reg, None, None, Strategy::Maxver, true,
         &deps_dir(&tmp), None, false, &cas_store(&tmp),
     )
     .expect("default (warn) policy must accept the shadowing claim, not hard-fail");
@@ -5961,7 +5971,7 @@ fn resolve_lattice_lone_url_pin_of_registry_name_disagrees_hard_fails_under_stri
     let mut m = manifest(vec![url_dep("t1lone", t1_url, "main")]);
     m.attestation_policy = milpa_manifest::TrustPolicy::Strict;
     let err = resolve(
-        &m, Some(&index), &reg, None, None, Strategy::Maxver, true,
+        &m, Some(&gi(&index)), &reg, None, None, Strategy::Maxver, true,
         &deps_dir(&tmp), None, false, &cas_store(&tmp),
     )
     .unwrap_err();
@@ -6004,7 +6014,7 @@ fn resolve_lattice_two_transitive_pins_different_refs_conflict() {
     // DE2-ref: foo@v2.0.0 and foo@v3.0.0 are different source pins → the two
     // transitive claims disagree, and no root pins foo → hard conflict.
     let err = resolve(
-        &m, Some(&index), &reg, None, None, Strategy::Maxver, true,
+        &m, Some(&gi(&index)), &reg, None, None, Strategy::Maxver, true,
         &deps_dir(&tmp), None, false, &cas_store(&tmp),
     )
     .unwrap_err();
@@ -6032,7 +6042,7 @@ fn resolve_lattice_lone_url_pin_of_non_registry_name_stands() {
     let tmp = tempfile::tempdir().unwrap();
     let m = manifest(vec![url_dep("t1bar", t1_url, "main")]);
     let graph = resolve(
-        &m, Some(&index), &reg, None, None, Strategy::Maxver, true,
+        &m, Some(&gi(&index)), &reg, None, None, Strategy::Maxver, true,
         &deps_dir(&tmp), None, false, &cas_store(&tmp),
     )
     .unwrap();
@@ -6100,7 +6110,7 @@ fn resolve_lattice_oci_only_content_hash_matches_accepted() {
     let tmp = tempfile::tempdir().unwrap();
     let m = manifest(vec![url_dep("t1-ocimatch", t1_url, "main")]);
     let graph = resolve(
-        &m, Some(&index), &reg, None, None, Strategy::Maxver, true,
+        &m, Some(&gi(&index)), &reg, None, None, Strategy::Maxver, true,
         &deps_dir(&tmp), None, false, &cas_store(&tmp),
     )
     .unwrap();
@@ -6153,7 +6163,7 @@ fn resolve_lattice_oci_only_content_hash_mismatch_warns_and_resolves() {
     let tmp = tempfile::tempdir().unwrap();
     let m = manifest(vec![url_dep("t1-ocimismatch", t1_url, "main")]);
     let graph = resolve(
-        &m, Some(&index), &reg, None, None, Strategy::Maxver, true,
+        &m, Some(&gi(&index)), &reg, None, None, Strategy::Maxver, true,
         &deps_dir(&tmp), None, false, &cas_store(&tmp),
     )
     .expect("default (warn) policy must accept the shadowing claim, not hard-fail");
@@ -6175,7 +6185,7 @@ fn resolve_lattice_oci_only_content_hash_mismatch_hard_fails_under_strict() {
     let mut m = manifest(vec![url_dep("t1-ocimismatch", t1_url, "main")]);
     m.attestation_policy = milpa_manifest::TrustPolicy::Strict;
     let err = resolve(
-        &m, Some(&index), &reg, None, None, Strategy::Maxver, true,
+        &m, Some(&gi(&index)), &reg, None, None, Strategy::Maxver, true,
         &deps_dir(&tmp), None, false, &cas_store(&tmp),
     )
     .unwrap_err();
@@ -6213,7 +6223,7 @@ fn resolve_lattice_oci_only_empty_content_hash_warns_and_resolves() {
     let tmp = tempfile::tempdir().unwrap();
     let m = manifest(vec![url_dep("t1-ociempty", t1_url, "main")]);
     let graph = resolve(
-        &m, Some(&index), &reg, None, None, Strategy::Maxver, true,
+        &m, Some(&gi(&index)), &reg, None, None, Strategy::Maxver, true,
         &deps_dir(&tmp), None, false, &cas_store(&tmp),
     )
     .expect("default (warn) policy must accept the shadowing claim, not hard-fail");
@@ -6235,7 +6245,7 @@ fn resolve_lattice_oci_only_empty_content_hash_hard_fails_under_strict() {
     let mut m = manifest(vec![url_dep("t1-ociempty", t1_url, "main")]);
     m.attestation_policy = milpa_manifest::TrustPolicy::Strict;
     let err = resolve(
-        &m, Some(&index), &reg, None, None, Strategy::Maxver, true,
+        &m, Some(&gi(&index)), &reg, None, None, Strategy::Maxver, true,
         &deps_dir(&tmp), None, false, &cas_store(&tmp),
     )
     .unwrap_err();
@@ -6310,7 +6320,7 @@ fn resolve_oci_source_url_agrees_across_version_drift_accepted() {
     let tmp = tempfile::tempdir().unwrap();
     let m = manifest(vec![url_dep("t1-ocisrcdrift", t1_url, "main")]);
     let graph = resolve(
-        &m, Some(&index), &reg, None, None, Strategy::Maxver, true,
+        &m, Some(&gi(&index)), &reg, None, None, Strategy::Maxver, true,
         &deps_dir(&tmp), None, false, &cas_store(&tmp),
     )
     .unwrap();
@@ -6356,7 +6366,7 @@ fn resolve_oci_source_url_mismatch_warns_and_resolves() {
     let tmp = tempfile::tempdir().unwrap();
     let m = manifest(vec![url_dep("t1-ocisrcmismatch", t1_url, "main")]);
     let graph = resolve(
-        &m, Some(&index), &reg, None, None, Strategy::Maxver, true,
+        &m, Some(&gi(&index)), &reg, None, None, Strategy::Maxver, true,
         &deps_dir(&tmp), None, false, &cas_store(&tmp),
     )
     .expect("default (warn) policy must accept the shadowing claim, not hard-fail");
@@ -6378,7 +6388,7 @@ fn resolve_oci_source_url_mismatch_hard_fails_under_strict() {
     let mut m = manifest(vec![url_dep("t1-ocisrcmismatch", t1_url, "main")]);
     m.attestation_policy = milpa_manifest::TrustPolicy::Strict;
     let err = resolve(
-        &m, Some(&index), &reg, None, None, Strategy::Maxver, true,
+        &m, Some(&gi(&index)), &reg, None, None, Strategy::Maxver, true,
         &deps_dir(&tmp), None, false, &cas_store(&tmp),
     )
     .unwrap_err();
@@ -6785,7 +6795,7 @@ fn resolve_s5_rekey_bare_root_and_qualified_transitive_collapse_to_one_node() {
 
     let graph = resolve(
         &m,
-        Some(&index),
+        Some(&gi(&index)),
         &reg,
         None,
         None,
@@ -7529,7 +7539,7 @@ fn s8b_registry_target_rebinds_maxver_default() {
     );
     let tmp = tempfile::tempdir().unwrap();
     let graph = resolve(
-        &m, Some(&index), &reg, None, None, Strategy::Maxver, true, &deps_dir(&tmp), None, false,
+        &m, Some(&gi(&index)), &reg, None, None, Strategy::Maxver, true, &deps_dir(&tmp), None, false,
         &cas_store(&tmp),
     )
     .unwrap();
@@ -7564,7 +7574,7 @@ fn s8b_registry_target_version_scoped_pins_exact_version() {
     );
     let tmp = tempfile::tempdir().unwrap();
     let graph = resolve(
-        &m, Some(&index), &reg, None, None, Strategy::Maxver, true, &deps_dir(&tmp), None, false,
+        &m, Some(&gi(&index)), &reg, None, None, Strategy::Maxver, true, &deps_dir(&tmp), None, false,
         &cas_store(&tmp),
     )
     .unwrap();

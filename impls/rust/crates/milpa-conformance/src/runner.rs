@@ -511,7 +511,14 @@ impl Target for MilpaTarget {
                                 // Unarmed, the existing default).
                                 i.epoch_commitment_status =
                                     fixture_epoch_commitment_status(&fx.dir, &itext)?;
-                                Some(i)
+                                // C2 bypass (RFC trusted-index-invariant.md §2.1):
+                                // this runner constructs the index directly from
+                                // fixture bytes rather than through the real gate —
+                                // S1b/S2b reroute this onto the cache-free `acquire`
+                                // seam. `for_test` (the `test-support` feature, see
+                                // milpa-core's Cargo.toml) keeps this compiling with
+                                // bit-for-bit identical behavior in the interim.
+                                Some(milpa_core::GatedIndex::for_test(i))
                             }
                             Err(e) => return Err(e.code().to_string()),
                         }
@@ -903,7 +910,11 @@ impl Target for MilpaTarget {
                         let itext = std::fs::read_to_string(&p)
                             .map_err(|e| format!("E2E-INDEX-UNREADABLE: {e}"))?;
                         match milpa_core::Index::parse(&itext) {
-                            Ok(i) => Some(i),
+                            // C2 bypass (RFC trusted-index-invariant.md §2.1) — see
+                            // the `Cmd::Resolve` arm's identical comment above;
+                            // `_execute_verify`'s Rust analogue, named in the RFC
+                            // §4 CRITICAL note as the fourth bypass S-Verify reroutes.
+                            Ok(i) => Some(milpa_core::GatedIndex::for_test(i)),
                             Err(e) => return Err(e.code().to_string()),
                         }
                     } else {
@@ -1082,7 +1093,7 @@ impl Target for MilpaTarget {
                 for dep in &pinned {
                     let locked_pin = dep.dep_decl.as_deref().unwrap();
                     // Find the package by bare name, then find the exact version-node.
-                    let iv = match index.lookup_bare(&dep.name) {
+                    let iv = match index.index().lookup_bare(&dep.name) {
                         milpa_core::registry::BareLookup::NotFound
                         | milpa_core::registry::BareLookup::Ambiguous(_) => {
                             return Err("LOCK-DEPDECL-PIN-MISSING".to_string());

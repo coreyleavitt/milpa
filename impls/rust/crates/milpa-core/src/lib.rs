@@ -80,7 +80,7 @@ pub use gated_index::GatedIndex;
 pub use index_cache::{
     baseline_sidecar_paths, derive_bundle_url, fetch_verified_candidate_text, get_bundle_url,
     index_url_from_env, load_index, load_index_with_history, write_baseline_pair, BundleError,
-    BundleHttpGet, DEFAULT_INDEX_URL, DEFAULT_TTL_SECONDS,
+    BundleHttpGet, EpochCommitmentInputs, DEFAULT_INDEX_URL, DEFAULT_TTL_SECONDS,
 };
 pub use index_ratchet_seam::{
     build_index_state, evaluate_gate, iso_timestamp, parse_baseline, parse_baseline_meta,
@@ -160,8 +160,19 @@ pub fn implemented_error_codes() -> Vec<&'static str> {
 }
 
 // ---------------------------------------------------------------------------
-// The three resolver traits (RFC §4.6). All defined here; a partially-
-// implemented impl is a compile error, not a silent gap.
+// The resolver traits (RFC §4.6). All defined here; a partially-implemented
+// impl is a compile error, not a silent gap.
+//
+// `Resolver` / `ResolveParams` (the `cmd=resolve` trait surface) were DELETED
+// here (RFC trusted-index-invariant.md §2.1 fork resolution): confirmed
+// genuinely dead — `impl Resolver` existed nowhere but `Milpa`, and no
+// `.resolve(`/`.resolve_workspace(` trait-object call exists anywhere in the
+// workspace (only `Milpa::resolve_frozen`, via `FrozenResolver`, is actually
+// exercised — `runner.rs:832`, `main.rs:1641`). Leaving it `&Index` would
+// either break the whole-crate-compiles invariant once `resolver::resolve*`
+// flips to `&GatedIndex`, or survive as an unaudited raw-`Index` bypass that
+// falsifies "no public path skips the gate" (§2.1) — deleting the dead trait
+// closes the hole outright rather than migrating a surface nothing calls.
 // ---------------------------------------------------------------------------
 
 /// Parse a `milpa.lock` (the `cmd=parse-lockfile` path).
@@ -170,58 +181,13 @@ pub trait LockfileParser {
 }
 
 /// The reference implementation of the resolver traits. A zero-sized handle that
-/// the CLI (S13) and conformance harness drive. `LockfileParser` lands here at
-/// S5a; `Resolver` (S7) and `FrozenResolver` (S10) follow on the same type, so
-/// the three `cmd` paths share one entry point.
+/// the CLI (S13) and conformance harness drive.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Milpa;
 
 impl LockfileParser for Milpa {
     fn parse_lockfile(&self, text: &str) -> Result<Lockfile, MilpaError> {
         Ok(lockfile::parse_lockfile(text)?)
-    }
-}
-
-impl Resolver for Milpa {
-    fn resolve(
-        &self,
-        m: &Manifest,
-        idx: Option<&Index>,
-        f: &dyn FetcherRegistry,
-        p: Option<&Profile>,
-        prior: Option<&Lockfile>,
-        deps_dir: &Path,
-        store: &CaStore,
-    ) -> Result<ResolvedGraph, MilpaError> {
-        resolver::resolve_default_strategy(m, idx, f, p, prior, deps_dir, store)
-    }
-
-    fn resolve_workspace(
-        &self,
-        _w: &Workspace,
-        params: ResolveParams<'_>,
-        deps_dir: &Path,
-        store: &CaStore,
-    ) -> Result<ResolvedGraph, MilpaError> {
-        // The trait carries the *parsed* workspace, but the union resolve needs
-        // each member's loaded manifest + directory. In a real project layout the
-        // workspace root is the deps_dir's parent; load from there. (The
-        // conformance harness, whose scratch `_deps/` is detached from the fixture
-        // inputs, calls the free `load_workspace` + `resolve_workspace` directly.)
-        let root = deps_dir.parent().unwrap_or_else(|| Path::new("."));
-        let loaded = workspace::load_workspace(root)?;
-        resolver::resolve_workspace(
-            &loaded,
-            params.index,
-            params.fetcher,
-            params.profile,
-            params.prior,
-            milpa_solver::Strategy::default(),
-            false, // strategy_explicit: this scaffold trait has no CLI/manifest strategy input
-            deps_dir,
-            params.require_attested_metadata,
-            store,
-        )
     }
 }
 
@@ -249,61 +215,6 @@ impl FrozenResolver for Milpa {
         let loaded = workspace::load_workspace(root)?;
         frozen::resolve_workspace_frozen(&loaded, lock, store, deps_dir)
     }
-}
-
-/// Inputs that configure a workspace resolution run (mirrors Python `ResolveParams`).
-///
-/// Bundles the index, fetcher, profile, prior lockfile, and attestation policy
-/// flag so that [`Resolver::resolve_workspace`] stays under the 7-arg arity limit.
-/// The workspace itself and `deps_dir` are passed as separate positional arguments
-/// because they are "what to resolve" and "where", not resolution options.
-pub struct ResolveParams<'a> {
-    /// Tianguis index for named-dep resolution; `None` ⇒ empty index (valid only
-    /// when no un-overridden named deps exist in any member, else `RES-WS-NO-INDEX`).
-    pub index: Option<&'a Index>,
-    /// Fetcher registry that materializes each dep's bytes.
-    pub fetcher: &'a dyn FetcherRegistry,
-    /// Active profile for conditional dep filtering (§6); `None` disables filtering.
-    pub profile: Option<&'a milpa_manifest::Profile>,
-    /// Prior lockfile for pin reuse (resolver-semantics §8); `None` means no pins.
-    pub prior: Option<&'a Lockfile>,
-    /// Enforces strict attestation policy (S5, §13.1) when `true`. Effective policy
-    /// is the OR of this flag and any member's `attestation-policy "strict"`.
-    pub require_attested_metadata: bool,
-    // S9 (RFC #23 §3.4): CLI feature-selection. Mirrors Python ResolveParams.
-    /// Explicit feature names to activate on the root manifest (``--features``).
-    pub features: std::collections::BTreeSet<String>,
-    /// When true, suppresses all default-true root flags (``--no-default-features``).
-    pub no_default_features: bool,
-    /// When true, activates all declared root flags (``--all-features``).
-    pub all_features: bool,
-}
-
-/// Full resolution (the `cmd=resolve` path). `prior` carries the previous
-/// lockfile for pin reuse (resolver-semantics §8); fixtures that don't test
-/// pin reuse pass `None`.
-///
-/// `store` is the content-addressed store used to rebuild `_deps/` after
-/// resolution completes (B-nimcfg SSOT: alias symlinks + stale-entry removal).
-pub trait Resolver {
-    fn resolve(
-        &self,
-        m: &Manifest,
-        idx: Option<&Index>,
-        f: &dyn FetcherRegistry,
-        p: Option<&Profile>,
-        prior: Option<&Lockfile>,
-        deps_dir: &Path,
-        store: &CaStore,
-    ) -> Result<ResolvedGraph, MilpaError>;
-
-    fn resolve_workspace(
-        &self,
-        w: &Workspace,
-        params: ResolveParams<'_>,
-        deps_dir: &Path,
-        store: &CaStore,
-    ) -> Result<ResolvedGraph, MilpaError>;
 }
 
 /// Frozen resolution (the `cmd=frozen` path): bypasses the solver, so it needs

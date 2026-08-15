@@ -45,6 +45,7 @@ use crate::edge_sources::{
 use crate::error::{CoreError, MilpaError};
 use crate::fetch::{FetchError, FetcherRegistry, Receipt};
 use crate::frozen::rebuild_deps_view;
+use crate::gated_index::GatedIndex;
 use crate::identity::compute_content_hash;
 use crate::lockfile::{cond_require_sort_key, collapse_notes};
 use crate::registry::{filter_by_exclude_newer, Index, IndexVersion};
@@ -86,7 +87,7 @@ const ROOT: &str = "__root__";
 #[allow(clippy::too_many_arguments)]
 pub fn resolve(
     manifest: &Manifest,
-    index: Option<&Index>,
+    index: Option<&GatedIndex>,
     fetcher: &dyn FetcherRegistry,
     profile: Option<&Profile>,
     prior: Option<&Lockfile>,
@@ -117,7 +118,7 @@ pub fn resolve(
 #[allow(clippy::too_many_arguments)]
 pub fn resolve_with_features(
     manifest: &Manifest,
-    index: Option<&Index>,
+    index: Option<&GatedIndex>,
     fetcher: &dyn FetcherRegistry,
     profile: Option<&Profile>,
     prior: Option<&Lockfile>,
@@ -141,6 +142,13 @@ pub fn resolve_with_features(
     // (mirrors `strategy`) — unused for now, D3/D4 read it.
     exclude_newer: Option<Timestamp>,
 ) -> Result<ResolvedGraph, MilpaError> {
+    // Unwrap ONCE at this entry point (RFC trusted-index-invariant.md §2.5):
+    // possessing a `GatedIndex` proves the index-level gates ran; everything
+    // downstream (build_single_provider, ResolveProvider, the binding
+    // resolvers) is internal machinery that stays on the plain `&Index` leaf
+    // type unchanged.
+    let index: Option<&Index> = index.map(GatedIndex::index);
+
     // S9 (RFC #23 §3.4): compute root CLI active-flag seed when any CLI
     // feature-selection is present. Mirrors Python's _compute_root_active_seed.
     let has_cli_features = !features.is_empty() || no_default_features || all_features;
@@ -260,16 +268,19 @@ pub fn resolve_with_features(
         None => manifest,
     };
 
-    // Anchor lifetime for the Index::default() fallback (build_single_provider
-    // borrows it; the provider must not outlive this frame).
-    let empty_index = Index::default();
+    // Anchor lifetime for the empty-index fallback (build_single_provider
+    // borrows it; the provider must not outlive this frame). §2.6: an empty
+    // `GatedIndex` asserts no trust claim, sound under every policy — the
+    // single canonical "no index" value (no bare `Index::default()` outside
+    // the gate module).
+    let empty_index = GatedIndex::empty();
     let (mut provider, _strict) = build_single_provider(
         manifest,
         index,
         fetcher,
         deps_dir,
         ProviderOpts { prior, dep_decl_store, require_attested_metadata, strategy, strategy_explicit, exclude_newer },
-        &empty_index,
+        empty_index.index(),
     )?;
 
     // M7: warn early about member= overrides in a single-package manifest.
@@ -410,33 +421,6 @@ pub fn resolve_with_features(
     // internally, symmetric with the frozen path and Python's resolver.resolve().
     rebuild_deps_view(&graph, deps_dir, store);
     Ok(graph)
-}
-
-/// The reference [`Resolver`](crate::Resolver) entry point delegates here with
-/// the default strategy (resolver-semantics §4.3 — `maxver`). The strategy
-/// override surface (CLI flag / env) lands with the CLI (S13).
-pub(crate) fn resolve_default_strategy(
-    manifest: &Manifest,
-    index: Option<&Index>,
-    fetcher: &dyn FetcherRegistry,
-    profile: Option<&Profile>,
-    prior: Option<&Lockfile>,
-    deps_dir: &Path,
-    store: &CaStore,
-) -> Result<ResolvedGraph, MilpaError> {
-    resolve(
-        manifest,
-        index,
-        fetcher,
-        profile,
-        prior,
-        Strategy::default(),
-        false, // strategy_explicit: this scaffold trait has no CLI/manifest strategy input
-        deps_dir,
-        None, // dep_decl_store: None (trait path, no dep-decl support)
-        false, // require_attested_metadata: false (trait path, no S5 flag)
-        store,
-    )
 }
 
 /// S9 (RFC #23 §3.4): FROZEN-ACTIVE-FLAGS-MISMATCH check.
@@ -661,7 +645,7 @@ pub fn check_workspace_frozen_active_flags_mismatch(
 #[allow(clippy::too_many_arguments)]
 pub fn resolve_workspace_with_features(
     workspace: &LoadedWorkspace,
-    index: Option<&Index>,
+    index: Option<&GatedIndex>,
     fetcher: &dyn FetcherRegistry,
     profile: Option<&Profile>,
     prior: Option<&Lockfile>,
@@ -682,6 +666,9 @@ pub fn resolve_workspace_with_features(
     // doc comment.
     exclude_newer: Option<Timestamp>,
 ) -> Result<ResolvedGraph, MilpaError> {
+    // Unwrap ONCE at this entry point (RFC trusted-index-invariant.md §2.5).
+    let index: Option<&Index> = index.map(GatedIndex::index);
+
     // Compute workspace-root cli_seed (mirrors resolve_with_features logic).
     use std::collections::HashSet;
     let has_ws_cli_features = !features.is_empty() || no_default_features || all_features;
@@ -733,7 +720,7 @@ pub fn resolve_workspace_with_features(
 #[allow(clippy::too_many_arguments)]
 pub fn resolve_workspace(
     workspace: &LoadedWorkspace,
-    index: Option<&Index>,
+    index: Option<&GatedIndex>,
     fetcher: &dyn FetcherRegistry,
     profile: Option<&Profile>,
     prior: Option<&Lockfile>,
@@ -744,6 +731,8 @@ pub fn resolve_workspace(
     require_attested_metadata: bool,
     store: &CaStore,
 ) -> Result<ResolvedGraph, MilpaError> {
+    // Unwrap ONCE at this entry point (RFC trusted-index-invariant.md §2.5).
+    let index: Option<&Index> = index.map(GatedIndex::index);
     resolve_workspace_inner(
         workspace, index, fetcher, profile, prior, strategy, strategy_explicit, deps_dir,
         require_attested_metadata, store,
@@ -769,7 +758,7 @@ pub fn resolve_workspace(
 #[allow(clippy::too_many_arguments)]
 pub fn resolve_workspace_with_cert(
     workspace: &LoadedWorkspace,
-    index: Option<&Index>,
+    index: Option<&GatedIndex>,
     fetcher: &dyn FetcherRegistry,
     profile: Option<&Profile>,
     prior: Option<&Lockfile>,
@@ -790,6 +779,9 @@ pub fn resolve_workspace_with_cert(
     // doc comment.
     exclude_newer: Option<Timestamp>,
 ) -> Result<(ResolvedGraph, SuccessCert), (MilpaError, FailureCert)> {
+    // Unwrap ONCE at this entry point (RFC trusted-index-invariant.md §2.5).
+    let index: Option<&Index> = index.map(GatedIndex::index);
+
     // Macro: wrap a plain MilpaError in the cert-failure pair with an empty
     // FailureCert (the cert only carries meaning for SOLVE-CONFLICT).
     macro_rules! lift_err {
@@ -878,7 +870,7 @@ pub fn resolve_workspace_with_cert(
         }
     }
 
-    let empty_index = Index::default();
+    let empty_index = GatedIndex::empty();
     let index_ref: &Index = match index {
         Some(i) => i,
         None => {
@@ -902,7 +894,7 @@ pub fn resolve_workspace_with_cert(
                     ),
                 ));
             }
-            &empty_index
+            empty_index.index()
         }
     };
 
@@ -1075,7 +1067,7 @@ fn resolve_workspace_inner(
 
     // RES-WS-NO-INDEX: a member's named dep with neither an index, an override,
     // nor a matching member is unresolvable.
-    let empty_index = Index::default();
+    let empty_index = GatedIndex::empty();
     let index: &Index = match index {
         Some(i) => i,
         None => {
@@ -1099,7 +1091,7 @@ fn resolve_workspace_inner(
                     ),
                 ));
             }
-            &empty_index
+            empty_index.index()
         }
     };
 
@@ -6379,7 +6371,7 @@ pub struct FailureCert {
 #[allow(clippy::too_many_arguments)]
 pub fn resolve_with_cert(
     manifest: &milpa_manifest::Manifest,
-    index: Option<&Index>,
+    index: Option<&GatedIndex>,
     fetcher: &dyn FetcherRegistry,
     profile: Option<&milpa_manifest::Profile>,
     prior: Option<&Lockfile>,
@@ -6398,6 +6390,9 @@ pub fn resolve_with_cert(
     // doc comment.
     exclude_newer: Option<Timestamp>,
 ) -> Result<(ResolvedGraph, SuccessCert), (MilpaError, FailureCert)> {
+    // Unwrap ONCE at this entry point (RFC trusted-index-invariant.md §2.5).
+    let index: Option<&Index> = index.map(GatedIndex::index);
+
     // Delegates to `solve_with_refutation` instead of `solve`; all setup is
     // identical to `resolve` — factored through `build_single_provider` (D-F2).
     //
@@ -6409,14 +6404,14 @@ pub fn resolve_with_cert(
     let filtered_cert = filter_manifest(manifest, &cert_filter_ctx);
     let manifest = &filtered_cert;
 
-    let empty_index = Index::default();
+    let empty_index = GatedIndex::empty();
     let (mut provider, _strict) = match build_single_provider(
         manifest,
         index,
         fetcher,
         deps_dir,
         ProviderOpts { prior, dep_decl_store, require_attested_metadata, strategy, strategy_explicit, exclude_newer },
-        &empty_index,
+        empty_index.index(),
     ) {
         Ok(r) => r,
         Err(e) => return Err((e, FailureCert { message: String::new(), refutation: Vec::new() })),

@@ -831,7 +831,7 @@ pub fn enforce_index_trust(
 /// Observable claims extracted from a Sigstore bundle — pure JSON, no crypto.
 ///
 /// Rust parity with Python `IndexBundleInfo` in `impls/python/milpa/index_trust.py`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct IndexBundleInfo {
     /// Rekor SET `integratedTime` (unix epoch seconds).
     ///

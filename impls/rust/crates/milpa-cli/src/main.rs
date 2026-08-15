@@ -19,6 +19,7 @@ use milpa_core::{
     check_source_id_preconditions_standalone, check_source_id_preconditions_workspace,
     check_workspace_frozen_active_flags_mismatch,
     dep_decl_store::DepDeclStore, discover_manifest, effective_trust_policy,
+    EpochCommitmentInputs,
     fetch::{FetchError, FetcherRegistry}, fetch_verified_candidate_text, format_nimcfg,
     format_workspace_nimcfgs, from_graph, index_url_from_env, iso_timestamp,
     load_index_with_history, load_lockfile, load_manifest, load_workspace,
@@ -32,7 +33,7 @@ use milpa_core::{
     verify_lockfile_against_deps, workspace_any_member_strict, write_baseline_pair, write_lockfile,
     Baseline, BaselineMeta, CaStore,
     CasAdmittingFetcher, CoreError, DefaultRegistry, FailureCert, FileDepDeclStore,
-    FrozenResolver, Index, ManifestDoc, Milpa, MilpaError, MockedFetcher, Profile,
+    FrozenResolver, GatedIndex, ManifestDoc, Milpa, MilpaError, MockedFetcher, Profile,
     ProvenanceRecord, RatchetOutcome, Strategy, SuccessCert, Version, DEFAULT_INDEX_URL, DEFAULT_TTL_SECONDS,
 };
 use milpa_manifest::{valid_flag_name, Dep, FlagRequest, Manifest, OverrideTarget, UrlDep, Workspace};
@@ -1124,7 +1125,7 @@ fn cmd_verify(
             // Online: check each pin against the live index.
             for dep in &pinned {
                 let locked_pin = dep.dep_decl.as_deref().unwrap();
-                let iv = match index.lookup_bare(&dep.name) {
+                let iv = match index.index().lookup_bare(&dep.name) {
                     milpa_core::registry::BareLookup::NotFound
                     | milpa_core::registry::BareLookup::Ambiguous(_) => None,
                     milpa_core::registry::BareLookup::Found(pkg) => {
@@ -1745,7 +1746,7 @@ fn cmd_fetch_with_cert(
     dir: &Path,
     manifest: &Manifest,
     deps_dir: &Path,
-    index: Option<&Index>,
+    index: Option<&GatedIndex>,
     registry: &dyn FetcherRegistry,
     profile: Option<&Profile>,
     prior: Option<&milpa_core::Lockfile>,
@@ -1814,7 +1815,7 @@ fn cmd_fetch_workspace_with_cert(
     dir: &Path,
     ws: &LoadedWorkspace,
     deps_dir: &Path,
-    index: Option<&Index>,
+    index: Option<&GatedIndex>,
     registry: &dyn FetcherRegistry,
     profile: Option<&Profile>,
     prior: Option<&milpa_core::Lockfile>,
@@ -3432,7 +3433,7 @@ fn maybe_index(
     index_history_policy: &milpa_manifest::TrustPolicy,
     entry_trust_policy: &milpa_manifest::TrustPolicy,
     require_attested_entries: bool,
-) -> Result<Option<Index>, MilpaError> {
+) -> Result<Option<GatedIndex>, MilpaError> {
     // --no-index flag OR present-but-empty MILPA_INDEX_URL → explicitly no
     // index (the flag overrides any configured index). Absent → default URL.
     if no_index_requested(no_index) {
@@ -3457,24 +3458,17 @@ fn maybe_index(
     // seam-vs-S4b dispatch, config+verifier construction.
     use milpa_core::BundleHttpGet;
     let gate = build_index_trust_gate(manifest_policy, manifest_signer, manifest_bundle, require_attested_index, &url)?;
-    let mut index_opt = match &gate {
-        None => load_index_raw(&url, &http, now, None, None, None, refresh_index, index_history_policy)?,
-        Some(active) => load_index_raw(
-            &url,
-            &http,
-            now,
-            Some(&active.cfg),
-            Some(active.verifier.as_ref()),
-            Some(active.bundle_fn.as_ref() as BundleHttpGet<'_>),
-            refresh_index,
-            index_history_policy,
-        )?,
-    };
 
     // S-EpochCommitment (rfc-attestation-v1-normative.md §6, D14-D18;
-    // registry-protocol §3.4.8/§3.4.9): the index-gate epoch-commitment
-    // phase, once per resolve, after index-trust's own verification
-    // succeeds and BEFORE any candidate is selected. Mirrors
+    // registry-protocol §3.4.8/§3.4.9): the index-gate epoch-commitment phase
+    // is now FOLDED INTO THE MINT (RFC trusted-index-invariant.md §2.2) —
+    // milpa-core's `load_index_with_history` runs it internally, once per
+    // resolve, after index-trust's own verification succeeds and BEFORE any
+    // candidate is selected, rather than as a separate post-load step here.
+    // Assemble the CLI-only inputs (verifier/signer/HTTP transport — env
+    // reads, the mock-seam file:// guard, the native HTTP transport) and pass
+    // them down; milpa-core owns the cache-dir reads/writes and the
+    // enforce/ratchet-requirement checks. Mirrors
     // `cli.py::_apply_epoch_commitment_phase`'s wiring inside
     // `_load_index_for_verb`.
     //
@@ -3486,76 +3480,56 @@ fn maybe_index(
     // here. An index that HAS armed a commitment while a consumer runs
     // with index-trust off is therefore silently treated as `Unarmed` by
     // this consumer — a documented residual, not a silent security
-    // downgrade of a check the consumer opted into.
-    if let (Some(active), Some(index)) = (gate.as_ref(), index_opt.as_mut()) {
-        apply_epoch_commitment_phase(index, &active.cfg.trust_bundle, &url, entry_trust_policy, index_history_policy)?;
-    }
+    // downgrade of a check the consumer opted into. Preserved verbatim by
+    // `epoch_owned`/`epoch` being `None` whenever `gate` is `None`.
+    let epoch_cache_dir = epoch_commitment_cache_dir();
+    let epoch_owned = match &gate {
+        None => None,
+        Some(_active) => {
+            let (verifier, expected_signer) = build_epoch_commitment_verifier(&url)?;
+            let http_get = build_commitment_http_fn();
+            Some((verifier, expected_signer, http_get))
+        }
+    };
+    let epoch: Option<EpochCommitmentInputs<'_>> = match (&gate, &epoch_owned) {
+        (Some(active), Some((verifier, expected_signer, http_get))) => Some(EpochCommitmentInputs {
+            verifier: verifier.as_ref(),
+            expected_signer: expected_signer.as_str(),
+            trust_bundle: &active.cfg.trust_bundle,
+            http_get: http_get.as_ref(),
+            status_cache_dir: epoch_cache_dir.as_path(),
+            entry_trust_policy,
+        }),
+        _ => None,
+    };
+
+    let index_opt = match &gate {
+        None => load_index_raw(&url, &http, now, None, None, None, refresh_index, index_history_policy, epoch)?,
+        Some(active) => load_index_raw(
+            &url,
+            &http,
+            now,
+            Some(&active.cfg),
+            Some(active.verifier.as_ref()),
+            Some(active.bundle_fn.as_ref() as BundleHttpGet<'_>),
+            refresh_index,
+            index_history_policy,
+            epoch,
+        )?,
+    };
 
     Ok(index_opt)
 }
 
-/// Compute + enforce the S-EpochCommitment index-gate phase for one
-/// already-loaded `Index` (mutated in place — `Index` is not frozen).
-/// Mirrors `cli.py::_apply_epoch_commitment_phase`.
-///
-/// Reuses index-trust's already-resolved trust ROOT (`trust_bundle`) — the
-/// epoch commitment is authenticated against a DEDICATED re-arm signer
-/// identity (D15), never the whole-index signer, but the Fulcio/Rekor trust
-/// root is the same one index-trust resolved for this invocation (spec
-/// §3.4.8: "resolved the same way").
-///
-/// # Errors
-/// - `TNG-INDEX-EPOCH-COMMITMENT-INVALID` — unconditional abort on
-///   `ArmingInvalid` (D14).
-/// - `TNG-INDEX-EPOCH-RATCHET-REQUIRED` — the D18 co-requirement (`Armed` +
-///   `entry-trust "strict"` requires `index-history "strict"`).
-fn apply_epoch_commitment_phase(
-    index: &mut Index,
-    trust_bundle: &milpa_core::index_trust::TrustBundle,
-    index_url: &str,
-    entry_trust_policy: &milpa_manifest::TrustPolicy,
-    index_history_policy: &milpa_manifest::TrustPolicy,
-) -> Result<(), MilpaError> {
-    use milpa_core::epoch_commitment::{check_epoch_ratchet_requirement, enforce_epoch_commitment};
-    use milpa_core::index_cache::{load_epoch_commitment_status, read_cached_epoch_commitment_pointer};
-
-    let pointer = read_cached_epoch_commitment_pointer(index_url, &index_cache_dir());
-
-    // Verifier + re-arm signer: the SAME construction `milpa verify`'s
-    // offline re-derivation uses (`build_epoch_commitment_verifier` —
-    // extracted in RFC attestation-v1-normative.md §6 S5 to avoid a second
-    // hand-rolled copy of the mock/production dispatch).
-    let (verifier, expected_signer) = build_epoch_commitment_verifier(index_url)?;
-
-    let http_get = build_commitment_http_fn();
-    let status = load_epoch_commitment_status(
-        index_url,
-        pointer.as_deref(),
-        &epoch_commitment_cache_dir(),
-        http_get.as_ref(),
-        verifier.as_ref(),
-        trust_bundle,
-        &expected_signer,
-    );
-    index.epoch_commitment_status = status.clone();
-
-    enforce_epoch_commitment(&status)?;
-    check_epoch_ratchet_requirement(&status, entry_trust_policy, index_history_policy)?;
-
-    // Dsgn-H2 (RFC attestation-v1-normative.md §6 S5): informational, never
-    // gates the resolve — see maybe_emit_no_epoch_armed_notice's doc comment.
-    milpa_core::entry_trust::maybe_emit_no_epoch_armed_notice(entry_trust_policy, &status);
-
-    Ok(())
-}
-
 /// `(verifier, expected_signer)` for the epoch-commitment phase — the SAME
-/// construction [`apply_epoch_commitment_phase`] uses (extracted so `milpa
-/// verify`'s offline re-derivation, RFC attestation-v1-normative.md §6 S5,
-/// builds the identical mock/production verifier and re-arm signer rather
-/// than a second hand-rolled copy). `index_url` MUST be the already
-/// three-way-resolved URL ([`milpa_core::index_cache::index_url_from_env`]),
-/// matching the guard `apply_epoch_commitment_phase` enforces.
+/// construction [`maybe_index`] uses to assemble
+/// [`milpa_core::EpochCommitmentInputs`] (RFC trusted-index-invariant.md
+/// §2.2 — the phase now runs INSIDE milpa-core's mint, not a separate
+/// post-load step here), extracted so `milpa verify`'s offline
+/// re-derivation, RFC attestation-v1-normative.md §6 S5, builds the
+/// identical mock/production verifier and re-arm signer rather than a
+/// second hand-rolled copy). `index_url` MUST be the already
+/// three-way-resolved URL ([`milpa_core::index_cache::index_url_from_env`]).
 fn build_epoch_commitment_verifier(
     index_url: &str,
 ) -> Result<(Box<dyn milpa_core::index_trust::IndexBundleVerifier>, String), MilpaError> {
@@ -4063,7 +4037,8 @@ fn reverify_cached_entry_attestations(
 
     // Dsgn-H2 (RFC attestation-v1-normative.md §6 S5): informational, never
     // gates verify — see maybe_emit_no_epoch_armed_notice's doc comment.
-    // Same dedup-gated function the fetch/lock path (apply_epoch_commitment_phase)
+    // Same dedup-gated function the fetch/lock path's mint-folded epoch phase
+    // (milpa-core's `apply_epoch_fold`, RFC trusted-index-invariant.md §2.2)
     // calls — at most one notice per process regardless of which path ran.
     milpa_core::entry_trust::maybe_emit_no_epoch_armed_notice(entry_trust_policy, epoch_status);
 
@@ -4147,7 +4122,8 @@ fn load_index_raw<'a>(
     bundle_http: Option<milpa_core::BundleHttpGet<'a>>,
     refresh_index: bool,
     index_history_policy: &milpa_manifest::TrustPolicy,
-) -> Result<Option<Index>, MilpaError> {
+    epoch: Option<EpochCommitmentInputs<'a>>,
+) -> Result<Option<GatedIndex>, MilpaError> {
     match load_index_with_history(
         url,
         &index_cache_dir(),
@@ -4159,6 +4135,7 @@ fn load_index_raw<'a>(
         bundle_http,
         refresh_index,
         index_history_policy,
+        epoch,
     ) {
         Ok(index) => Ok(Some(index)),
         // Non-catalog sentinels: index is unreachable or cache I/O failed.
@@ -4342,7 +4319,7 @@ fn maybe_index_for_workspace(
     refresh_index: bool,
     entry_trust_policy: &milpa_manifest::TrustPolicy,
     require_attested_entries: bool,
-) -> Result<Option<Index>, MilpaError> {
+) -> Result<Option<GatedIndex>, MilpaError> {
     let (policy, signer, bundle) = workspace_index_trust_fields(ws);
     let history_policy = effective_index_history_policy(&ws.index_history_policy);
     maybe_index(
@@ -4368,7 +4345,7 @@ fn maybe_index_for_manifest(
     refresh_index: bool,
     entry_trust_policy: &milpa_manifest::TrustPolicy,
     require_attested_entries: bool,
-) -> Result<Option<Index>, MilpaError> {
+) -> Result<Option<GatedIndex>, MilpaError> {
     let history_policy = effective_index_history_policy(&m.index_history_policy);
     maybe_index(
         no_index,

@@ -19,7 +19,6 @@ use milpa_types::{
 };
 
 use crate::error::{CoreError, MilpaError};
-use crate::registry::Index;
 use crate::source_id::format_source_id;
 use crate::store::CaStore;
 use crate::workspace::LoadedWorkspace;
@@ -547,7 +546,7 @@ fn source_id_matches_declared(declared: &SourceId, locked: &SourceId) -> bool {
 /// Reuses `binding::reconcile_root_claims` — the SAME override-application
 /// helper `BindingResolver::new` uses — so an `overrides {}`-redirected dep
 /// is compared against its override TARGET, never its raw declaration. No
-/// live tianguis index is needed (or used) here: an empty `Index::default()`
+/// live tianguis index is needed (or used) here: an empty `GatedIndex::empty()`
 /// makes a bare name's `resolved_registry_namespace` lookup return `None`,
 /// and `source_id_matches_declared` skips that ONE component for an
 /// unqualified declaration rather than requiring a real index (the frozen
@@ -557,8 +556,9 @@ fn check_source_id_preconditions(
     overrides: &[Override],
     lockfile_deps: &[LockedDep],
 ) -> Result<(), MilpaError> {
-    let index = Index::default();
-    let declared_claims = crate::binding::reconcile_root_claims(declared_deps, overrides, &index)?;
+    let index = crate::gated_index::GatedIndex::empty();
+    let declared_claims =
+        crate::binding::reconcile_root_claims(declared_deps, overrides, index.index())?;
     let mut declared_by_key: std::collections::BTreeMap<DepKey, SourceId> =
         std::collections::BTreeMap::new();
     for c in &declared_claims {
