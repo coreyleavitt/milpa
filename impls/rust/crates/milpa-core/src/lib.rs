@@ -33,6 +33,7 @@ pub mod error;
 pub mod fetch;
 pub mod fetchers;
 pub mod frozen;
+pub mod gated_index;
 pub mod identity;
 pub mod import_slot;
 pub mod index_cache;
@@ -75,6 +76,7 @@ pub use entry_trust::{
     SigstoreEntryVerifier, VerifierOutcome,
 };
 pub use error::{CoreError, MilpaError};
+pub use gated_index::GatedIndex;
 pub use index_cache::{
     baseline_sidecar_paths, derive_bundle_url, fetch_verified_candidate_text, get_bundle_url,
     index_url_from_env, load_index, load_index_with_history, write_baseline_pair, BundleError,

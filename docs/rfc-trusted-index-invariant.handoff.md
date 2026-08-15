@@ -1,7 +1,7 @@
 # RFC: GatedIndex construction invariant — handoff
 
 - **Stage:** 3 (tdd)   •   **Round:** architect rounds 1 & 2 APPLIED; no open forks
-- **Progress:** S0 DONE (1/9). Next: S1a-i (Rust type, additive).
+- **Progress:** S0, S1a-i DONE (2/9). Next: S1a-ii (Rust atomic flip + retrofit).
 - **Resume:** `/loop implement the next unimplemented RFC slice of docs/rfc-trusted-index-invariant.md with /tdd, following the standing rules; after each slice report one progress line; stop when every slice is implemented`
 - **RFC:** `docs/rfc-trusted-index-invariant.md`  •  **Issue:** #199
 
@@ -47,7 +47,7 @@ unrepresentable.
 
 ## Slices (Stage 3) — round-2 re-cut
 - [x] S0 migrate 74 no-policy fixtures → `index-trust "warn"` (data-only; harmless, NOT gate coverage — S3 is). DONE: all 74 confirmed `MAN-*`/`WS-*` validation fixtures (73 MAN- + 1 WS-MEMBER-IS-WORKSPACE), 0 success-shaped — matches C3, contradicts the stale §3 body prose, which was corrected in the RFC-landing commit (§3 now states the 74 are validation fixtures that never reach the gate; migration is hygiene + defense-in-depth, not coverage). Green both impls (Python `EXIT=0`; Rust `milpa-conformance` all `test result: ok`).
-- [ ] S1a-i Rust type additive: GatedIndex (verification: Option<VerificationResult>) + `.index()` accessor + empty() + module-private `mint` + `#[cfg(test)] for_test`; NO return-type change (green)
+- [x] S1a-i Rust type additive: GatedIndex (verification: Option<VerificationResult>) + `.index()` accessor + empty() + module-private `mint` + `#[cfg(test)] for_test`; NO return-type change (green). DONE: `milpa-core/src/gated_index.rs` (new module, re-exported at crate root); `mint` `pub(crate)` + `#[allow(dead_code)]` (unconsumed until S1a-ii); accessors `index()`/`verification()`/`bundle_info()`/`is_cryptographically_trusted()` (Some(Trusted) only). 5 unit tests. Green: `-p milpa-core` 1262/0, `--workspace` 1812/0. (sigstore vendored crate emits 9 pre-existing dead-code warnings — not ours.)
 - [ ] S1a-ii Rust flip+retrofit ONE atomic green commit: load_*/maybe_index → GatedIndex; mint at ~4 sites; fold epoch (entry_trust_policy param + preserve trust_active conditionality); ~17 Deref-blind resolver.rs sites; **lib.rs Resolver/ResolveParams**; **manifest_writer.rs:289**; ~60 prod + ~96 test sites
 - [ ] S1b Rust cache-free acquire; reroute runner bypass — runner.rs:507 IS inverted (flip manifest-first), runner.rs:905 already manifest-first (reroute only); RED strict+no-bundle
 - [ ] S2a Python frozen-dataclass MilpaEnv + wrapper + `.index` property + `_mint` + contained for_test (outside milpa/, file://-guard, CI grep lint) + empty()/frozen.py:241 + fold epoch; assert at BOTH resolve() AND resolve_workspace(); retype edge_sources.py:745; named negative test/entry point
