@@ -326,6 +326,78 @@ fn verify_and_enforce(
     Ok(result)
 }
 
+/// Cache-free convenience mint (RFC trusted-index-invariant.md §2.1 "the
+/// `GatedIndex::acquire` paragraph", §2.2). For callers that hold index bytes
+/// directly rather than going through the on-disk 4-state cache — the
+/// conformance runner (S1b/S2b reroute their in-process bypass sites onto
+/// this), and a future `milpa verify --index-only`. Reuses [`verify_and_enforce`]
+/// — the SAME trust-dispatch helper every cache-integrated mint site calls —
+/// rather than reimplementing policy dispatch; this is a thin wrap, not a
+/// second gate.
+///
+/// Gate ordering mirrors [`try_serve_from_cache`] exactly: verify the raw
+/// bytes FIRST (eager / before-parse, spec §3.4.1), parse only after the gate
+/// passes (or warns-and-continues).
+///
+/// - `config`/`verifier` both `None` ⇒ effective policy `off`: the verifier is
+///   never invoked, [`GatedIndex::verification`] is `None` (RFC §2.3's `off`
+///   case). Callers construct `Some` for both whenever the effective policy is
+///   `Warn`/`Strict` (mirrors [`load_index_with_history`]'s `trust_active`).
+/// - `bundle_bytes: None` under an active policy ⇒ `VerificationResult::BundleMissing`
+///   — raises `TNG-INDEX-BUNDLE-MISSING` under `Strict`, warns-and-continues
+///   under `Warn` (via [`enforce_index_trust`]).
+/// - `bundle_bytes: Some(bytes)` ⇒ real verify+enforce via [`verify_and_enforce`],
+///   with `bundle_info` populated from the same bytes (mirrors
+///   [`try_serve_from_cache`]'s zero-extra-I/O population).
+///
+/// `epoch_status` is the ALREADY-RESOLVED [`EpochCommitmentStatus`] (RFC §2.2:
+/// the cache-integrated mint computes this itself via `apply_epoch_fold`'s own
+/// sidecar I/O; a cache-free caller has no on-disk cache to read that sidecar
+/// from, so it injects the value it already computed — e.g. the conformance
+/// runner's `fixture_epoch_commitment_status`). `acquire` does not run the
+/// epoch-commitment phase itself; it only stamps the injected value onto the
+/// parsed `Index` before minting.
+impl GatedIndex {
+    pub fn acquire(
+        index_text: &str,
+        bundle_bytes: Option<&[u8]>,
+        config: Option<&IndexTrustConfig>,
+        verifier: Option<&dyn IndexBundleVerifier>,
+        url: &str,
+        epoch_status: EpochCommitmentStatus,
+    ) -> Result<GatedIndex, MilpaError> {
+        let mut verification: Option<VerificationResult> = None;
+        let mut bundle_info: Option<IndexBundleInfo> = None;
+
+        if let (Some(config), Some(verifier)) = (config, verifier) {
+            match bundle_bytes {
+                Some(bytes) => {
+                    let result = verify_and_enforce(
+                        index_text.as_bytes(),
+                        bytes,
+                        config,
+                        verifier,
+                        &config.policy,
+                        url,
+                        false,
+                    )?;
+                    bundle_info = describe_index_bundle(bytes);
+                    verification = Some(result);
+                }
+                None => {
+                    enforce_index_trust(VerificationResult::BundleMissing, &config.policy, url)?;
+                    verification = Some(VerificationResult::BundleMissing);
+                }
+            }
+        }
+
+        let mut index = Index::parse(index_text).map_err(MilpaError::from)?;
+        index.epoch_commitment_status = epoch_status;
+
+        Ok(GatedIndex::mint(index, verification, bundle_info))
+    }
+}
+
 /// Re-verify the ALREADY-CACHED index attestation bundle, fully offline (Sv,
 /// `rfc-attestation-verifier`).
 ///

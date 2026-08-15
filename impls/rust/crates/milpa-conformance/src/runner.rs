@@ -493,10 +493,49 @@ impl Target for MilpaTarget {
                 let project_root = fixture_project_root(fx);
                 let text = std::fs::read_to_string(project_root.join("milpa.kdl"))
                     .map_err(|e| format!("E2E-MANIFEST-UNREADABLE: {e}"))?;
+
+                // S1b (RFC trusted-index-invariant.md §2.1): manifest-first. The
+                // production CLI validates the manifest/workspace topology BEFORE
+                // ever touching the index (discover_manifest → load_workspace →
+                // THEN the index-trust gate; milpa-cli/main.rs `cmd_fetch`) — a
+                // manifest or workspace-topology error must surface before an
+                // index-trust error. This runner was parse-order-inverted (the
+                // index was gated before the manifest was even parsed) until this
+                // reroute.
+                let doc = match milpa_core::parse_document(&text) {
+                    Ok(d) => d,
+                    Err(e) => return Err(e.code().to_string()),
+                };
+                // For a workspace doc, load the full topology now (WS-* errors,
+                // e.g. WS-MEMBER-IS-WORKSPACE) so it runs before the index gate
+                // below, matching production. Reused by the workspace arm further
+                // down instead of a second `load_workspace` call.
+                let loaded_ws = match &doc {
+                    ManifestDoc::Workspace(_) => match milpa_core::load_workspace(&project_root) {
+                        Ok(w) => Some(w),
+                        Err(e) => return Err(e.code().to_string()),
+                    },
+                    ManifestDoc::Package(_) => None,
+                };
+                // The fixture's declared index-trust policy — the loaded
+                // workspace's root-authority-resolved value (mirrors the CLI's
+                // `ws.index_trust_signer`/`ws.index_trust_bundle` reads), or the
+                // single package manifest's own field. Always a concrete value
+                // (explicit `index-trust` node, or the spec default when absent).
+                let index_trust_manifest_policy = if let Some(ws) = &loaded_ws {
+                    ws.index_trust_policy.clone()
+                } else if let ManifestDoc::Package(m) = &doc {
+                    m.index_trust_policy.clone()
+                } else {
+                    unreachable!("loaded_ws is Some for every Workspace doc")
+                };
+
                 // Optional tianguis index for named-dep resolution. The parser
-                // surfaces TNG-* trust-boundary errors (schema/unsafe/bad-*).
-                // --no-index (cli-contract §2.6) overrides any present index.kdl,
-                // forcing index=None so a named dep raises RES-NO-INDEX.
+                // surfaces TNG-* trust-boundary errors (schema/unsafe/bad-*), now
+                // gated through the real index-trust gate (S1b:
+                // `GatedIndex::acquire`), AFTER the manifest/workspace validation
+                // above. --no-index (cli-contract §2.6) overrides any present
+                // index.kdl, forcing index=None so a named dep raises RES-NO-INDEX.
                 let index = {
                     let p = fx.dir.join("index.kdl");
                     if fx.no_index {
@@ -504,22 +543,35 @@ impl Target for MilpaTarget {
                     } else if p.is_file() {
                         let itext = std::fs::read_to_string(&p)
                             .map_err(|e| format!("E2E-INDEX-UNREADABLE: {e}"))?;
-                        match milpa_core::Index::parse(&itext) {
-                            Ok(mut i) => {
-                                // S-EpochGate: a no-op for the overwhelming majority
-                                // of fixtures (no `attestation-epoch-commitment` ->
-                                // Unarmed, the existing default).
-                                i.epoch_commitment_status =
-                                    fixture_epoch_commitment_status(&fx.dir, &itext)?;
-                                // C2 bypass (RFC trusted-index-invariant.md §2.1):
-                                // this runner constructs the index directly from
-                                // fixture bytes rather than through the real gate —
-                                // S1b/S2b reroute this onto the cache-free `acquire`
-                                // seam. `for_test` (the `test-support` feature, see
-                                // milpa-core's Cargo.toml) keeps this compiling with
-                                // bit-for-bit identical behavior in the interim.
-                                Some(milpa_core::GatedIndex::for_test(i))
-                            }
+                        // S-EpochGate: a no-op for the overwhelming majority of
+                        // fixtures (no `attestation-epoch-commitment` -> Unarmed,
+                        // the existing default) — computed independently of the
+                        // index-trust gate and injected into `acquire` (RFC §2.2).
+                        let epoch_status = fixture_epoch_commitment_status(&fx.dir, &itext)?;
+                        let index_url = format!("file://{}", p.display());
+                        let (cfg, verifier) = fixture_index_trust_gate(
+                            &fx.dir,
+                            &index_trust_manifest_policy,
+                            &index_url,
+                        )?;
+                        // S1b (RFC trusted-index-invariant.md §2.1): reroute
+                        // through the real cache-free gate — `GatedIndex::acquire`
+                        // — replacing the `Index::parse` + `for_test` C2 bypass.
+                        // No fixture in the shared resolve/verify tier ships an
+                        // `index.kdl.bundle` sidecar, so `bundle_bytes` is always
+                        // `None` here today: an active policy takes the
+                        // `BundleMissing` branch inside `acquire` (raises under
+                        // `strict`, warns under `warn`) — the S3 strict-success
+                        // pin is the first to exercise the `Some(bytes)` branch.
+                        match milpa_core::GatedIndex::acquire(
+                            &itext,
+                            None,
+                            cfg.as_ref(),
+                            verifier.as_deref(),
+                            &index_url,
+                            epoch_status,
+                        ) {
+                            Ok(gated) => Some(gated),
                             Err(e) => return Err(e.code().to_string()),
                         }
                     } else {
@@ -551,14 +603,12 @@ impl Target for MilpaTarget {
                 // exercised exactly as the CLI's `cmd_fetch` does.
                 let prior_lock = milpa_core::load_lockfile(&fx.dir.join("milpa.lock")).ok();
 
-                let manifest = match milpa_core::parse_document(&text) {
-                    // Workspace: load (WS-* topology) → multi-member union resolve
-                    // (RES-WS-*) → shared milpa.lock + per-member nim.cfg.
-                    Ok(ManifestDoc::Workspace(ws_doc)) => {
-                        let loaded = match milpa_core::load_workspace(&project_root) {
-                            Ok(w) => w,
-                            Err(e) => return Err(e.code().to_string()),
-                        };
+                let manifest = match doc {
+                    // Workspace: topology already loaded above (WS-* errors
+                    // surfaced before the index gate) → multi-member union
+                    // resolve (RES-WS-*) → shared milpa.lock + per-member nim.cfg.
+                    ManifestDoc::Workspace(ws_doc) => {
+                        let loaded = loaded_ws.expect("built above for a workspace doc");
                         let fetcher = crate::fake_fetcher::FakeFetcher::new(
                             fx.dir.join("mocked-fetches"),
                             scratch.cas_root.clone(),
@@ -638,8 +688,7 @@ impl Target for MilpaTarget {
                             Err(e) => Err(e.code().to_string()),
                         };
                     }
-                    Ok(ManifestDoc::Package(m)) => m,
-                    Err(e) => return Err(e.code().to_string()),
+                    ManifestDoc::Package(m) => m,
                 };
 
                 // The fake fetcher also admits into the scratch CAS and symlinks
@@ -904,17 +953,47 @@ impl Target for MilpaTarget {
                 let dep_decl_store_box = fixture_dep_decl_store(fx);
                 let dep_decl_store: Option<&dyn milpa_core::dep_decl_store::DepDeclStore> =
                     dep_decl_store_box.as_deref();
+                // S1b (RFC trusted-index-invariant.md §2.1): this site is
+                // already manifest-first (`doc` parsed above at :923, before any
+                // index touch here) — no reorder needed, only the bypass swap.
+                // The policy comes straight off the already-parsed `doc` (not a
+                // `load_workspace` call — that pre-phase load happens further
+                // below, after this point, and is not reordered by this slice).
+                let index_trust_manifest_policy = match &doc {
+                    ManifestDoc::Workspace(w) => w.index_trust_policy.clone(),
+                    ManifestDoc::Package(m) => m.index_trust_policy.clone(),
+                };
                 let verify_index = {
                     let p = fx.dir.join("index.kdl");
                     if p.is_file() {
                         let itext = std::fs::read_to_string(&p)
                             .map_err(|e| format!("E2E-INDEX-UNREADABLE: {e}"))?;
-                        match milpa_core::Index::parse(&itext) {
-                            // C2 bypass (RFC trusted-index-invariant.md §2.1) — see
-                            // the `Cmd::Resolve` arm's identical comment above;
-                            // `_execute_verify`'s Rust analogue, named in the RFC
-                            // §4 CRITICAL note as the fourth bypass S-Verify reroutes.
-                            Ok(i) => Some(milpa_core::GatedIndex::for_test(i)),
+                        // S-EpochGate (see the `Cmd::Resolve` arm's identical
+                        // comment above): a no-op for fixtures with no
+                        // `attestation-epoch-commitment` pointer.
+                        let epoch_status = fixture_epoch_commitment_status(&fx.dir, &itext)?;
+                        let index_url = format!("file://{}", p.display());
+                        let (cfg, verifier) = fixture_index_trust_gate(
+                            &fx.dir,
+                            &index_trust_manifest_policy,
+                            &index_url,
+                        )?;
+                        // S1b (RFC trusted-index-invariant.md §2.1): reroute
+                        // through the real cache-free gate — `GatedIndex::acquire`
+                        // — replacing the `Index::parse` + `for_test` C2 bypass;
+                        // `_execute_verify`'s Rust analogue, named in the RFC §4
+                        // CRITICAL note as the fourth bypass (Python's separate
+                        // S-Verify slice reroutes ITS OWN analogous site — this
+                        // one is Rust's, already handled here).
+                        match milpa_core::GatedIndex::acquire(
+                            &itext,
+                            None,
+                            cfg.as_ref(),
+                            verifier.as_deref(),
+                            &index_url,
+                            epoch_status,
+                        ) {
+                            Ok(gated) => Some(gated),
                             Err(e) => return Err(e.code().to_string()),
                         }
                     } else {
@@ -2550,6 +2629,100 @@ fn fixture_entry_trust_config(
     }))
 }
 
+/// Build the index-trust gate assembly for [`milpa_core::GatedIndex::acquire`]
+/// (RFC trusted-index-invariant.md §2.1 S1b) — the runner's cache-free
+/// counterpart to the CLI's `build_index_trust_gate` (milpa-cli/main.rs),
+/// scaled down to what a fixture can drive (no real bundle-URL override, no
+/// custom trust-root file — no fixture needs either at the resolve/verify
+/// tier, since the shared corpus carries zero `index.kdl.bundle` sidecars
+/// outside the dedicated `cmd=index-trust` fixture tier).
+///
+/// Precedence mirrors [`fixture_entry_trust_config`]'s sibling entry-trust
+/// axis exactly, specialized to `IndexTrustConfig`/`IndexBundleVerifier`:
+/// `MILPA_INDEX_TRUST` (env override) > `manifest_policy` (the manifest's own
+/// `index-trust` field — ALWAYS a concrete value, explicit or the spec
+/// default) via [`milpa_core::effective_trust_policy`], with
+/// `MILPA_REQUIRE_ATTESTED_INDEX` as the warn→strict escalation flag.
+///
+/// Returns `(None, None)` when the effective policy is `off` — `acquire`'s
+/// contract for "verification never ran" (RFC §2.3). Otherwise builds a real
+/// `IndexTrustConfig` + verifier: `MILPA_INDEX_TRUST_MOCK_VERIFIER` (the
+/// existing conformance seam, `file://`-guarded exactly like the CLI's) when
+/// set, else the real `SigstoreVerifier` — which today is never actually
+/// invoked by any resolve/verify-tier fixture, since none ships a bundle
+/// sidecar; the gate instead always takes the `BundleMissing` branch inside
+/// `acquire`.
+fn fixture_index_trust_gate(
+    fixture_dir: &Path,
+    manifest_policy: &milpa_core::TrustPolicy,
+    url: &str,
+) -> Result<
+    (
+        Option<milpa_core::index_trust::IndexTrustConfig>,
+        Option<Box<dyn milpa_core::index_trust::IndexBundleVerifier>>,
+    ),
+    String,
+> {
+    use milpa_core::index_trust::{
+        IndexBundleVerifier, IndexTrustConfig, MockVerifier, SigstoreVerifier, TrustBundle,
+        VerificationResult, DEFAULT_INDEX_SIGNER,
+    };
+    use milpa_core::{effective_trust_policy, TrustPolicy};
+
+    let env = fixture_env(fixture_dir);
+
+    let env_policy_raw = env
+        .get("MILPA_INDEX_TRUST")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let env_policy: Option<TrustPolicy> = env_policy_raw.as_deref().and_then(|s| match s {
+        "warn" => Some(TrustPolicy::Warn),
+        "strict" => Some(TrustPolicy::Strict),
+        "off" => Some(TrustPolicy::Off),
+        _ => None,
+    });
+    let flag = env
+        .get("MILPA_REQUIRE_ATTESTED_INDEX")
+        .map(|v| parse_env_bool(v))
+        .unwrap_or(false);
+    let policy = effective_trust_policy(manifest_policy, flag, env_policy.as_ref());
+
+    if policy == TrustPolicy::Off {
+        return Ok((None, None));
+    }
+
+    let mock_verifier_str = env
+        .get("MILPA_INDEX_TRUST_MOCK_VERIFIER")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    if mock_verifier_str.is_some() && !url.starts_with("file://") {
+        return Err(format!(
+            "MILPA_INDEX_TRUST_MOCK_VERIFIER is a conformance-internal test seam \
+             and is only honored when the index URL scheme is file:// (spec §8.6.6); \
+             got {url:?}"
+        ));
+    }
+
+    let cfg = IndexTrustConfig::new(policy, TrustBundle::test(), DEFAULT_INDEX_SIGNER.to_string());
+
+    let verifier: Box<dyn IndexBundleVerifier> = match mock_verifier_str {
+        Some(mock_str) => {
+            let mock_result = VerificationResult::from_value(&mock_str).ok_or_else(|| {
+                format!(
+                    "MILPA_INDEX_TRUST_MOCK_VERIFIER={mock_str:?} is not a valid \
+                     VerificationResult wire string (expected one of: trusted, sig-invalid, \
+                     digest-mismatch, signer-mismatch, bundle-stale, bundle-missing, \
+                     bundle-malformed). Test seam must never fail-open silently."
+                )
+            })?;
+            Box::new(MockVerifier::new(mock_result))
+        }
+        None => Box::new(SigstoreVerifier),
+    };
+
+    Ok((Some(cfg), Some(verifier)))
+}
+
 /// §2.8.1: resolve the fixture's project root. When a `project-dir` control file
 /// is present, the root is `<fixture>/<trimmed contents>`; otherwise it is the
 /// fixture dir itself. Mirrors the black-box harness and the Python adapter.
@@ -3545,6 +3718,101 @@ mod tests {
         std::fs::write(tmp.path().join("milpa.kdl"), "kind \"library\"\n").unwrap();
         let fx = Fixture {
             id: "synthetic/probe".into(),
+            dir: tmp.path().to_path_buf(),
+            cmd: Cmd::Resolve,
+            no_index: false,
+            strategy: None,
+            exclude_newer: None,
+            expected: Expected::Error("MAN-NAME-MISSING".into()),
+        };
+        assert_eq!(
+            MilpaTarget.execute(&fx, &scratch),
+            Err("MAN-NAME-MISSING".into())
+        );
+    }
+
+    // S1b (RFC trusted-index-invariant.md §2.1/§4 resolve-tier pin, Rust-local
+    // pre-corpus proof — the shared #199 corpus fixture is S3, gated on BOTH
+    // S1b and S2b landing first). RED before the reroute (the old `for_test`
+    // bypass never invoked the gate, so this resolved successfully); GREEN
+    // after: `GatedIndex::acquire` raises `TNG-INDEX-BUNDLE-MISSING` because
+    // `index-trust "strict"` + a present `index.kdl` + no bundle sidecar is
+    // exactly the honest per-policy invariant (RFC §2.3) — `strict` with no
+    // verified result mints no `GatedIndex` at all.
+    #[test]
+    fn milpa_target_resolve_strict_index_trust_no_bundle_raises_bundle_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let scratch = Scratch::new(tmp.path()).unwrap();
+        std::fs::write(
+            tmp.path().join("milpa.kdl"),
+            "name \"probe\"\nkind \"library\"\nindex-trust \"strict\"\n",
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("index.kdl"), "schema_version 1\n").unwrap();
+        let fx = Fixture {
+            id: "synthetic/probe-strict-no-bundle".into(),
+            dir: tmp.path().to_path_buf(),
+            cmd: Cmd::Resolve,
+            no_index: false,
+            strategy: None,
+            exclude_newer: None,
+            expected: Expected::Error("TNG-INDEX-BUNDLE-MISSING".into()),
+        };
+        assert_eq!(
+            MilpaTarget.execute(&fx, &scratch),
+            Err("TNG-INDEX-BUNDLE-MISSING".into())
+        );
+    }
+
+    // Sibling to the strict test above: `warn` + no bundle sidecar warns and
+    // continues (RFC §2.3's `warn` case — "verified, or a non-Trusted result
+    // was recorded as a warning") rather than hard-failing, so the resolve
+    // still reaches success. Proves `acquire`'s `BundleMissing` branch is
+    // policy-sensitive, not a blanket hard-fail.
+    #[test]
+    fn milpa_target_resolve_warn_index_trust_no_bundle_still_resolves() {
+        let tmp = tempfile::tempdir().unwrap();
+        let scratch = Scratch::new(tmp.path()).unwrap();
+        std::fs::write(
+            tmp.path().join("milpa.kdl"),
+            "name \"probe\"\nkind \"library\"\nindex-trust \"warn\"\n",
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("index.kdl"), "schema_version 1\n").unwrap();
+        let fx = Fixture {
+            id: "synthetic/probe-warn-no-bundle".into(),
+            dir: tmp.path().to_path_buf(),
+            cmd: Cmd::Resolve,
+            no_index: false,
+            strategy: None,
+            exclude_newer: None,
+            expected: Expected::Success,
+        };
+        match MilpaTarget.execute(&fx, &scratch) {
+            Ok(Produced::Outputs(_)) => {}
+            other => panic!("expected Outputs (warn-and-continue), got {other:?}"),
+        }
+    }
+
+    // S1b manifest-first proof: a manifest error and a would-be strict
+    // index-trust failure are BOTH present (index-trust "strict" + index.kdl
+    // + no bundle would raise TNG-INDEX-BUNDLE-MISSING if the gate ran), but
+    // the manifest is validated FIRST — production ordering (discover_manifest
+    // → load_workspace → THEN the index-trust gate). If the reroute were
+    // index-first instead, this would surface TNG-INDEX-BUNDLE-MISSING; it
+    // must surface the manifest's own MAN-NAME-MISSING instead.
+    #[test]
+    fn milpa_target_resolve_manifest_error_surfaces_before_index_trust_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let scratch = Scratch::new(tmp.path()).unwrap();
+        std::fs::write(
+            tmp.path().join("milpa.kdl"),
+            "kind \"library\"\nindex-trust \"strict\"\n",
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("index.kdl"), "schema_version 1\n").unwrap();
+        let fx = Fixture {
+            id: "synthetic/probe-manifest-first".into(),
             dir: tmp.path().to_path_buf(),
             cmd: Cmd::Resolve,
             no_index: false,
