@@ -3,3 +3,4 @@ kind "library"
 workspace {
     member "a"
 }
+index-trust "warn"

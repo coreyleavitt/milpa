@@ -3,3 +3,4 @@ kind "library"
 deps {
     member "a" bogus="y"
 }
+index-trust "warn"

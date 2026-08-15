@@ -4,3 +4,4 @@ kind "application"
 overrides {
     pkg "mylib"
 }
+index-trust "warn"

@@ -3,3 +3,4 @@ kind "library"
 mirrors {
     mirror 42
 }
+index-trust "warn"

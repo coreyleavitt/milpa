@@ -5,3 +5,4 @@ deps {
         mirror
     }
 }
+index-trust "warn"

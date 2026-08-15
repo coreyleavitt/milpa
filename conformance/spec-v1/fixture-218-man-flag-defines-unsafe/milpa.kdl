@@ -7,3 +7,4 @@ flags {
         defines "x\n--passC:-Dmalicious\n"
     }
 }
+index-trust "warn"

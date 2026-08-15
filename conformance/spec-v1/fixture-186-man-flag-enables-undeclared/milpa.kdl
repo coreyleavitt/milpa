@@ -5,3 +5,4 @@ flags {
     }
 }
 kind "library"
+index-trust "warn"

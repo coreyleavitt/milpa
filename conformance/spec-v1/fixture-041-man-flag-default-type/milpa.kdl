@@ -3,3 +3,4 @@ kind "library"
 flags {
     f default="not-a-bool"
 }
+index-trust "warn"

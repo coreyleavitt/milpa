@@ -1,3 +1,4 @@
 workspace {
     bogus "y"
 }
+index-trust "warn"

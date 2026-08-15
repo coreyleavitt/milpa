@@ -3,3 +3,4 @@ kind "library"
 overrides {
     bogus "a" git=(url)"https://a/foo.git" ref="main"
 }
+index-trust "warn"

@@ -5,3 +5,4 @@ deps {
         platform
     }
 }
+index-trust "warn"

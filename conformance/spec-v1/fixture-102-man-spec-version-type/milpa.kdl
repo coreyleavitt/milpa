@@ -1,3 +1,4 @@
 spec-version "x"
 name "myapp"
 kind "application"
+index-trust "warn"

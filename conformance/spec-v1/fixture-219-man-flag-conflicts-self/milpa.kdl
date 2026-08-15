@@ -7,3 +7,4 @@ flags {
         conflicts "f1"
     }
 }
+index-trust "warn"

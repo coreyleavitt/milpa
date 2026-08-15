@@ -5,3 +5,4 @@ deps {
         flag
     }
 }
+index-trust "warn"

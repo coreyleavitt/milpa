@@ -5,3 +5,4 @@ deps {
         platform "linux" (not)"windows"
     }
 }
+index-trust "warn"

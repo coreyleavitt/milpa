@@ -3,3 +3,4 @@ kind "library"
 deps {
     z "@@@bad"
 }
+index-trust "warn"

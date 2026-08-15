@@ -5,3 +5,4 @@ deps {
         bogus "y"
     }
 }
+index-trust "warn"

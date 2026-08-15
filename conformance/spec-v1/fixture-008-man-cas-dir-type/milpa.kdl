@@ -3,3 +3,4 @@ kind "library"
 cas {
     dir 42
 }
+index-trust "warn"

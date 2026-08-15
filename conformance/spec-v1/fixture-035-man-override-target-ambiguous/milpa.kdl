@@ -3,3 +3,4 @@ kind "library"
 overrides {
     pkg "a" ref="main"
 }
+index-trust "warn"

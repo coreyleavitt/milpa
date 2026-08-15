@@ -3,3 +3,4 @@ kind "library"
 flags {
     f description=42
 }
+index-trust "warn"

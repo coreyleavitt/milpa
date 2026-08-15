@@ -3,3 +3,4 @@ kind "library"
 deps {
     foo tarball=(url)""
 }
+index-trust "warn"

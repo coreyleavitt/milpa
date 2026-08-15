@@ -2,3 +2,4 @@ workspace {
     member "a"
 }
 bogus "y"
+index-trust "warn"

@@ -5,3 +5,4 @@ deps {
         flag "a" #true "extra"
     }
 }
+index-trust "warn"

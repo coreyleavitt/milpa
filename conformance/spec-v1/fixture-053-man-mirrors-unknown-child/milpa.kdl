@@ -3,3 +3,4 @@ kind "library"
 mirrors {
     bogus "y"
 }
+index-trust "warn"

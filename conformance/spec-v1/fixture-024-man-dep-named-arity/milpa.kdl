@@ -3,3 +3,4 @@ kind "library"
 deps {
     foo "a" "b"
 }
+index-trust "warn"

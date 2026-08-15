@@ -9,3 +9,4 @@ kind "application"
 deps {
     "opt.lib" git=(url)"https://example.com/optlib.git" ref="main" optional=#true
 }
+index-trust "warn"

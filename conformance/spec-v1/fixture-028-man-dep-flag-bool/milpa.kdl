@@ -5,3 +5,4 @@ deps {
         flag "a" "not-a-bool"
     }
 }
+index-trust "warn"

@@ -7,3 +7,4 @@ flags {
         defines "innocent"
     }
 }
+index-trust "warn"

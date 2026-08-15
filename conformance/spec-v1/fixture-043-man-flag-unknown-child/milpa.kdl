@@ -5,3 +5,4 @@ flags {
         bogus "y"
     }
 }
+index-trust "warn"

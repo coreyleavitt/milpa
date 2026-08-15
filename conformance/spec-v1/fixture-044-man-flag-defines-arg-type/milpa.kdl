@@ -5,3 +5,4 @@ flags {
         defines 42
     }
 }
+index-trust "warn"

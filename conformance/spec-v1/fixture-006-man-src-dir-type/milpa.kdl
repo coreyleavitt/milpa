@@ -1,3 +1,4 @@
 name "x"
 src_dir 42
 kind "library"
+index-trust "warn"

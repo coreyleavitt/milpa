@@ -4,3 +4,4 @@ deps {
         member "intonaco"
     }
 }
+index-trust "warn"

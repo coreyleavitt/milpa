@@ -1,3 +1,4 @@
 name "x"
 bogus "y"
 kind "library"
+index-trust "warn"

@@ -3,3 +3,4 @@ kind "library"
 flags {
     f bogus=#true
 }
+index-trust "warn"

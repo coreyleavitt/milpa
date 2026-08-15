@@ -2,3 +2,4 @@ workspace {
     member "a"
     member "a"
 }
+index-trust "warn"
