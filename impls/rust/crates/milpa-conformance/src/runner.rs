@@ -557,15 +557,27 @@ impl Target for MilpaTarget {
                         // S1b (RFC trusted-index-invariant.md §2.1): reroute
                         // through the real cache-free gate — `GatedIndex::acquire`
                         // — replacing the `Index::parse` + `for_test` C2 bypass.
-                        // No fixture in the shared resolve/verify tier ships an
-                        // `index.kdl.bundle` sidecar, so `bundle_bytes` is always
-                        // `None` here today: an active policy takes the
-                        // `BundleMissing` branch inside `acquire` (raises under
-                        // `strict`, warns under `warn`) — the S3 strict-success
-                        // pin is the first to exercise the `Some(bytes)` branch.
+                        // S3: read the optional `index.kdl.bundle` sidecar
+                        // (mirrors the `show-index-trust` arm's identical read
+                        // below and Python's `_build_env`) — `None` when the
+                        // fixture ships no sidecar (the overwhelming majority;
+                        // `BundleMissing` inside `acquire` raises under `strict`,
+                        // warns under `warn`), `Some(bytes)` for the S3 strict-
+                        // success pin, which is the first fixture to exercise
+                        // that branch.
+                        let bundle_bytes = {
+                            let bp = fx.dir.join("index.kdl.bundle");
+                            if bp.is_file() {
+                                Some(std::fs::read(&bp).map_err(|e| {
+                                    format!("E2E-INDEX-BUNDLE-UNREADABLE: {e}")
+                                })?)
+                            } else {
+                                None
+                            }
+                        };
                         match milpa_core::GatedIndex::acquire(
                             &itext,
-                            None,
+                            bundle_bytes.as_deref(),
                             cfg.as_ref(),
                             verifier.as_deref(),
                             &index_url,

@@ -1,0 +1,13 @@
+// fixture-467: RFC rfc-trusted-index-invariant.md §4/S3 — the #199 regression
+// pin. index-trust "strict", index.kdl present with NO `.bundle` sidecar, but
+// the only dep uses `git=` (not a named/index-resolved dep) — the index is
+// genuinely UNCONSUMED by resolution. The gate is EAGER (fires on index load,
+// independent of whether resolution ever consults the index), so this still
+// raises TNG-INDEX-BUNDLE-MISSING. Template: fixture-367-entry-trust-strict-
+// unattested / fixture-466-verify-index-trust-strict-bundle-missing.
+name "myapp"
+kind "application"
+index-trust "strict"
+deps {
+    bar git=(url)"https://github.com/example/bar.git" ref="v2.0.0"
+}

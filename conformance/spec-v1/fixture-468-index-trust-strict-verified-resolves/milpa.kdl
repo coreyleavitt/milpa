@@ -1,0 +1,13 @@
+// fixture-468: RFC rfc-trusted-index-invariant.md §4/S3 — the strict-success
+// pin (round 2, breadth). index-trust "strict" + a verified-trusted bundle
+// (MILPA_INDEX_TRUST_MOCK_VERIFIER=trusted, the file://-guarded conformance
+// seam) mints a GatedIndex with VerificationResult::Trusted, and a named dep
+// resolvable ONLY via the index is actually resolved out of it. Proves the
+// type's raison d'etre: the gate RAN and PASSED, not merely that ungated
+// access is blocked. Template: fixture-061-named-dep.
+name "myapp"
+kind "application"
+index-trust "strict"
+deps {
+    bar ">= 2.0.0"
+}
