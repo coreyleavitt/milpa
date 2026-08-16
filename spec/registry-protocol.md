@@ -944,6 +944,19 @@ prose.
 > entry, version, provenance) may be used before the gate passes or produces
 > a `warn`-policy warning.
 
+> NORMATIVE (per-policy meaning of a passed gate): "the gate passes" is
+> policy-relative and MUST NOT be over-read as cryptographic trust under every
+> policy. Under `strict`, the gate passes ONLY if the index verified as
+> cryptographically trusted; any non-trusted result raises and no index claim is
+> used. Under `warn`, the gate passes if the index verified OR a non-trusted
+> result (missing / invalid / digest-mismatched / signer-mismatched / stale
+> bundle) was recorded as a warning and resolution continued — so a passed
+> `warn` gate does NOT assert the index is trusted. Under `off`, verification is
+> not performed and the gate asserts no trust claim at all. A conformant
+> implementation MUST NOT treat a passed `warn`/`off` gate as equivalent to a
+> `strict` verification (e.g. when recording index provenance or deciding
+> whether a downstream check may rely on the index being authentic).
+
 > NORMATIVE: The gate MUST NOT fire on frozen-path invocations (`fetch
 > --frozen`, or any path that reconstructs the dep graph from `milpa.lock`
 > without loading the index). When `--no-index` is active, no index is loaded
@@ -956,6 +969,18 @@ prose.
 > invoke the gate. `milpa verify` invokes the gate in crypto-only mode (steps
 > 1–2 and 4–7, skipping step 3 (freshness), §3.4.4) but MUST NOT assert the
 > wall-clock freshness bound, preserving offline audit capability.
+
+> NORMATIVE (online `dep_decl` drift check vs. offline reverify): `milpa verify`
+> touches the index in two DISTINCT ways, and both are gated. (1) The offline
+> attestation reverify above is the crypto-only mode (freshness skipped). (2) The
+> online `dep_decl` edge check (`spec/dep-decl.md` §3.7; raises
+> `VERIFY-EDGE-MISMATCH`) performs a SEPARATE, live index load that is gated in
+> FULL under the effective policy (a `strict` consumer with an unverifiable index
+> therefore fails closed — it MUST NOT read `dep_decl` fields from an unverified
+> index). That online load occurs ONLY when the lockfile carries at least one
+> `dep_decl` pin to check; when there are no pins, no index load occurs. This is
+> not an exception to "the gate fires on every index load" — it is a case where
+> no load happens at all.
 
 #### 3.4.2  Bundle acquisition and URL derivation
 
