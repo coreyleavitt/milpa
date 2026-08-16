@@ -532,7 +532,12 @@ def _fixture_entry_trust_config(fixture_dir: Path, doc: object) -> "object | Non
     )
 
 
-def _fixture_epoch_commitment_status(fixture_dir: Path, index_path: Path) -> "object":
+def _fixture_epoch_commitment_status(
+    fixture_dir: Path,
+    index_path: Path,
+    config: "object | None",
+    verifier: "object | None",
+) -> "object":
     """S-EpochGate (RFC attestation-v1-normative.md §6, D14/D17): compute the
     ``EpochCommitmentStatus`` for a fixture's ``index.kdl``, when it declares
     ``attestation-epoch-commitment``.
@@ -548,6 +553,18 @@ def _fixture_epoch_commitment_status(fixture_dir: Path, index_path: Path) -> "ob
     C`, ...) lives in each impl's dedicated, non-shared test suite
     (``test_epoch_commitment.py`` / the Rust mirror), not this corpus.
 
+    ``config``/``verifier`` are the SAME ``(IndexTrustConfig, IndexBundleVerifier)``
+    pair the caller already resolved via ``_fixture_index_trust_config`` — mirrors
+    production's ``trust_active = config is not None and verifier is not None``
+    gate (``index_cache.load_index_gated``) which ``cli.py._load_index_for_verb``
+    upstream collapses to "only build the epoch verifier when index-trust
+    itself is active" (``epoch_verifier`` stays ``None`` under ``policy=off``,
+    so ``epoch_active`` is false and the sidecar is never read). Under an
+    inactive gate this function must NOT read the sidecar at all — returning
+    ``Unarmed()`` unconditionally, exactly like production's untouched default
+    — otherwise a tampered sidecar would raise in-process where the real CLI
+    (which never looks at it under ``off``) resolves cleanly.
+
     Returns ``Unarmed()`` when the pointer is absent — the default every
     pre-S-EpochGate fixture already relies on, so this function is a no-op
     extension for fixtures that never opt in.
@@ -556,6 +573,12 @@ def _fixture_epoch_commitment_status(fixture_dir: Path, index_path: Path) -> "ob
     from milpa.index_ratchet_seam import _raw_attestation_epoch_commitment
     from milpa.index_trust import MockVerifier, TrustBundle, VerificationResult
     from milpa.kdl_io import parse_kdl
+
+    # trust_active gate (mirrors index_cache.load_index_gated's own
+    # `trust_active = config is not None and verifier is not None`, which is
+    # what production's epoch_active ultimately collapses to — see docstring).
+    if config is None or verifier is None:
+        return Unarmed()
 
     doc = parse_kdl(index_path.read_text(encoding="utf-8"), context="registry")
     pointer = _raw_attestation_epoch_commitment(doc)
@@ -664,6 +687,27 @@ def _fixture_index_trust_config(
     return config, verifier
 
 
+def _manifest_epoch_policies(doc: object) -> "tuple[str, str]":
+    """Resolve the ``(entry-trust, index-history)`` policy pair off an
+    already-parsed manifest doc (RR-Low-b) — the two enforcement axes
+    ``acquire`` threads through to ``_mint_enforced`` (D18 co-requirement),
+    shared by ``_build_env`` (resolve tier) and ``_execute_verify`` (verify
+    tier) so both resolve it identically. Mirrors the Rust runner's
+    ``manifest_epoch_policies`` (``runner.rs``). No env-override merge: the
+    production epoch fold's own ``entry_trust_policy`` input is likewise the
+    raw manifest value (``milpa-cli/main.rs::maybe_index``). Defaults mirror
+    ``Manifest``/``WorkspaceManifest``'s own dataclass defaults for the
+    no-manifest edge case.
+    """
+    entry_trust_policy = (
+        doc.entry_trust_policy if isinstance(doc, (Manifest, WorkspaceManifest)) else "strict"
+    )
+    index_history_policy = (
+        doc.index_history_policy if isinstance(doc, (Manifest, WorkspaceManifest)) else "warn"
+    )
+    return entry_trust_policy, index_history_policy
+
+
 # ---------------------------------------------------------------------------
 # MilpaEnv construction for in-process conformance
 # ---------------------------------------------------------------------------
@@ -739,8 +783,15 @@ def _build_env(
         # S-EpochGate: a no-op for the overwhelming majority of fixtures
         # (no ``attestation-epoch-commitment`` -> Unarmed, the existing
         # default) — see _fixture_epoch_commitment_status's docstring.
-        epoch_status = _fixture_epoch_commitment_status(fixture_dir, index_path)
+        # config/verifier already resolved above — threading them gates the
+        # status computation on trust_active, mirroring production exactly.
+        epoch_status = _fixture_epoch_commitment_status(fixture_dir, index_path, config, verifier)
         index_url = f"file://{index_path.resolve()}"
+        # Same two enforcement axes ``acquire`` now threads through to
+        # ``_mint_enforced`` (D18 co-requirement) — raw manifest values,
+        # mirroring the Rust runner's identical `entry_trust_manifest_policy`/
+        # `index_history_manifest_policy` reads.
+        entry_trust_manifest_policy, index_history_manifest_policy = _manifest_epoch_policies(doc)
 
         # Let MilpaError propagate — TNG-INDEX-* gate failures (strict) and
         # TNG-* parse errors from index.kdl must surface as the fixture's
@@ -756,6 +807,8 @@ def _build_env(
                 verifier,
                 index_url,
                 epoch_status,
+                entry_trust_manifest_policy,
+                index_history_manifest_policy,
             )
         except MilpaError:
             raise
@@ -2825,8 +2878,11 @@ def _execute_verify(
     config, verifier = _fixture_index_trust_config(fixture_dir, doc)
     bundle_path = fixture_dir / "index.kdl.bundle"
     bundle_bytes = bundle_path.read_bytes() if bundle_path.is_file() else None
-    epoch_status = _fixture_epoch_commitment_status(fixture_dir, index_path)
+    epoch_status = _fixture_epoch_commitment_status(fixture_dir, index_path, config, verifier)
     index_url = f"file://{index_path.resolve()}"
+    # Same two enforcement axes as the resolve-tier `_build_env` call site
+    # above (`_mint_enforced`'s D18 co-requirement).
+    entry_trust_manifest_policy, index_history_manifest_policy = _manifest_epoch_policies(doc)
     try:
         gated = index_cache.acquire(
             index_path.read_text(encoding="utf-8"),
@@ -2835,6 +2891,8 @@ def _execute_verify(
             verifier,
             index_url,
             epoch_status,
+            entry_trust_manifest_policy,
+            index_history_manifest_policy,
         )
     except MilpaError as e:
         if fixture.expected_error is not None and e.slug == fixture.expected_error:
@@ -3417,6 +3475,110 @@ class TestConformanceAdapterMachinery:
         config = _fixture_entry_trust_config(tmp_path, None)
         assert config is not None
         assert config.verifier._default is SignatureInvalid  # type: ignore[attr-defined]
+
+    # -----------------------------------------------------------------------
+    # RR-2 (MEDIUM re-review finding, root-cause): the in-process adapter's
+    # ``_fixture_epoch_commitment_status`` used to compute the REAL epoch
+    # status from the sidecar UNCONDITIONALLY, ignoring the index-trust
+    # policy — diverging from production, where ``epoch_active =
+    # trust_active and epoch_verifier is not None`` (``index_cache.
+    # load_index_gated``) collapses (via ``cli.py._load_index_for_verb``,
+    # which only builds ``epoch_verifier`` when ``config``/``verifier`` are
+    # both not ``None``) to "the sidecar is never read when index-trust is
+    # off". Under ``off`` the adapter's unconditional computation would raise
+    # ``TNG-INDEX-EPOCH-COMMITMENT-INVALID`` in-process for a tampered
+    # sidecar the real CLI never looks at. fixture-469 (``index-trust
+    # "warn"``) exercises the ACTIVE-policy case and is untouched by this fix.
+    # -----------------------------------------------------------------------
+
+    def test_fixture_epoch_commitment_status_unarmed_when_trust_inactive(
+        self, tmp_path: Path
+    ) -> None:
+        """``_fixture_epoch_commitment_status`` must return ``Unarmed()`` — and
+        must NOT even read the sidecar — when ``config``/``verifier`` are
+        ``None`` (index-trust ``off``), mirroring production's
+        ``trust_active`` gate, even though the index declares a commitment
+        pointer and the sidecar on disk is a tampered/``ArmingInvalid`` one."""
+        from milpa.epoch_commitment import Unarmed
+
+        fixture_469 = _CORPUS_ROOT / "spec-v1" / "fixture-469-epoch-commitment-arming-invalid"
+        if not fixture_469.is_dir():
+            pytest.skip("fixture-469 not found")
+
+        index_path = tmp_path / "index.kdl"
+        shutil.copy(fixture_469 / "index.kdl", index_path)
+        shutil.copy(
+            fixture_469 / "index.kdl.epoch-commitment",
+            tmp_path / "index.kdl.epoch-commitment",
+        )
+
+        status = _fixture_epoch_commitment_status(tmp_path, index_path, None, None)
+        assert status == Unarmed()
+
+    def test_fixture_epoch_commitment_status_computed_when_trust_active(
+        self, tmp_path: Path
+    ) -> None:
+        """Sanity check for the SAME fixture files as the test above: when
+        ``config``/``verifier`` ARE resolved (trust active), the adapter must
+        still compute the real status from the sidecar — proving the RR-2
+        gate only short-circuits the inactive case, not the active one."""
+        from milpa.epoch_commitment import ArmingInvalid
+        from milpa.index_trust import IndexTrustConfig, MockVerifier, TrustBundle, VerificationResult
+
+        fixture_469 = _CORPUS_ROOT / "spec-v1" / "fixture-469-epoch-commitment-arming-invalid"
+        if not fixture_469.is_dir():
+            pytest.skip("fixture-469 not found")
+
+        index_path = tmp_path / "index.kdl"
+        shutil.copy(fixture_469 / "index.kdl", index_path)
+        shutil.copy(
+            fixture_469 / "index.kdl.epoch-commitment",
+            tmp_path / "index.kdl.epoch-commitment",
+        )
+
+        config = IndexTrustConfig(
+            policy="warn",
+            trust_bundle=TrustBundle.test(),
+            expected_signer="fixture-signer",
+        )
+        verifier = MockVerifier(VerificationResult.TRUSTED)
+
+        status = _fixture_epoch_commitment_status(tmp_path, index_path, config, verifier)
+        assert isinstance(status, ArmingInvalid)
+
+    def test_build_env_index_trust_off_resolves_despite_tampered_epoch_commitment_sidecar(
+        self, tmp_path: Path
+    ) -> None:
+        """End-to-end RR-2 regression (the exact scenario the finding names):
+        ``index-trust "off"`` paired with fixture-469's tampered
+        ``attestation-epoch-commitment`` sidecar must resolve SUCCESSFULLY
+        in-process via ``_build_env`` -> ``index_cache.acquire`` — matching
+        the real CLI, which never reads the sidecar under ``off``. Before the
+        RR-2 fix this raised ``MilpaError(TNG-INDEX-EPOCH-COMMITMENT-INVALID)``
+        (confirmed RED against the pre-fix adapter)."""
+        fixture_469 = _CORPUS_ROOT / "spec-v1" / "fixture-469-epoch-commitment-arming-invalid"
+        if not fixture_469.is_dir():
+            pytest.skip("fixture-469 not found")
+
+        (tmp_path / "milpa.kdl").write_text(
+            'name "myapp"\nkind "application"\nindex-trust "off"\n',
+            encoding="utf-8",
+        )
+        shutil.copy(fixture_469 / "index.kdl", tmp_path / "index.kdl")
+        shutil.copy(
+            fixture_469 / "index.kdl.epoch-commitment",
+            tmp_path / "index.kdl.epoch-commitment",
+        )
+
+        from milpa.epoch_commitment import Unarmed
+        from milpa.gated_index import GatedIndex
+
+        work_dir = tmp_path / "_work"
+        work_dir.mkdir()
+        env = _build_env(tmp_path, work_dir)
+
+        assert isinstance(env.index, GatedIndex)
+        assert env.index.index.epoch_commitment_status == Unarmed()
 
     def test_cli_only_fixtures_detected(self) -> None:
         """CLI-only verb fixtures (and CLI discovery-guard fixtures) are identified.

@@ -529,6 +529,16 @@ impl Target for MilpaTarget {
                 } else {
                     unreachable!("loaded_ws is Some for every Workspace doc")
                 };
+                // Same manifest-first resolution for the two epoch-commitment
+                // enforcement axes `GatedIndex::acquire` now threads through to
+                // `mint_enforced` (D18 co-requirement) — mirrors the CLI's
+                // `ws.entry_trust_policy`/`ws.index_history_policy` reads exactly
+                // like `index_trust_manifest_policy` above. `manifest_epoch_
+                // policies` reads straight off `doc`, which is equivalent to
+                // `loaded_ws`'s fields (both are the same `milpa.kdl` parse —
+                // see the helper's doc comment).
+                let (entry_trust_manifest_policy, index_history_manifest_policy) =
+                    manifest_epoch_policies(&doc);
 
                 // Optional tianguis index for named-dep resolution. The parser
                 // surfaces TNG-* trust-boundary errors (schema/unsafe/bad-*), now
@@ -543,17 +553,22 @@ impl Target for MilpaTarget {
                     } else if p.is_file() {
                         let itext = std::fs::read_to_string(&p)
                             .map_err(|e| format!("E2E-INDEX-UNREADABLE: {e}"))?;
-                        // S-EpochGate: a no-op for the overwhelming majority of
-                        // fixtures (no `attestation-epoch-commitment` -> Unarmed,
-                        // the existing default) — computed independently of the
-                        // index-trust gate and injected into `acquire` (RFC §2.2).
-                        let epoch_status = fixture_epoch_commitment_status(&fx.dir, &itext)?;
                         let index_url = format!("file://{}", p.display());
                         let (cfg, verifier) = fixture_index_trust_gate(
                             &fx.dir,
                             &index_trust_manifest_policy,
                             &index_url,
                         )?;
+                        // S-EpochGate: a no-op for the overwhelming majority of
+                        // fixtures (no `attestation-epoch-commitment` -> Unarmed,
+                        // the existing default). RR-2: gated on `trust_active`
+                        // (mirrors production's `epoch_active`/`gate.is_some()`
+                        // condition) — computed AFTER cfg/verifier so the sidecar
+                        // is never even read under an inactive gate, injected
+                        // into `acquire` (RFC §2.2).
+                        let trust_active = cfg.is_some() && verifier.is_some();
+                        let epoch_status =
+                            fixture_epoch_commitment_status(&fx.dir, &itext, trust_active)?;
                         // S1b (RFC trusted-index-invariant.md §2.1): reroute
                         // through the real cache-free gate — `GatedIndex::acquire`
                         // — replacing the `Index::parse` + `for_test` C2 bypass.
@@ -565,16 +580,7 @@ impl Target for MilpaTarget {
                         // warns under `warn`), `Some(bytes)` for the S3 strict-
                         // success pin, which is the first fixture to exercise
                         // that branch.
-                        let bundle_bytes = {
-                            let bp = fx.dir.join("index.kdl.bundle");
-                            if bp.is_file() {
-                                Some(std::fs::read(&bp).map_err(|e| {
-                                    format!("E2E-INDEX-BUNDLE-UNREADABLE: {e}")
-                                })?)
-                            } else {
-                                None
-                            }
-                        };
+                        let bundle_bytes = read_index_bundle_sidecar(&fx.dir)?;
                         match milpa_core::GatedIndex::acquire(
                             &itext,
                             bundle_bytes.as_deref(),
@@ -582,6 +588,8 @@ impl Target for MilpaTarget {
                             verifier.as_deref(),
                             &index_url,
                             epoch_status,
+                            &entry_trust_manifest_policy,
+                            &index_history_manifest_policy,
                         ) {
                             Ok(gated) => Some(gated),
                             Err(e) => return Err(e.code().to_string()),
@@ -975,21 +983,29 @@ impl Target for MilpaTarget {
                     ManifestDoc::Workspace(w) => w.index_trust_policy.clone(),
                     ManifestDoc::Package(m) => m.index_trust_policy.clone(),
                 };
+                // Same two enforcement axes as the `Cmd::Resolve` arm above
+                // (`mint_enforced`'s D18 co-requirement).
+                let (entry_trust_manifest_policy, index_history_manifest_policy) =
+                    manifest_epoch_policies(&doc);
                 let verify_index = {
                     let p = fx.dir.join("index.kdl");
                     if p.is_file() {
                         let itext = std::fs::read_to_string(&p)
                             .map_err(|e| format!("E2E-INDEX-UNREADABLE: {e}"))?;
-                        // S-EpochGate (see the `Cmd::Resolve` arm's identical
-                        // comment above): a no-op for fixtures with no
-                        // `attestation-epoch-commitment` pointer.
-                        let epoch_status = fixture_epoch_commitment_status(&fx.dir, &itext)?;
                         let index_url = format!("file://{}", p.display());
                         let (cfg, verifier) = fixture_index_trust_gate(
                             &fx.dir,
                             &index_trust_manifest_policy,
                             &index_url,
                         )?;
+                        // S-EpochGate (see the `Cmd::Resolve` arm's identical
+                        // comment above): a no-op for fixtures with no
+                        // `attestation-epoch-commitment` pointer, RR-2-gated on
+                        // `trust_active` (computed after cfg/verifier so the
+                        // sidecar is never read under an inactive gate).
+                        let trust_active = cfg.is_some() && verifier.is_some();
+                        let epoch_status =
+                            fixture_epoch_commitment_status(&fx.dir, &itext, trust_active)?;
                         // S1b (RFC trusted-index-invariant.md §2.1): reroute
                         // through the real cache-free gate — `GatedIndex::acquire`
                         // — replacing the `Index::parse` + `for_test` C2 bypass;
@@ -997,13 +1013,16 @@ impl Target for MilpaTarget {
                         // CRITICAL note as the fourth bypass (Python's separate
                         // S-Verify slice reroutes ITS OWN analogous site — this
                         // one is Rust's, already handled here).
+                        let bundle_bytes = read_index_bundle_sidecar(&fx.dir)?;
                         match milpa_core::GatedIndex::acquire(
                             &itext,
-                            None,
+                            bundle_bytes.as_deref(),
                             cfg.as_ref(),
                             verifier.as_deref(),
                             &index_url,
                             epoch_status,
+                            &entry_trust_manifest_policy,
+                            &index_history_manifest_policy,
                         ) {
                             Ok(gated) => Some(gated),
                             Err(e) => return Err(e.code().to_string()),
@@ -2459,6 +2478,48 @@ fn fixture_require_attested_metadata(dir: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Read the optional `index.kdl.bundle` sidecar next to a fixture's
+/// `index.kdl`, shared by the `Cmd::Resolve` and `Cmd::Verify` arms so both
+/// route through `GatedIndex::acquire` identically (R4 fix: `Cmd::Verify`
+/// previously hardcoded `None` here, diverging from `Cmd::Resolve` and from
+/// Python's `_execute_verify`). Returns `None` when the fixture ships no
+/// sidecar (the overwhelming majority; `BundleMissing` inside `acquire`
+/// raises under `strict`, warns under `warn`), `Some(bytes)` otherwise.
+fn read_index_bundle_sidecar(fixture_dir: &Path) -> Result<Option<Vec<u8>>, String> {
+    let bp = fixture_dir.join("index.kdl.bundle");
+    if bp.is_file() {
+        Ok(Some(std::fs::read(&bp).map_err(|e| {
+            format!("E2E-INDEX-BUNDLE-UNREADABLE: {e}")
+        })?))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Resolve the `(entry-trust, index-history)` policy pair off an
+/// already-parsed manifest doc (RR-Low-b) — the two enforcement axes
+/// `GatedIndex::acquire` threads through to `mint_enforced`'s D18
+/// co-requirement (RFC trusted-index-invariant.md §2.2), shared by the
+/// `Cmd::Resolve` and `Cmd::Verify` arms so both resolve it identically.
+/// For a `Workspace` doc, these are the root's own values (members are
+/// structurally forbidden from declaring them — `check_member_entry_trust_
+/// declarations` / `check_member_index_history_declarations`), which is
+/// exactly what a fresh parse of the workspace's `milpa.kdl` already carries
+/// — equivalent to (and cheaper than) re-reading them off a separately
+/// loaded `LoadedWorkspace`.
+fn manifest_epoch_policies(
+    doc: &milpa_core::ManifestDoc,
+) -> (milpa_core::TrustPolicy, milpa_core::TrustPolicy) {
+    match doc {
+        milpa_core::ManifestDoc::Workspace(w) => {
+            (w.entry_trust_policy.clone(), w.index_history_policy.clone())
+        }
+        milpa_core::ManifestDoc::Package(m) => {
+            (m.entry_trust_policy.clone(), m.index_history_policy.clone())
+        }
+    }
+}
+
 /// S-EpochGate (RFC attestation-v1-normative.md §6, D14/D17): compute the
 /// `EpochCommitmentStatus` for a fixture's `index.kdl`, when it declares
 /// `attestation-epoch-commitment`. Mirrors the Python in-process adapter's
@@ -2473,15 +2534,32 @@ fn fixture_require_attested_metadata(dir: &Path) -> bool {
 /// crypto-correctness matrix lives in each impl's dedicated, non-shared test
 /// suite, not this corpus.
 ///
+/// `trust_active` is the SAME `config.is_some() && verifier.is_some()`
+/// condition `milpa_core::index_cache::load_index_with_history` gates its own
+/// `epoch_active` on (which in turn is what `milpa-cli::maybe_index` collapses
+/// to: `epoch_owned`/`epoch` are `None` whenever the index-trust `gate` is
+/// `None`, i.e. whenever `policy == Off` or the mock/production verifier
+/// couldn't be built) — under an inactive gate this function must NOT read
+/// the `index.kdl.epoch-commitment` sidecar at all, returning `Unarmed`
+/// unconditionally, exactly like production's untouched default. Without this
+/// gate a tampered sidecar would raise `TNG-INDEX-EPOCH-COMMITMENT-INVALID`
+/// in-process where the real CLI (which never looks at the sidecar under
+/// `off`) resolves cleanly — a conformance-parity landmine (RR-2).
+///
 /// Returns `Unarmed` when the pointer is absent — the default every
 /// pre-S-EpochGate fixture already relies on, so this function is a no-op
 /// extension for fixtures that never opt in.
 fn fixture_epoch_commitment_status(
     fixture_dir: &Path,
     index_text: &str,
+    trust_active: bool,
 ) -> Result<milpa_core::epoch_commitment::EpochCommitmentStatus, String> {
     use milpa_core::epoch_commitment::{evaluate_epoch_commitment, EpochCommitmentStatus};
     use milpa_core::index_trust::{MockVerifier, TrustBundle, VerificationResult};
+
+    if !trust_active {
+        return Ok(EpochCommitmentStatus::Unarmed);
+    }
 
     let pointer = milpa_core::raw_attestation_epoch_commitment(index_text)
         .map_err(|e| e.code().to_string())?;
@@ -3803,6 +3881,62 @@ mod tests {
         match MilpaTarget.execute(&fx, &scratch) {
             Ok(Produced::Outputs(_)) => {}
             other => panic!("expected Outputs (warn-and-continue), got {other:?}"),
+        }
+    }
+
+    // RR-2 (MEDIUM re-review finding, root-cause): `fixture_epoch_commitment_status`
+    // used to compute the REAL `EpochCommitmentStatus` from the
+    // `index.kdl.epoch-commitment` sidecar UNCONDITIONALLY, ignoring whether
+    // the index-trust gate is active — diverging from production, where
+    // `milpa-cli::maybe_index` only builds `EpochCommitmentInputs` (`epoch`)
+    // when the index-trust `gate` itself is `Some` (policy != Off), so the
+    // sidecar is never even read under `off`. Reuses fixture-469's own
+    // `index.kdl` (declares `attestation-epoch-commitment`) and its tampered
+    // sidecar (`hash(S) != C` -> ArmingInvalid under an active gate) but pairs
+    // them with `index-trust "off"` here — the real CLI resolves cleanly in
+    // that combination; before the RR-2 fix this adapter falsely raised
+    // `TNG-INDEX-EPOCH-COMMITMENT-INVALID` in-process (confirmed RED by
+    // temporarily removing the `trust_active` short-circuit in
+    // `fixture_epoch_commitment_status`).
+    #[test]
+    fn milpa_target_resolve_index_trust_off_resolves_despite_tampered_epoch_commitment_sidecar() {
+        let corpus_root = Path::new(env!("CARGO_MANIFEST_DIR")).join(crate::CORPUS_REL);
+        let fixture_469 =
+            corpus_root.join("spec-v1").join("fixture-469-epoch-commitment-arming-invalid");
+        if !fixture_469.is_dir() {
+            eprintln!("fixture-469 not found; skipping");
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let scratch = Scratch::new(tmp.path()).unwrap();
+        std::fs::write(
+            tmp.path().join("milpa.kdl"),
+            "name \"probe\"\nkind \"library\"\nindex-trust \"off\"\n",
+        )
+        .unwrap();
+        std::fs::copy(fixture_469.join("index.kdl"), tmp.path().join("index.kdl")).unwrap();
+        std::fs::copy(
+            fixture_469.join("index.kdl.epoch-commitment"),
+            tmp.path().join("index.kdl.epoch-commitment"),
+        )
+        .unwrap();
+
+        let fx = Fixture {
+            id: "synthetic/probe-off-tampered-epoch-commitment".into(),
+            dir: tmp.path().to_path_buf(),
+            cmd: Cmd::Resolve,
+            no_index: false,
+            strategy: None,
+            exclude_newer: None,
+            expected: Expected::Success,
+        };
+        match MilpaTarget.execute(&fx, &scratch) {
+            Ok(Produced::Outputs(_)) => {}
+            other => panic!(
+                "expected Outputs (index-trust off ignores the tampered epoch-commitment \
+                 sidecar, matching production), got {other:?}"
+            ),
         }
     }
 
