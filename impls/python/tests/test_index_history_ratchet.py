@@ -46,7 +46,9 @@ from milpa.errors import (
     TNG_UNSAFE_CONTROL_CHAR,
     MilpaError,
 )
-from milpa.index_cache import DEFAULT_TTL_SECONDS, cache_path_for, load_index
+from milpa.index_cache import DEFAULT_TTL_SECONDS, cache_path_for
+
+from ._index_cache_helpers import load_index
 from milpa.index_ratchet_seam import (
     BaselineMeta,
     build_index_state,
