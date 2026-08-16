@@ -2640,6 +2640,7 @@ def _execute_verify(
     - index.kdl      — live (drifted) index for dep_decl edge check
     - expected/error — expected error slug (all S6 verify fixtures are error-class)
     """
+    from milpa import index_cache
     from milpa.lockfile import parse_lockfile, verify_lockfile_against_deps
 
     fixture_dir = fixture.dir
@@ -2739,8 +2740,6 @@ def _execute_verify(
     # Phase 2: in-process verify.
     # We reproduce cmd_verify's logic in-process rather than calling cmd_verify
     # directly (which would re-load env from os.environ, not the fixture env).
-    from milpa.registry import parse_index
-
     flag_require_attested = _fixture_require_attested_metadata(fixture_dir)
 
     # §13.1: effective strict = OR(manifest attestation-policy "strict", flag).
@@ -2815,11 +2814,33 @@ def _execute_verify(
             return ("pass", "")
         return ("fail", f"verify: offline strict failed with {slug!r} (expected {fixture.expected_error!r})")
 
-    # Load index.
+    # Load index through the SAME gated seam _build_env uses for the resolve
+    # tier (RFC rfc-trusted-index-invariant.md §2.1/S-Verify — this was the
+    # "fourth bypass" the RFC names at §4: a bare parse_index() with no
+    # trust gate, so a strict+no-bundle verify fixture could never raise
+    # TNG-INDEX-BUNDLE-MISSING in-process). Reuses _fixture_index_trust_config
+    # / _fixture_epoch_commitment_status / index_cache.acquire — the SAME
+    # primitives, so this adapter cannot silently drift from the resolve-tier
+    # trust dispatch.
+    config, verifier = _fixture_index_trust_config(fixture_dir, doc)
+    bundle_path = fixture_dir / "index.kdl.bundle"
+    bundle_bytes = bundle_path.read_bytes() if bundle_path.is_file() else None
+    epoch_status = _fixture_epoch_commitment_status(fixture_dir, index_path)
+    index_url = f"file://{index_path.resolve()}"
     try:
-        index = parse_index(index_path.read_text(encoding="utf-8"))
+        gated = index_cache.acquire(
+            index_path.read_text(encoding="utf-8"),
+            bundle_bytes,
+            config,
+            verifier,
+            index_url,
+            epoch_status,
+        )
     except MilpaError as e:
-        return ("fail", f"verify: index parse failed: {e.slug!r}")
+        if fixture.expected_error is not None and e.slug == fixture.expected_error:
+            return ("pass", "")
+        return ("fail", f"verify: index load failed: {e.slug!r} (expected {fixture.expected_error!r})")
+    index = gated.index
 
     # Per-dep edge check.
     for dep in pinned_deps:

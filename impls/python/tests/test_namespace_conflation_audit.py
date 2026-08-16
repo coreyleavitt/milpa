@@ -344,7 +344,7 @@ def test_update_bare_ambiguous_name_errors_instead_of_deleting_sibling(
 
 
 def test_verify_dep_decl_pins_namespaced_dep_not_conflated_by_bare_ambiguity_live(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
     """Same scenario as above, driving the REAL function (patching
     `load_default_index` + forcing the online branch), asserting rc == 0
@@ -372,8 +372,16 @@ def test_verify_dep_decl_pins_namespaced_dep_not_conflated_by_bare_ambiguity_liv
             ),
         ]
     )
-    monkeypatch.setattr(cli_mod, "load_default_index", lambda: for_test(index))
+    # S-Verify (rfc-trusted-index-invariant.md): _verify_dep_decl_pins now
+    # routes through _load_index_for_verb, which calls load_default_index
+    # with trust-gate kwargs — accept/ignore them, the mock still bypasses
+    # the real gate entirely.
+    monkeypatch.setattr(cli_mod, "load_default_index", lambda **kw: for_test(index))
     monkeypatch.setenv("MILPA_INDEX_URL", "file:///dummy-index.kdl")
+    # No manifest at tmp_path → index-trust defaults to "strict", but since
+    # load_default_index itself is mocked above, the trust config built for
+    # it is inert here.
+    monkeypatch.setenv("MILPA_INDEX_TRUST", "off")
 
     pinned_dep = LockedDep(
         name="foo",
@@ -388,7 +396,7 @@ def test_verify_dep_decl_pins_namespaced_dep_not_conflated_by_bare_ambiguity_liv
 
     env = MilpaEnv(fetcher=object(), index=None, store=object(), dep_decl_store=object())  # type: ignore[arg-type]
 
-    rc = cli_mod._verify_dep_decl_pins([pinned_dep], env=env, strict=False)
+    rc = cli_mod._verify_dep_decl_pins([pinned_dep], env=env, project_dir=tmp_path, strict=False)
     assert rc == 0, (
         "a namespace-qualified pin must verify OK even when a DIFFERENT "
         "namespace shares the bare name (must not false-positive PIN-MISSING)"
@@ -396,7 +404,7 @@ def test_verify_dep_decl_pins_namespaced_dep_not_conflated_by_bare_ambiguity_liv
 
 
 def test_verify_dep_decl_pins_bare_dep_ambiguous_still_reports_pin_missing(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path,
 ) -> None:
     """Regression guard for the OTHER direction: an actually un-namespaced
     (bare) locked dep whose bare name IS ambiguous in the index must still
@@ -416,8 +424,9 @@ def test_verify_dep_decl_pins_bare_dep_ambiguous_still_reports_pin_missing(
             ),
         ]
     )
-    monkeypatch.setattr(cli_mod, "load_default_index", lambda: for_test(index))
+    monkeypatch.setattr(cli_mod, "load_default_index", lambda **kw: for_test(index))
     monkeypatch.setenv("MILPA_INDEX_URL", "file:///dummy-index.kdl")
+    monkeypatch.setenv("MILPA_INDEX_TRUST", "off")
 
     pinned_dep = LockedDep(
         name="foo",
@@ -431,7 +440,7 @@ def test_verify_dep_decl_pins_bare_dep_ambiguous_still_reports_pin_missing(
     )
     env = MilpaEnv(fetcher=object(), index=None, store=object(), dep_decl_store=object())  # type: ignore[arg-type]
 
-    rc = cli_mod._verify_dep_decl_pins([pinned_dep], env=env, strict=False)
+    rc = cli_mod._verify_dep_decl_pins([pinned_dep], env=env, project_dir=tmp_path, strict=False)
     assert rc == 1
     out = capsys.readouterr()
     assert LOCK_DEPDECL_PIN_MISSING in out.err

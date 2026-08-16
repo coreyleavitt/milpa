@@ -1663,11 +1663,36 @@ def urllib_bundle_http_get(url: str) -> bytes:
     """Production ``BundleHttpGet`` transport using ``bounded_http.request``
     (RFC docs/rfc-native-oci-fetch.md §3.3).
 
-    Raises ``_BundleNotFound`` on HTTP 404; raises ``MilpaError`` on any
-    other network or HTTP-status failure, capped at ``_INDEX_BUNDLE_MAX_BYTES``.
+    Raises ``_BundleNotFound`` on HTTP 404 (or, for ``file://`` bundle URLs,
+    on a genuinely absent local file — see below); raises ``MilpaError`` on
+    any other network or HTTP-status failure, capped at
+    ``_INDEX_BUNDLE_MAX_BYTES``.
+
+    ``file://`` root cause (RFC rfc-trusted-index-invariant.md §S-Verify):
+    ``file://`` has no HTTP status layer, so urllib's ``FileHandler`` signals
+    a missing local file as ``URLError(FileNotFoundError)``, which
+    ``bounded_http.request`` maps to ``MilpaError(FETCH_DOWNLOAD_FAILED)`` —
+    indistinguishable, at that layer, from a transient transport failure.
+    But for a local file there is no such thing as "transient": either the
+    bundle sidecar is on disk or it is not, exactly like an HTTP 404. Every
+    conformance fixture's index is ``file://``, so before this translation
+    a missing ``index.kdl.bundle`` sidecar was silently reclassified by the
+    caller as ``bundle_transport_error`` instead of ``bundle_was_404`` — the
+    warn-mode ``.no-bundle`` degraded marker was never written, and the
+    NEXT cache read (any later ``milpa`` invocation against the same warm
+    cache — e.g. ``verify`` reading the index a ``fetch`` pre-phase just
+    populated) found neither a bundle nor a marker, tripped the bounded
+    crash-recovery refetch, hit the same "missing" bundle a second time, and
+    hard-failed as MILPA-INDEX-UNREACHABLE (`crash-recovery: second
+    consecutive bundle mismatch`) even under ``index-trust "warn"``.
     """
     sink = io.BytesIO()
-    resp = bounded_http.request("GET", url, cap=_INDEX_BUNDLE_MAX_BYTES, sink=sink)
+    try:
+        resp = bounded_http.request("GET", url, cap=_INDEX_BUNDLE_MAX_BYTES, sink=sink)
+    except MilpaError:
+        if url.startswith("file://") and not _file_url_to_path(url).exists():
+            raise _BundleNotFound(f"bundle not found at {url!r}: local file absent") from None
+        raise
     if resp.status == 404:
         raise _BundleNotFound(f"bundle not found at {url!r}: HTTP 404")
     if resp.status is not None and resp.status >= 400:
@@ -1677,6 +1702,20 @@ def urllib_bundle_http_get(url: str) -> bytes:
             url=url,
         )
     return sink.getvalue()
+
+
+def _file_url_to_path(url: str) -> Path:
+    """Convert a ``file://`` URL to a local filesystem ``Path``.
+
+    Uses the stdlib's own ``url2pathname`` (via ``urlparse``) rather than a
+    naive ``url[len("file://"):]`` slice, so percent-escapes and platform
+    path quirks round-trip the same way urllib's own ``FileHandler``
+    resolved them when raising the ``FileNotFoundError`` this helper is
+    diagnosing.
+    """
+    from urllib.request import url2pathname
+
+    return Path(url2pathname(urlparse(url).path))
 
 
 # ---------------------------------------------------------------------------

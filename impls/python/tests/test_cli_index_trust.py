@@ -868,3 +868,93 @@ class TestVerifyReverifiesCachedBundle:
         # Trusted cached bundle → reverify passes; verify proceeds (0 deps → success).
         assert rc == 0, f"trusted cached bundle must not block verify; stderr:\n{err}"
         assert "TNG-INDEX-" not in err, f"no trust slug expected on a trusted bundle:\n{err}"
+
+
+# ---------------------------------------------------------------------------
+# S-Verify (rfc-trusted-index-invariant.md §1.2/§4) — the ONLINE dep_decl-pin
+# drift check `milpa verify` runs must route through the SAME index-trust
+# gate every other verb uses. Before the fix, `_verify_dep_decl_pins` called
+# `load_default_index()` bare (no config/verifier) — under
+# `index-trust "strict"` with no cached bundle, that silently used an
+# UNVERIFIED index instead of failing closed with TNG-INDEX-BUNDLE-MISSING.
+# ---------------------------------------------------------------------------
+
+
+class TestVerifyDepDeclOnlineTrustGate:
+    """cmd_verify's S6 dep_decl edge check must fail closed under
+    index-trust strict + no cached bundle, exactly like fetch/lock/resolve."""
+
+    @staticmethod
+    def _build_project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+        """A standalone project with one LOCAL dep (liveness-only disk check,
+        no content-hash bookkeeping needed) whose lockfile carries a
+        `dep_decl` pin — so `cmd_verify` reaches the S6 online check."""
+        from milpa.index_trust import _reset_warned_urls
+
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        src = tmp_path / "mylib-src"
+        src.mkdir()
+        (src / "mylib.nim").write_text("# stub\n", encoding="utf-8")
+
+        (proj / "milpa.kdl").write_text(
+            'name "x"\nkind "application"\nindex-trust "strict"\n'
+            'deps {\n    mylib local="../mylib-src"\n}\n',
+            encoding="utf-8",
+        )
+        (proj / "milpa.lock").write_text(
+            'version 1\nstrategy "maxver"\n\n'
+            'dep "mylib" {\n'
+            '    identity "dag-sha256:' + "0" * 64 + '"\n'
+            '    version "0.0.1"\n'
+            '    src_dir ""\n'
+            "    requires\n"
+            '    dep_decl "sha256:' + "1" * 64 + '"\n'
+            "    provenance {\n"
+            '        origin "observed"\n'
+            '        kind "local"\n'
+            '        path "../mylib-src"\n'
+            "    }\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        deps_dir = proj / "_deps"
+        deps_dir.mkdir()
+        (deps_dir / "mylib").symlink_to(src, target_is_directory=True)
+
+        # Index present, NO bundle sidecar — the missing-bundle scenario.
+        idx_file = tmp_path / "index.kdl"
+        idx_file.write_text(_VALID_INDEX, encoding="utf-8")
+
+        monkeypatch.setenv("MILPA_INDEX_URL", idx_file.as_uri())
+        monkeypatch.delenv("MILPA_INDEX_TRUST_MOCK_VERIFIER", raising=False)
+        monkeypatch.delenv("MILPA_INDEX_TRUST", raising=False)
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg"))
+        _reset_warned_urls()
+        return proj
+
+    def test_strict_no_bundle_fails_closed_not_silently_trusted(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from milpa.cli import cmd_verify
+        from milpa.context import MilpaEnv
+
+        proj = self._build_project(tmp_path, monkeypatch)
+        # dep_decl_store must be non-None so the S6 check takes the ONLINE
+        # branch (offline is dep_decl_store is None) — its identity is
+        # irrelevant here, the gate must fail before it is ever consulted.
+        env = MilpaEnv(
+            fetcher=unittest.mock.MagicMock(),
+            index=None,
+            store=unittest.mock.MagicMock(),
+            dep_decl_store=unittest.mock.MagicMock(),
+        )
+
+        rc = cmd_verify(proj, env)
+        err = capsys.readouterr().err
+        assert rc == 1, (
+            f"strict index-trust + no cached bundle must fail milpa verify "
+            f"closed, not silently trust an unverified index; stderr:\n{err}"
+        )
+        assert TNG_INDEX_BUNDLE_MISSING in err, f"expected slug in stderr:\n{err}"

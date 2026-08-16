@@ -3056,6 +3056,7 @@ def cmd_verify(
         result = _verify_dep_decl_pins(
             pinned_deps,
             env=env,
+            project_dir=(ws.root_dir if ws is not None else project_dir),
             strict=effective_strict,
         )
         if result != 0:
@@ -3088,6 +3089,7 @@ def cmd_verify(
 def _verify_dep_decl_pins(
     pinned_deps: "list[LockedDep]",
     env: "MilpaEnv | None",
+    project_dir: "Path",
     *,
     strict: bool,
 ) -> int:
@@ -3135,36 +3137,44 @@ def _verify_dep_decl_pins(
         )
         return 0
 
-    # Load the live index (same pattern as _load_index_for_verb).
-    from milpa.errors import MILPA_INDEX_UNREACHABLE
-
+    # Load the live index through the SAME gated seam every other verb uses
+    # (RFC rfc-trusted-index-invariant.md §2.1/S-Verify): reuse
+    # ``_load_index_for_verb`` rather than a second bare ``load_default_index()``
+    # call. This is the S-Verify fix for the "fourth bypass" the RFC names at
+    # §4 — under ``index-trust "strict"`` with no cached bundle,
+    # ``_load_index_for_verb`` now propagates ``TNG-INDEX-BUNDLE-MISSING``
+    # (fail closed) instead of this site silently trusting an unverified
+    # index. ``env`` is guaranteed non-None here: the ``offline`` branch
+    # above already returns when ``env is None`` (``dep_decl_store`` is
+    # None in that case), so this call only ever executes with a real env.
+    assert env is not None
     try:
-        # RFC rfc-trusted-index-invariant.md §2.1: load_default_index now
-        # mints a GatedIndex. This call site pre-dates the gate (it's the
-        # "fourth bypass" the RFC names at §4 — the S-Verify reroute is a
-        # LATER slice, not this one) and only needs the plain Index for its
-        # lookup_bare/lookup_qualified calls below, so unwrap immediately
-        # rather than threading GatedIndex through unrelated lookup helpers.
-        index = load_default_index().index
+        env_with_index = _load_index_for_verb(env, project_dir)
     except MilpaError as exc:
-        if exc.slug == MILPA_INDEX_UNREACHABLE:
-            if strict:
-                print(
-                    f"index unreachable — cannot verify dep_decl pins "
-                    f"(strict mode): {exc.message}",
-                    file=sys.stderr,
-                )
-                _emit_slug(VERIFY_EDGE_MISMATCH)
-                return 1
-            print(
-                f"dep_decl edge check SKIPPED — index unreachable: {exc.message}",
-                file=sys.stderr,
-            )
-            return 0
-        # TNG-* parse errors propagate — real malformation, not just offline.
+        # TNG-* parse/trust-gate errors propagate — real malformation or a
+        # failed trust gate (e.g. strict + no bundle), not just offline.
         print(f"failed to load index: {exc.message}", file=sys.stderr)
         _emit_slug(exc.slug)
         return 1
+
+    if env_with_index.index is None:
+        # Soft-unreachable: ``_load_index_for_verb`` swallows
+        # MILPA_INDEX_UNREACHABLE into ``index=None`` (the resolver's
+        # per-dep RES-NO-INDEX convention) rather than raising.
+        if strict:
+            print(
+                "index unreachable — cannot verify dep_decl pins (strict mode)",
+                file=sys.stderr,
+            )
+            _emit_slug(VERIFY_EDGE_MISMATCH)
+            return 1
+        print(
+            "dep_decl edge check SKIPPED — index unreachable",
+            file=sys.stderr,
+        )
+        return 0
+
+    index = env_with_index.index.index
 
     # Per-dep check.
     for dep in pinned_deps:
