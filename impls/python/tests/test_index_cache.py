@@ -37,10 +37,11 @@ from milpa.index_cache import (
     cache_path_for,
     derive_bundle_url,
     index_url_from_env,
-    load_index,
     urllib_bundle_http_get,
     urllib_http_get,
 )
+
+from ._index_cache_helpers import load_index
 from milpa.index_trust import (
     BundleMissing,
     BundleStale,
@@ -1112,6 +1113,242 @@ class TestCrashRecovery:
         idx = load_index(URL, tmp_path, get, DEFAULT_TTL_SECONDS, 1000)
         assert calls[0] == 1  # still only 1 call
         assert idx.packages[0].name == "bar"
+
+
+# ---------------------------------------------------------------------------
+# 16a. R1 (code review, HIGH): crash-recovery bundle refetch must distinguish
+# a genuine 404 (hard-fail regardless of policy — active-adversary signal,
+# spec §3.4.2) from a transient transport error (must respect index-trust
+# policy, exactly like the non-recovery path — spec §3.4.2's
+# transport-unreachability clause). Mirrors Rust's
+# Err(BundleError::NotFound) vs. Err(BundleError::Other(_)) recovery arms
+# in index_cache.rs.
+# ---------------------------------------------------------------------------
+
+
+class TestCrashRecoveryBundleFailureClassification:
+    """Pins all three arms of the recovery-refetch bundle-failure split."""
+
+    def _prime_cache_then_corrupt_bundle(self, tmp_path: Path, config: IndexTrustConfig) -> None:
+        """First load populates cache + bundle sidecar; then delete the bundle
+        sidecar to force the NEXT load down the crash-recovery path
+        (mirrors ``TestCrashRecovery.test_missing_bundle_sidecar_triggers_recovery``)."""
+        get, _ = make_counter_get(VALID_INDEX)
+        bundle_get = make_bundle_get()
+        _reset_warned_urls()
+        load_index(URL, tmp_path, get, DEFAULT_TTL_SECONDS, 1000,
+                   config=config, verifier=MockVerifier(Trusted),
+                   bundle_http_get=bundle_get)
+        cache_file = cache_path_for(URL, tmp_path)
+        bundle_file = Path(str(cache_file) + ".bundle")
+        bundle_file.unlink()
+        _reset_warned_urls()
+
+    def test_recovery_transport_error_under_warn_does_not_raise(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """warn + non-404 transport error on the recovery refetch: MUST NOT raise;
+        proceeds with a BundleMissing-verified index and a warning (spec §3.4.2's
+        transport-unreachability clause)."""
+        config = _make_trust_config("warn")
+        self._prime_cache_then_corrupt_bundle(tmp_path, config)
+
+        get, calls = make_counter_get(VALID_INDEX)
+
+        def erroring_bundle_get(url: str) -> bytes:
+            raise ConnectionError(f"HTTP 500: {url!r}")
+
+        idx = load_index(URL, tmp_path, get, DEFAULT_TTL_SECONDS, 1000,
+                         config=config, verifier=MockVerifier(Trusted),
+                         bundle_http_get=erroring_bundle_get)
+        assert idx.packages[0].name == "bar", (
+            "warn + transient transport error on recovery refetch must NOT hard-fail"
+        )
+        assert calls[0] == 1, "recovery refetch performs exactly one network call"
+
+        err = capsys.readouterr().err
+        assert TNG_INDEX_BUNDLE_MISSING in err, (
+            "warn + transport error on recovery must still emit the BUNDLE-MISSING warning"
+        )
+
+    def test_recovery_transport_error_under_strict_raises_unreachable(
+        self, tmp_path: Path
+    ) -> None:
+        """strict + non-404 transport error on the recovery refetch: hard-fails
+        closed with MILPA-INDEX-UNREACHABLE (fail-closed per spec §3.4.2)."""
+        config = _make_trust_config("strict")
+        self._prime_cache_then_corrupt_bundle(tmp_path, config)
+
+        get, _ = make_counter_get(VALID_INDEX)
+
+        def erroring_bundle_get(url: str) -> bytes:
+            raise ConnectionError(f"HTTP 500: {url!r}")
+
+        with pytest.raises(MilpaError) as exc_info:
+            load_index(URL, tmp_path, get, DEFAULT_TTL_SECONDS, 1000,
+                       config=config, verifier=MockVerifier(Trusted),
+                       bundle_http_get=erroring_bundle_get)
+        assert exc_info.value.slug == MILPA_INDEX_UNREACHABLE
+
+    def test_recovery_genuine_404_under_warn_still_hard_fails(
+        self, tmp_path: Path
+    ) -> None:
+        """warn + a genuine 404 on the recovery refetch: still hard-fails
+        regardless of policy — a SECOND consecutive miss is an
+        active-adversary signal (spec §3.4.2), unlike a transient transport
+        error. Pins the 404 arm stays unconditional after the fix."""
+        config = _make_trust_config("warn")
+        self._prime_cache_then_corrupt_bundle(tmp_path, config)
+
+        get, _ = make_counter_get(VALID_INDEX)
+
+        with pytest.raises(MilpaError) as exc_info:
+            load_index(URL, tmp_path, get, DEFAULT_TTL_SECONDS, 1000,
+                       config=config, verifier=MockVerifier(Trusted),
+                       bundle_http_get=failing_bundle_get)
+        assert exc_info.value.slug == MILPA_INDEX_UNREACHABLE
+
+
+# ---------------------------------------------------------------------------
+# 16b. R8 (code review, LOW): direct pin — through the REAL production
+# ``urllib_http_get``/``urllib_bundle_http_get`` transports (not fakes), a
+# genuinely-absent ``file://`` bundle sidecar loaded TWICE under ``warn``
+# must warn-and-continue on BOTH reads and never raise
+# MILPA-INDEX-UNREACHABLE.  This is the exact scenario the S-Verify fix
+# (``urllib_bundle_http_get``'s ``file://``-aware ``_BundleNotFound``
+# mapping + ``_file_url_to_path``) targets: pre-fix, ``file://`` has no
+# HTTP-status layer, so a missing local bundle file was misclassified as a
+# transient transport error rather than a 404-equivalent, the warn-mode
+# ``.no-bundle`` degraded marker was never written on the first load, and
+# the second (warm-cache) read tripped bounded crash-recovery.
+#
+# Every other test that exercises this classification (16/16a above) does
+# so through a FAKE ``bundle_http_get`` that raises the already-classified
+# exception directly — none of them ever calls ``_file_url_to_path`` or the
+# real ``file://`` branch of ``urllib_bundle_http_get``, so this is the only
+# test pinning the actual production code path end to end.
+# ---------------------------------------------------------------------------
+
+
+class TestUrllibBundleHttpGetFileUrlMissing:
+    """R8: the actual root-cause unit — ``urllib_bundle_http_get`` on a
+    genuinely-absent ``file://`` bundle must raise ``_BundleNotFound``
+    (404-equivalent), not let the underlying ``MilpaError`` (transient
+    transport failure) propagate. This is the narrowest possible pin of the
+    S-Verify fix: it fails immediately if ``_file_url_to_path``'s ``file://``
+    mapping in ``urllib_bundle_http_get`` regresses, independent of whatever
+    the crash-recovery state machine does with the classification afterward.
+    """
+
+    def test_missing_file_url_bundle_raises_bundle_not_found(
+        self, tmp_path: Path
+    ) -> None:
+        missing_bundle_url = (tmp_path / "index.kdl.bundle").as_uri()
+        with pytest.raises(_BundleNotFound):
+            urllib_bundle_http_get(missing_bundle_url)
+
+    def test_missing_file_url_bundle_does_not_raise_milpa_error(
+        self, tmp_path: Path
+    ) -> None:
+        """``_BundleNotFound`` is deliberately NOT a ``MilpaError`` subclass
+        — the crash-recovery classification (``except _BundleNotFound`` vs.
+        ``except Exception``) depends on this exception identity, so pin it
+        directly rather than only via the classification's downstream effect."""
+        missing_bundle_url = (tmp_path / "index.kdl.bundle").as_uri()
+        try:
+            urllib_bundle_http_get(missing_bundle_url)
+        except MilpaError:
+            pytest.fail(
+                "a genuinely-absent file:// bundle must raise _BundleNotFound, "
+                "not the generic MilpaError transient-transport-failure path"
+            )
+        except _BundleNotFound:
+            pass
+
+
+class TestFileUrlBundleMissingWarmCacheWarn:
+    """R8: warn + genuinely-absent file:// bundle, loaded twice, via the
+    real production transports."""
+
+    @staticmethod
+    def _setup(tmp_path: Path) -> tuple[str, Path, IndexTrustConfig]:
+        index_file = tmp_path / "index.kdl"
+        index_file.write_text(VALID_INDEX, encoding="utf-8")
+        # Deliberately do NOT write index.kdl.bundle: a genuinely-absent
+        # sidecar, exactly like an unattested/pre-attestation tianguis index.
+        url = index_file.as_uri()
+        cache_dir = tmp_path / "cache"
+        config = _make_trust_config("warn")
+        return url, cache_dir, config
+
+    def test_two_consecutive_loads_warn_and_continue(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        url, cache_dir, config = self._setup(tmp_path)
+        _reset_warned_urls()
+
+        # First load (State 2: fresh network fetch of a fresh cache dir) —
+        # real file:// production transports, genuinely-absent bundle.
+        idx1 = load_index(
+            url, cache_dir, urllib_http_get, DEFAULT_TTL_SECONDS, 1000,
+            config=config, verifier=MockVerifier(Trusted),
+            bundle_http_get=urllib_bundle_http_get,
+        )
+        assert idx1.packages[0].name == "bar"
+        err1 = capsys.readouterr().err
+        assert TNG_INDEX_BUNDLE_MISSING in err1, (
+            f"first load must warn BUNDLE-MISSING; stderr was: {err1!r}"
+        )
+        assert MILPA_INDEX_UNREACHABLE not in err1
+
+        # Second load (State 1: warm cache, same cache_dir, TTL not
+        # expired) — mirrors `milpa verify` re-loading the index a `fetch`
+        # pre-phase already cached.  Pre-fix, this is exactly the read that
+        # tripped bounded crash-recovery and hard-failed.
+        _reset_warned_urls()
+        idx2 = load_index(
+            url, cache_dir, urllib_http_get, DEFAULT_TTL_SECONDS, 1000,
+            config=config, verifier=MockVerifier(Trusted),
+            bundle_http_get=urllib_bundle_http_get,
+        )
+        assert idx2.packages[0].name == "bar", (
+            "second warm-cache load of a genuinely-absent file:// bundle "
+            "under warn must warn-and-continue, not hard-fail"
+        )
+        err2 = capsys.readouterr().err
+        assert TNG_INDEX_BUNDLE_MISSING in err2, (
+            f"second load must ALSO warn BUNDLE-MISSING; stderr was: {err2!r}"
+        )
+        assert MILPA_INDEX_UNREACHABLE not in err2, (
+            "R8 regression: second warm-cache read of a genuinely-absent "
+            f"file:// bundle under warn must NOT surface MILPA-INDEX-UNREACHABLE; "
+            f"stderr was: {err2!r}"
+        )
+
+    def test_second_load_raises_nothing(self, tmp_path: Path) -> None:
+        """Strongest form of the pin: no exception at all on either load —
+        MILPA-INDEX-UNREACHABLE is a raised MilpaError, not just stderr text."""
+        url, cache_dir, config = self._setup(tmp_path)
+        _reset_warned_urls()
+
+        load_index(
+            url, cache_dir, urllib_http_get, DEFAULT_TTL_SECONDS, 1000,
+            config=config, verifier=MockVerifier(Trusted),
+            bundle_http_get=urllib_bundle_http_get,
+        )
+
+        _reset_warned_urls()
+        try:
+            load_index(
+                url, cache_dir, urllib_http_get, DEFAULT_TTL_SECONDS, 1000,
+                config=config, verifier=MockVerifier(Trusted),
+                bundle_http_get=urllib_bundle_http_get,
+            )
+        except MilpaError as exc:
+            pytest.fail(
+                "second warm-cache load of a genuinely-absent file:// "
+                f"bundle under warn must not raise; got {exc.slug}: {exc}"
+            )
 
 
 # ---------------------------------------------------------------------------

@@ -355,8 +355,17 @@ fn verify_and_enforce(
 /// sidecar I/O; a cache-free caller has no on-disk cache to read that sidecar
 /// from, so it injects the value it already computed — e.g. the conformance
 /// runner's `fixture_epoch_commitment_status`). `acquire` does not run the
-/// epoch-commitment phase itself; it only stamps the injected value onto the
-/// parsed `Index` before minting.
+/// epoch-commitment STATUS COMPUTATION itself (no sidecar I/O — that's the
+/// injected `epoch_status`'s job), but it DOES run the D14/D18 ENFORCEMENT
+/// over that status, via the same [`mint_enforced`] choke point
+/// `apply_epoch_fold` delegates to — so a minted `GatedIndex` proves
+/// enforcement ran regardless of which mint path produced it.
+///
+/// `entry_trust_policy` / `index_history_policy` feed [`mint_enforced`]'s D18
+/// co-requirement check exactly as they do on the cache-integrated path
+/// (`EpochCommitmentInputs::entry_trust_policy` / `load_index_with_history`'s
+/// `index_history_policy` param) — callers thread the same manifest-resolved
+/// values here.
 impl GatedIndex {
     pub fn acquire(
         index_text: &str,
@@ -365,6 +374,8 @@ impl GatedIndex {
         verifier: Option<&dyn IndexBundleVerifier>,
         url: &str,
         epoch_status: EpochCommitmentStatus,
+        entry_trust_policy: &TrustPolicy,
+        index_history_policy: &TrustPolicy,
     ) -> Result<GatedIndex, MilpaError> {
         let mut verification: Option<VerificationResult> = None;
         let mut bundle_info: Option<IndexBundleInfo> = None;
@@ -391,10 +402,14 @@ impl GatedIndex {
             }
         }
 
-        let mut index = Index::parse(index_text).map_err(MilpaError::from)?;
-        index.epoch_commitment_status = epoch_status;
+        let index = Index::parse(index_text).map_err(MilpaError::from)?;
 
-        Ok(GatedIndex::mint(index, verification, bundle_info))
+        mint_enforced(
+            FetchedIndex { index, verification, bundle_info },
+            epoch_status,
+            entry_trust_policy,
+            index_history_policy,
+        )
     }
 }
 
@@ -814,10 +829,25 @@ pub struct EpochCommitmentInputs<'a> {
     pub entry_trust_policy: &'a TrustPolicy,
 }
 
+/// An already index-trust-gated candidate, bundled for threading through the
+/// epoch-commitment fold (RR-Low-a): [`apply_epoch_fold`] and
+/// [`mint_enforced`] both need the SAME `(index, verification, bundle_info)`
+/// triple that index-trust already resolved, one unchanged, one step further
+/// downstream. Bundling it (mirrors the existing [`EpochCommitmentInputs`]
+/// precedent for grouping related mint-time params) sheds a parallel
+/// positional triple from both signatures rather than growing it.
+struct FetchedIndex {
+    index: Index,
+    verification: Option<VerificationResult>,
+    bundle_info: Option<IndexBundleInfo>,
+}
+
 /// Apply the S-EpochCommitment gate phase to an already index-trust-gated
-/// `Index`, BEFORE the final `GatedIndex::mint` wrap (RFC §2.2): mutates
-/// `index.epoch_commitment_status` in place and enforces the D14/D18 rules.
-/// A minted `GatedIndex` therefore proves both gates ran. Mirrors the
+/// `Index`, computing its `EpochCommitmentStatus` via sidecar I/O, then
+/// delegating to [`mint_enforced`] — the SAME enforce-then-mint choke point
+/// [`GatedIndex::acquire`] uses — for the D14/D18 enforcement and the final
+/// mint (RFC §2.2). A minted `GatedIndex` therefore proves both gates ran,
+/// on EVERY mint path, not just this cache-integrated one. Mirrors the
 /// pre-fold `main.rs::apply_epoch_commitment_phase` /
 /// `cli.py::_apply_epoch_commitment_phase` exactly — only the seam moved.
 ///
@@ -825,12 +855,12 @@ pub struct EpochCommitmentInputs<'a> {
 /// - `TNG-INDEX-EPOCH-COMMITMENT-INVALID` — unconditional abort on `ArmingInvalid` (D14).
 /// - `TNG-INDEX-EPOCH-RATCHET-REQUIRED` — the D18 co-requirement.
 fn apply_epoch_fold(
-    index: &mut Index,
+    fetched: FetchedIndex,
     url: &str,
     index_cache_dir: &Path,
     index_history_policy: &TrustPolicy,
     epoch: &EpochCommitmentInputs<'_>,
-) -> Result<(), MilpaError> {
+) -> Result<GatedIndex, MilpaError> {
     let pointer = read_cached_epoch_commitment_pointer(url, index_cache_dir);
     let status = load_epoch_commitment_status(
         url,
@@ -841,16 +871,47 @@ fn apply_epoch_fold(
         epoch.trust_bundle,
         epoch.expected_signer,
     );
-    index.epoch_commitment_status = status.clone();
-
-    enforce_epoch_commitment(&status)?;
-    check_epoch_ratchet_requirement(&status, epoch.entry_trust_policy, index_history_policy)?;
 
     // Dsgn-H2 (RFC attestation-v1-normative.md §6 S5): informational, never
-    // gates the resolve.
+    // gates the resolve. Fired before `mint_enforced` below: its own
+    // precondition (`Unarmed`) can never coincide with an enforcement error
+    // (`ArmingInvalid`, or `Armed` + strict-without-ratchet), so the ordering
+    // relative to enforcement is immaterial.
     crate::entry_trust::maybe_emit_no_epoch_armed_notice(epoch.entry_trust_policy, &status);
 
-    Ok(())
+    mint_enforced(
+        fetched,
+        status,
+        epoch.entry_trust_policy,
+        index_history_policy,
+    )
+}
+
+/// Single choke point: enforce the D14 unconditional-abort + D18 ratchet
+/// co-requirement rules (spec §3.4.8) over an ALREADY-RESOLVED
+/// `EpochCommitmentStatus`, stamp it onto `index`, then mint. BOTH
+/// [`apply_epoch_fold`] (the cache-integrated mint, which computes
+/// `epoch_status` itself via sidecar I/O) and [`GatedIndex::acquire`] (the
+/// cache-free mint, which receives an already-resolved `epoch_status` from
+/// its caller) delegate here — the ONE place `GatedIndex::mint` is reached
+/// downstream of an epoch-commitment status, so enforcement cannot silently
+/// diverge between mint paths (closes the gap where `acquire` used to stamp
+/// an unenforced status).
+///
+/// # Errors
+/// - `TNG-INDEX-EPOCH-COMMITMENT-INVALID` — unconditional abort on `ArmingInvalid` (D14).
+/// - `TNG-INDEX-EPOCH-RATCHET-REQUIRED` — the D18 co-requirement.
+fn mint_enforced(
+    fetched: FetchedIndex,
+    epoch_status: EpochCommitmentStatus,
+    entry_trust_policy: &TrustPolicy,
+    index_history_policy: &TrustPolicy,
+) -> Result<GatedIndex, MilpaError> {
+    enforce_epoch_commitment(&epoch_status)?;
+    check_epoch_ratchet_requirement(&epoch_status, entry_trust_policy, index_history_policy)?;
+    let FetchedIndex { mut index, verification, bundle_info } = fetched;
+    index.epoch_commitment_status = epoch_status;
+    Ok(GatedIndex::mint(index, verification, bundle_info))
 }
 
 /// Force a network fetch of `url` and verify it under the effective
@@ -1283,11 +1344,17 @@ pub fn load_index_with_history(
                 .expect("every branch above that reaches here set ratchet_decision");
             apply_ratchet_writes(&cache_file, &decision, &index_bytes)?;
 
-            let mut index = decision.index;
-            if let Some(epoch) = &epoch {
-                apply_epoch_fold(&mut index, url, cache_dir, index_history_policy, epoch)?;
+            let index = decision.index;
+            match &epoch {
+                Some(epoch) => apply_epoch_fold(
+                    FetchedIndex { index, verification, bundle_info },
+                    url,
+                    cache_dir,
+                    index_history_policy,
+                    epoch,
+                ),
+                None => Ok(GatedIndex::mint(index, verification, bundle_info)),
             }
-            Ok(GatedIndex::mint(index, verification, bundle_info))
         }
 
         Err(fetch_err) => {
@@ -1402,13 +1469,20 @@ fn try_serve_from_cache(
             format!("cached index at {:?} is not valid UTF-8", cache_file),
         ))
     })?;
-    let mut index = Index::parse(text).map_err(MilpaError::from)?;
+    let index = Index::parse(text).map_err(MilpaError::from)?;
 
-    if let Some(epoch) = &epoch {
-        apply_epoch_fold(&mut index, url, cache_dir, index_history_policy, epoch)?;
-    }
+    let gated = match &epoch {
+        Some(epoch) => apply_epoch_fold(
+            FetchedIndex { index, verification, bundle_info },
+            url,
+            cache_dir,
+            index_history_policy,
+            epoch,
+        )?,
+        None => GatedIndex::mint(index, verification, bundle_info),
+    };
 
-    Ok(Some(GatedIndex::mint(index, verification, bundle_info)))
+    Ok(Some(gated))
 }
 
 #[cfg(test)]

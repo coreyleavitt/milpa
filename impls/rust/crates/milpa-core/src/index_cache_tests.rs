@@ -1093,6 +1093,82 @@ fn strict_transport_error_returns_bundle_missing_slug() {
 }
 
 // ---------------------------------------------------------------------------
+// R8 (code review, LOW): direct pin of the S-Verify cross-impl contract —
+// "warn + a genuinely-absent bundle sidecar, read twice → both reads
+// warn-and-continue, never MILPA-INDEX-UNREACHABLE". Every recovery test
+// above uses `not_found_bundle` (BundleError::NotFound, a CONFIRMED 404,
+// which — correctly — DOES hard-fail unconditionally on recovery per
+// §3.4.5's active-adversary rule). A genuinely-absent `file://` bundle
+// sidecar is different: milpa-cli's `build_bundle_http_fn` maps it to
+// `BundleError::Other` (mirroring the pre-native-transport `curl` behavior,
+// which never observes a real 404 for `file://`), NOT `NotFound` — so the
+// relevant fake here is `err_bundle`, exactly like the single-load tests
+// above. Rust never needed a Python-style `file://`-aware 404 remap (the
+// Python fix's `_file_url_to_path` counterpart) because `Err(Other(_))`'s
+// recovery arm already respects Warn/Strict instead of hard-failing
+// unconditionally — this test pins that this holds across TWO consecutive
+// loads sharing one warm cache, not just a single load.
+// ---------------------------------------------------------------------------
+
+/// Warn + a bundle that is persistently unavailable (non-404 transport
+/// error, e.g. the real `file://` transport's mapping for a genuinely-absent
+/// local bundle file) loaded TWICE against the same cache dir: the first
+/// load proceeds without writing a marker (transient side-channel); the
+/// second (warm-cache) load has neither a bundle nor a marker, so it falls
+/// into bounded crash-recovery — and MUST also proceed under Warn rather
+/// than hard-failing, because a transport error is unreachability, not a
+/// confirmed-absent/verification-failure active-adversary signal.
+#[test]
+fn warn_two_consecutive_loads_with_persistent_transport_error_never_hard_fail() {
+    _reset_warned_urls();
+    let d = tmp();
+    let get = |_: &str| Ok(INDEX.as_bytes().to_vec());
+    let mock = MockVerifier::new(VerificationResult::Trusted);
+
+    // First load: bundle transport persistently fails — Warn proceeds, no
+    // marker written (matches warn_transport_error_emits_bundle_missing_not_malformed).
+    let first = load_index(
+        URL, d.path(), &get, DEFAULT_TTL_SECONDS, 1000,
+        Some(&cfg(TrustPolicy::Warn)), Some(&mock),
+        Some(&err_bundle as BundleHttpGet<'_>), false,
+    );
+    assert!(first.is_ok(), "first load under warn must proceed: {first:?}");
+
+    let cache_file = cache_path_for(URL, d.path());
+    assert!(
+        !no_bundle_marker_path(&cache_file).exists(),
+        "first load must not write a marker for a persistent transport error"
+    );
+    assert!(!bundle_path(&cache_file).exists(), "no bundle sidecar was ever fetched");
+
+    _reset_warned_urls();
+
+    // Second load: SAME cache dir, fresh (age=0 < TTL) — no bundle, no
+    // marker → triggers bounded crash-recovery. The recovery re-fetch hits
+    // the SAME persistent transport error. Per spec §3.4.5's
+    // transport-unreachability clause, this must still respect Warn and
+    // proceed — NOT surface MILPA-INDEX-UNREACHABLE.
+    let second = load_index(
+        URL, d.path(), &get, DEFAULT_TTL_SECONDS, 1000,
+        Some(&cfg(TrustPolicy::Warn)), Some(&mock),
+        Some(&err_bundle as BundleHttpGet<'_>), false,
+    );
+    assert!(
+        second.is_ok(),
+        "second warm-cache load of a persistently-unavailable bundle under \
+         Warn must warn-and-continue, not hard-fail: {second:?}"
+    );
+    if let Err(e) = &second {
+        assert_ne!(
+            e.code(),
+            "MILPA-INDEX-UNREACHABLE",
+            "R8 regression: second consecutive Warn load must never surface \
+             MILPA-INDEX-UNREACHABLE for a transport-error (non-404) bundle failure"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // A3 (rfc-registry-append-only.md §2): the append-only ratchet wired into
 // load_index_with_history. No trust gate (config=None) — the ratchet's
 // index-history axis is orthogonal to index-trust.
@@ -1481,5 +1557,110 @@ mod s5_reverify_cached_epoch_commitment_status {
             matches!(verify_time_status, EpochCommitmentStatus::Armed { .. }),
             "re-derivation must reflect the CURRENT cache, not the lock-time Unarmed status — got {verify_time_status:?}"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// R2 (MEDIUM code-review finding): `GatedIndex::acquire` used to STAMP an
+// injected `EpochCommitmentStatus` onto the minted index without ever
+// running the D14/D18 enforcement `apply_epoch_fold` runs on the
+// cache-integrated path — so an `ArmingInvalid` status minted a
+// trusted-looking `GatedIndex` and succeeded. `acquire` now delegates to the
+// SAME `mint_enforced` choke point `apply_epoch_fold` uses, so both mint
+// paths enforce identically. These pin the RED->GREEN behavior directly at
+// the primitive.
+// ---------------------------------------------------------------------------
+mod s6_acquire_epoch_enforcement {
+    use super::*;
+
+    #[test]
+    fn acquire_arming_invalid_raises_even_under_index_trust_off() {
+        // index-trust entirely off (config/verifier both None) — proves
+        // enforcement is NOT gated behind the bundle-verification branch;
+        // it runs unconditionally over the injected epoch_status, mirroring
+        // `apply_epoch_fold`'s own unconditional-once-invoked enforcement.
+        let status = EpochCommitmentStatus::ArmingInvalid { reason: "test: tampered sidecar".to_string() };
+
+        let err = GatedIndex::acquire(
+            INDEX,
+            None,
+            None,
+            None,
+            URL,
+            status,
+            &TrustPolicy::Off,
+            &TrustPolicy::Off,
+        )
+        .unwrap_err();
+
+        assert_eq!(err.code(), "TNG-INDEX-EPOCH-COMMITMENT-INVALID");
+    }
+
+    #[test]
+    fn acquire_arming_invalid_raises_under_active_index_trust() {
+        // index-trust active (strict, bundle verifies) — proves the
+        // epoch-commitment enforcement is a SEPARATE gate from index-trust,
+        // not accidentally satisfied by it: a bundle that verifies fine must
+        // still not paper over an ArmingInvalid epoch status.
+        let status = EpochCommitmentStatus::ArmingInvalid { reason: "test: hash(S) != C".to_string() };
+        let verifier = MockVerifier::new(VerificationResult::Trusted);
+
+        let err = GatedIndex::acquire(
+            INDEX,
+            Some(BUNDLE),
+            Some(&cfg(TrustPolicy::Strict)),
+            Some(&verifier),
+            URL,
+            status,
+            &TrustPolicy::Strict,
+            &TrustPolicy::Strict,
+        )
+        .unwrap_err();
+
+        assert_eq!(err.code(), "TNG-INDEX-EPOCH-COMMITMENT-INVALID");
+    }
+
+    #[test]
+    fn acquire_epoch_ratchet_required_raises() {
+        // D18: Armed + entry-trust "strict" requires index-history "strict" —
+        // acquire must enforce this co-requirement too, not just D14.
+        let identities = std::collections::HashSet::new();
+        let status = EpochCommitmentStatus::Armed { identities, integrated_time: 1_700_000_000 };
+
+        let err = GatedIndex::acquire(
+            INDEX,
+            None,
+            None,
+            None,
+            URL,
+            status,
+            &TrustPolicy::Strict,
+            &TrustPolicy::Warn, // NOT strict — violates the D18 co-requirement
+        )
+        .unwrap_err();
+
+        assert_eq!(err.code(), "TNG-INDEX-EPOCH-RATCHET-REQUIRED");
+    }
+
+    #[test]
+    fn acquire_unarmed_is_unaffected_off_case_preserved() {
+        // The `off`-case conditionality (RFC §2.2 HIGH) is preserved by
+        // convention at the caller (an `off` caller only ever has an
+        // `Unarmed` status to inject) — Unarmed must remain a silent success
+        // through the SAME unconditional enforcement call, proving no
+        // special-casing of `off` was added inside `acquire`.
+        let gated = GatedIndex::acquire(
+            INDEX,
+            None,
+            None,
+            None,
+            URL,
+            EpochCommitmentStatus::Unarmed,
+            &TrustPolicy::Off,
+            &TrustPolicy::Off,
+        )
+        .expect("Unarmed must mint successfully");
+
+        assert_eq!(gated.index().epoch_commitment_status, EpochCommitmentStatus::Unarmed);
     }
 }

@@ -1013,6 +1013,30 @@ https://raw.githubusercontent.com/coreyleavitt/tianguis/main/index.kdl.bundle
 > regardless of policy. A second consecutive mismatch indicates an active adversary
 > signal, not an interrupted write; the implementation MUST NOT loop.
 
+> NORMATIVE (transport unreachability vs. verification failure on the recovery
+> re-fetch): the preceding paragraph's "hard-fail regardless of policy" is
+> scoped to two outcomes of the recovery re-fetch: bundle bytes that ARRIVED but
+> failed the §3.4.4 gate (any `TNG-INDEX-BUNDLE-MALFORMED` / `-STALE` /
+> `TNG-INDEX-SIGNATURE-INVALID` / `-DIGEST-MISMATCH` / `-SIGNER-MISMATCH`
+> result), and a bundle that is definitively absent (a 404/not-found response).
+> Both are active-adversary signals — the whole point of the bounded-recovery
+> design is that a SECOND consecutive miss or mismatch, immediately after the
+> first one triggered this re-fetch, is no longer explainable as an interrupted
+> write. A TRANSIENT transport-level failure to even complete the re-fetch
+> (e.g. HTTP 500, connection reset, timeout — the bundle bytes never arrived and
+> no verification was attempted) is UNREACHABILITY, not a verification failure
+> or a confirmed-missing bundle, and MUST instead respect the effective
+> `index-trust` policy (§3.4.5) exactly as the non-recovery path does: under
+> `strict`, the implementation MUST raise `MILPA-INDEX-UNREACHABLE`
+> (fail-closed); under `warn` (or `off`), the implementation MUST proceed by
+> recording `BundleMissing` (emitting the `warn` diagnostic per §3.4.5) rather
+> than hard-failing. This is not a relaxation of the crash-recovery hard-fail —
+> it is a correction of its scope: a resolve that touches the index twice in
+> one invocation (e.g. `milpa verify`'s offline reverify followed by its online
+> `dep_decl` drift check, §3.4.1) must not have its SECOND load silently
+> hard-fail on a transient blip when the FIRST load already recorded and warned
+> about the same unreachable bundle under `warn` policy.
+
 #### 3.4.3  Bundle format
 
 The Sigstore bundle is a JSON document carrying:
@@ -1197,6 +1221,15 @@ key. Failure MUST raise `TNG-INDEX-SIGNATURE-INVALID`.
 > write the marker — the next fresh-cache read MUST go through crash-recovery refetch
 > instead of settling into degraded mode indefinitely. Under `strict`, a bundle 404
 > MUST raise `TNG-INDEX-BUNDLE-MISSING` and MUST NOT write partial cache state.
+>
+> This paragraph governs the ORIGINAL (non-recovery) bundle fetch. The bounded
+> crash-recovery re-fetch that MAY follow it is a distinct code path with its own
+> hard-fail-vs-policy split, stated normatively in §3.4.2: a transient transport
+> failure encountered ON the recovery re-fetch itself still respects `warn`/`strict`
+> (and, unlike this paragraph's non-recovery case, MAY write the degraded marker on
+> `warn` to avoid a repeat crash-recovery loop against a persistently-unreachable
+> bundle host); a 404 or a verification failure on the recovery re-fetch hard-fails
+> regardless of policy per §3.4.2's active-adversary rationale.
 
 > NORMATIVE (effective policy — instantiates §3.4.0): `index-trust` is an
 > instantiation of the generic policy-axis model (§3.4.0) with manifest node

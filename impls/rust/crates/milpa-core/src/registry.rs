@@ -296,7 +296,7 @@ impl Index {
     /// are ignored (a transport this milpa can't fetch shouldn't be fatal — other
     /// provenances on the same version may still be usable). Versions sort
     /// newest-first by semver, unparseable trailing in document order.
-    pub fn parse(text: &str) -> Result<Index, CoreError> {
+    pub(crate) fn parse(text: &str) -> Result<Index, CoreError> {
         // Depth guard — see milpa_manifest::KDL_MAX_NESTING_DEPTH for rationale.
         // Both brace depth and block-comment depth are checked (mirrors Python).
         if kdl_brace_depth(text) > KDL_MAX_NESTING_DEPTH {
