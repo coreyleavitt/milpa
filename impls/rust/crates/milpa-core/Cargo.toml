@@ -13,7 +13,14 @@ publish.workspace = true
 # it — `#[cfg(test)]` alone only reaches milpa-core's OWN unit tests, not a
 # separate consuming crate. Enabled by milpa-conformance's Cargo.toml only;
 # milpa-cli's Cargo.toml does NOT enable it, so a standalone `cargo build -p
-# milpa-cli` release binary never links `for_test`.
+# milpa-cli` release binary never links `for_test`. This is package-scoped,
+# NOT workspace-wide: resolver-v2 feature unification means a workspace build
+# (`cargo build --workspace` / plain `cargo test`) DOES link `for_test` into
+# `milpa-cli`, because the feature is unified across every package in that
+# build. `milpa-cli/tests/containment.rs` is the actual backstop — a
+# source-grep lint that fails if `milpa-cli/src/` ever references `for_test`,
+# `GatedIndex::mint`, or this feature. See `gated_index.rs`'s `for_test` doc
+# comment for the full accounting.
 test-support = []
 
 [dependencies]

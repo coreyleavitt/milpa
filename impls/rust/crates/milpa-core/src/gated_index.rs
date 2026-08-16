@@ -123,9 +123,7 @@ impl GatedIndex {
     }
 
     /// Test-only escape hatch: wrap an arbitrary [`Index`] without going
-    /// through the gate. Gated so it cannot ship in a release build (RFC
-    /// §2.6) — Rust enforces this at compile time, unlike Python's
-    /// `for_test`, which needs a runtime containment story.
+    /// through the gate.
     ///
     /// Two gates, not one: `cfg(test)` covers milpa-core's OWN unit tests
     /// (same-crate compilation shares one `--cfg test`), but the shared
@@ -136,8 +134,30 @@ impl GatedIndex {
     /// §2.1 names; S1b/S2b reroute it onto the real gate) and needs a real,
     /// linkable `for_test` to keep compiling in the interim. The
     /// `test-support` Cargo feature is the standard idiom for exactly this:
-    /// milpa-conformance's `Cargo.toml` enables it; milpa-cli's does NOT, so
-    /// a standalone `cargo build -p milpa-cli` release binary never links it.
+    /// milpa-conformance's `Cargo.toml` enables it; milpa-cli's does NOT.
+    ///
+    /// **This is a *package-scoped* guarantee, not a workspace-wide one.**
+    /// A standalone release build (`cargo build -p milpa-cli`, what actually
+    /// ships) never links `for_test`, because `test-support` is never
+    /// requested for that build. But Cargo's resolver-v2 feature unification
+    /// means a *workspace-wide* build — `cargo build --workspace`, a plain
+    /// `cargo test` at the workspace root, or `./dev-rust test` run without
+    /// `-p` — unifies milpa-conformance's `test-support` request into the
+    /// SAME `milpa-core` compilation unit that `milpa-cli` links against, so
+    /// the `for_test` symbol IS present in a workspace-built `milpa` binary
+    /// too. `#[cfg(...)]` alone therefore does not, by itself, prove the
+    /// symbol is compiled out of every binary that could exist — only that a
+    /// package-scoped build of `milpa-cli` never enables it. The remaining
+    /// guarantee is a source-boundary lint, not the feature gate in
+    /// isolation:
+    /// `milpa-cli/tests/containment.rs` greps `milpa-cli/src/` and fails the
+    /// build if it ever references `for_test`, `GatedIndex::mint`, or the
+    /// `test-support` feature — the Rust analogue of Python's
+    /// `tests/test_gated_index_containment.py` runtime grep. Together, the
+    /// feature gate (keeps the escape hatch out of package-scoped release
+    /// builds) and the lint (keeps `milpa-cli`'s own source from ever calling
+    /// it, even under feature unification) are what make the containment
+    /// claim hold.
     #[cfg(any(test, feature = "test-support"))]
     pub fn for_test(index: Index) -> GatedIndex {
         GatedIndex { index, verification: None, bundle_info: None }
