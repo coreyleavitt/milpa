@@ -1,0 +1,10 @@
+name "myapp"
+kind "application"
+// index-trust "warn": the epoch-commitment fold runs only when the index-trust
+// gate is ACTIVE (trust_active — RFC §2.2). Under "off" the fold never runs and
+// the status stays Unarmed, so a tampered attestation-epoch-commitment would be
+// silently ignored by the real load path (an "off" fixture here would assert an
+// in-process-adapter artifact, not real semantics). "warn" is the minimal active
+// policy that evaluates the commitment → ArmingInvalid → enforce_epoch_commitment
+// aborts unconditionally (spec §3.4.8), no bundle required.
+index-trust "warn"

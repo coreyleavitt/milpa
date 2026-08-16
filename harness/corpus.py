@@ -36,6 +36,24 @@ from harness.runner import RunResult, run_fixture
 # milpa internals.  Document the reason clearly.  If either actually passes
 # black-box, remove it from this set.
 KNOWN_LIMITATIONS: dict[str, str] = {
+    # Epoch-commitment tier (RFC rfc-trusted-index-invariant.md §4 / D14 — the
+    # index-scoped attestation-epoch-commitment phase). fixture-469 drives an
+    # ArmingInvalid commitment (hash(S) != C) to TNG-INDEX-EPOCH-COMMITMENT-INVALID.
+    # The epoch fold fires during index load with the epoch machinery wired; the
+    # black-box translation neither loads the index for this dep-less resolve nor
+    # honors the `index.kdl.epoch-commitment` sidecar — the same unwired epoch/
+    # attestation tier as fixtures 367-375 and the index-history block below.
+    # Covered by each impl's in-process adapter (test_conformance.py `_build_env`
+    # -> `GatedIndex.acquire`, both impls) + the acquire epoch-enforcement unit
+    # tests (test_gated_index_invariant.py / index_cache_tests.rs `s6_*`).
+    "fixture-469-epoch-commitment-arming-invalid": (
+        "epoch-commitment evaluation is unwired in the black-box fixture "
+        "translation (no index load for a dep-less resolve; the "
+        "index.kdl.epoch-commitment sidecar is not honored) — same tier as "
+        "367-375. Covered by the in-process adapter (test_conformance.py "
+        "_build_env -> GatedIndex.acquire, both impls) + the acquire "
+        "epoch-enforcement unit tests"
+    ),
     # Slice C c4 (rfc-conformance-parity §4): partial-profile absent-axis fixtures.
     # The CLI builds its Profile via Profile.from_environment(), which host-defaults
     # every absent MILPA_TARGET_* axis (cli-contract §8) — so a partial profile
